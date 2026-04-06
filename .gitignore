@@ -1,0 +1,44 @@
+# Secrets and local credentials (never commit)
+.env
+.env.*
+!.env.example
+**/service_accounts.json
+*credentials*.json
+google-services.json
+GoogleService-Info.plist
+*.pem
+*.key
+id_rsa*
+*.p12
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Testing / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

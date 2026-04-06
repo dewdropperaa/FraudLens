@@ -1,0 +1,59 @@
+# Secrets and local config (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+*.p12
+*credentials*.json
+service_accounts.json
+google-services.json
+GoogleService-Info.plist
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Frontend (root-level ignores; frontend/ has its own)
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.*
+
+# Blockchain / compiled (regenerate locally)
+contracts/**/artifacts/
+contracts/**/cache/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
