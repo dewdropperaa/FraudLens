@@ -28,6 +28,7 @@ requests>=2.31.0
 
 # Document text extraction (PDF + images via Tesseract when installed)
 pypdf>=4.0.0
+pypdfium2>=4.30.0
 Pillow>=10.0.0
 pytesseract>=0.3.10
 networkx>=3.2.0

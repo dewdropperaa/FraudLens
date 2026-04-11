@@ -58,6 +58,7 @@ class ConsensusSystem:
     def __init__(self) -> None:
         self._store = get_claim_store()
         self._weights = _agent_weights()
+        self._expected_agents = set(self._weights.keys())
         self._threshold = float(os.getenv("CONSENSUS_APPROVAL_THRESHOLD", "75"))
         self._graph_fp_force = float(os.getenv("GRAPH_FRAUD_FORCE_REJECT_FP", "0.12"))
         self._anomaly_score_force = float(os.getenv("ANOMALY_FORCE_REJECT_SCORE", "40"))
@@ -80,6 +81,17 @@ class ConsensusSystem:
             total_w += w
         return round(acc / total_w, 2) if total_w else 0.0
 
+    def _agent_coverage_ratio(self, agent_results: List[AgentResult]) -> float:
+        """
+        Fraction of expected agents present in this decision round.
+        Keeps consensus mathematically honest if orchestration returns partial results.
+        """
+        if not self._expected_agents:
+            return 1.0
+        present = {r.agent_name for r in agent_results}
+        covered = len(self._expected_agents.intersection(present))
+        return covered / len(self._expected_agents)
+
     def _critical_agent_force_reject(self, agent_results: List[AgentResult]) -> bool:
         """
         Graph: material fraud probability forces reject (overrides weak averaging).
@@ -100,7 +112,13 @@ class ConsensusSystem:
         return False
 
     def _finalize(self, agent_results: List[AgentResult]) -> Tuple[str, float]:
-        consensus_score = self._weighted_score(agent_results)
+        raw_score = self._weighted_score(agent_results)
+        coverage_ratio = self._agent_coverage_ratio(agent_results)
+        consensus_score = round(raw_score * coverage_ratio, 2)
+
+        # Fail closed if any expected agent is missing.
+        if coverage_ratio < 1.0:
+            return "REJECTED", consensus_score
 
         if any(not r.decision for r in agent_results):
             return "REJECTED", consensus_score
@@ -112,6 +130,32 @@ class ConsensusSystem:
             return "APPROVED", consensus_score
 
         return "REJECTED", consensus_score
+
+    @staticmethod
+    def _effective_document_count(claim_data: Dict[str, Any]) -> int:
+        """Use whichever source has richer evidence: raw doc ids or extracted uploads."""
+        documents = claim_data.get("documents") or []
+        extractions = claim_data.get("document_extractions") or []
+        return max(len(documents), len(extractions))
+
+    def _insufficient_evidence_force_reject(self, claim_data: Dict[str, Any]) -> bool:
+        """
+        Defense-in-depth for high-value claims:
+        force reject when claim amount is high but documentary/history evidence is thin.
+        """
+        amount = float(claim_data.get("amount") or 0.0)
+        history_len = len(claim_data.get("history") or [])
+        doc_count = self._effective_document_count(claim_data)
+
+        # Moderate-high amount: require a minimum investigation trail.
+        if amount >= 25_000 and (doc_count < 3 or history_len < 2):
+            return True
+
+        # Very high amount: require stronger corroboration from both docs and history.
+        if amount >= 40_000 and (doc_count < 4 or history_len < 3):
+            return True
+
+        return False
 
     @staticmethod
     def _extreme_fraud_veto(
@@ -143,6 +187,9 @@ class ConsensusSystem:
         """
         decision, consensus_score = self._finalize(agent_results)
         veto_applied = False
+        if decision == "APPROVED" and self._insufficient_evidence_force_reject(claim_data):
+            decision = "REJECTED"
+            veto_applied = True
         if decision == "APPROVED" and self._extreme_fraud_veto(claim_data, agent_results):
             decision = "REJECTED"
             veto_applied = True
@@ -185,8 +232,17 @@ class ConsensusSystem:
         zk_proof_hash: str | None = None
 
         if decision == "APPROVED":
-            ipfs_hashes = await self._upload_to_ipfs_async(claim_id, enriched)
-            ipfs_hash = ipfs_hashes[0] if ipfs_hashes else None
+            try:
+                ipfs_hashes = await self._upload_to_ipfs_async(claim_id, enriched)
+                ipfs_hash = ipfs_hashes[0] if ipfs_hashes else None
+            except Exception as exc:
+                logging.getLogger("claimguard.consensus").warning(
+                    "ipfs_upload_failed claim_id=%s error=%s",
+                    claim_id,
+                    exc,
+                )
+                ipfs_hashes = []
+                ipfs_hash = None
 
             if self._blockchain_enabled:
                 chain_result = await asyncio.to_thread(

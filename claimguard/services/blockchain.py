@@ -157,6 +157,21 @@ class BlockchainService:
         self.contract = None
         if self.contract_address:
             self._load_contract()
+
+    @staticmethod
+    def _should_wait_for_receipt() -> bool:
+        raw = (os.getenv("BLOCKCHAIN_WAIT_FOR_RECEIPT", "") or "").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _receipt_timeout_seconds() -> int:
+        raw = (os.getenv("BLOCKCHAIN_RECEIPT_TIMEOUT_SECONDS", "") or "").strip()
+        if not raw:
+            return 120
+        try:
+            return max(1, int(float(raw)))
+        except ValueError:
+            return 120
     
     def _load_contract(self) -> None:
         """Load the smart contract instance"""
@@ -282,23 +297,20 @@ class BlockchainService:
             'gasPrice': self.get_gas_price(),
         }
         
-        # Estimate gas
-        gas_estimate = self.estimate_gas({
-            **tx,
-            'to': self.contract_address,
-            'data': self.contract.encode_abi(
-                fn_name="validateClaim",
-                args=[claim_id_hash, int(score), approved]
-            )
-        })
-        tx['gas'] = gas_estimate
-        
-        # Build and sign transaction
-        transaction = self.contract.functions.validateClaim(
+        claim_fn = self.contract.functions.validateClaim(
             claim_id_hash,
             int(score),
             approved
-        ).build_transaction(tx)
+        )
+
+        # Estimate gas from the contract function (Web3 v6+ compatible).
+        try:
+            tx['gas'] = int(claim_fn.estimate_gas({'from': self.address}) * 1.2)
+        except Exception:
+            tx['gas'] = 300000
+
+        # Build and sign transaction
+        transaction = claim_fn.build_transaction(tx)
         
         signed_tx = self.w3.eth.account.sign_transaction(transaction, self.private_key)
         
@@ -308,17 +320,30 @@ class BlockchainService:
         
         print(f"Transaction sent: {tx_hash_hex}")
         
-        # Wait for confirmation
-        receipt = self._wait_for_transaction(tx_hash_hex)
-        
+        if self._should_wait_for_receipt():
+            receipt = self._wait_for_transaction(
+                tx_hash_hex,
+                timeout=self._receipt_timeout_seconds(),
+            )
+            return {
+                "tx_hash": tx_hash_hex,
+                "block_number": receipt['blockNumber'],
+                "gas_used": receipt['gasUsed'],
+                "status": "success" if receipt['status'] == 1 else "failed",
+                "claim_id_hash": self.w3.to_hex(claim_id_hash),
+                "document_hash": self.w3.to_hex(document_hash),
+                "zk_proof_hash": self.w3.to_hex(zk_proof_hash),
+            }
+
+        # Default non-blocking path: return immediately after broadcast.
         return {
             "tx_hash": tx_hash_hex,
-            "block_number": receipt['blockNumber'],
-            "gas_used": receipt['gasUsed'],
-            "status": "success" if receipt['status'] == 1 else "failed",
+            "block_number": None,
+            "gas_used": None,
+            "status": "submitted",
             "claim_id_hash": self.w3.to_hex(claim_id_hash),
             "document_hash": self.w3.to_hex(document_hash),
-            "zk_proof_hash": self.w3.to_hex(zk_proof_hash)
+            "zk_proof_hash": self.w3.to_hex(zk_proof_hash),
         }
     
     def _wait_for_transaction(self, tx_hash: str, timeout: int = 120) -> Dict:

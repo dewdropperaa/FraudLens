@@ -1,23 +1,44 @@
-from typing import Dict, Any
+from typing import Any, Dict
+
 from .base_agent import BaseAgent
+
+POLICY_SYSTEM_PROMPT = """You are a compliance and fraud risk analyst.
+
+You do not blindly apply policy rules.
+
+You question:
+- borderline cases
+- repeated near-limit claims
+- patterns exploiting policy thresholds
+
+You assume attackers may optimize claims to stay just below limits.
+
+Treat tool output as structured limits and signals — combine with cumulative and marginal abuse patterns."""
 
 
 class PolicyAgent(BaseAgent):
+    system_prompt: str = POLICY_SYSTEM_PROMPT
+
     def __init__(self):
         super().__init__(
             name="Policy Agent",
-            role="Insurance Coverage Validation Specialist",
-            goal="Validate insurance coverage and policy compliance"
+            role="Compliance & Policy Risk Analyst",
+            goal="Apply CNSS/CNOPS rules while flagging threshold gaming and borderline abuse via tool signals",
         )
 
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
         insurance = claim_data.get("insurance", "")
-        amount = claim_data.get("amount", 0)
+        try:
+            amount = float(claim_data.get("amount", 0) or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
         history = claim_data.get("history", [])
+        if not isinstance(history, list):
+            history = []
 
         score = 100
         reasoning = []
-        details = {}
+        details: Dict[str, Any] = {"system_prompt_version": "policy_v2_forensic"}
 
         if insurance not in ["CNSS", "CNOPS"]:
             score -= 60
@@ -65,5 +86,5 @@ class PolicyAgent(BaseAgent):
             "decision": decision,
             "score": round(score, 2),
             "reasoning": "; ".join(reasoning) if reasoning else "Policy coverage validated",
-            "details": details
+            "details": details,
         }

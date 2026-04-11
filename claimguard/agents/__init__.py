@@ -5,6 +5,7 @@ from .identity_agent import IdentityAgent
 from .document_agent import DocumentAgent
 from .policy_agent import PolicyAgent
 from .graph_agent import GraphAgent
+from .security_utils import detect_prompt_injection, sanitize_input
 
 __all__ = [
     "BaseAgent",
@@ -14,4 +15,6 @@ __all__ = [
     "DocumentAgent",
     "PolicyAgent",
     "GraphAgent",
+    "detect_prompt_injection",
+    "sanitize_input",
 ]

@@ -7,6 +7,7 @@ returns empty text with method ``ocr_unavailable`` / ``ocr_failed``.
 from __future__ import annotations
 
 import io
+import os
 import re
 from typing import Any, Dict, List
 
@@ -28,6 +29,100 @@ def _truncate(s: str) -> str:
     if len(s) > _MAX_TEXT_PER_FILE:
         return s[:_MAX_TEXT_PER_FILE] + "\n...[truncated]"
     return s
+
+
+def _configure_tesseract_if_needed(pytesseract_module: Any) -> None:
+    """
+    Best-effort Tesseract executable discovery for hosts where PATH is not set.
+    """
+    configured = str(getattr(pytesseract_module.pytesseract, "tesseract_cmd", "") or "").strip()
+    if configured and os.path.exists(configured):
+        return
+
+    env_cmd = os.getenv("TESSERACT_CMD", "").strip()
+    if env_cmd and os.path.exists(env_cmd):
+        pytesseract_module.pytesseract.tesseract_cmd = env_cmd
+        return
+
+    candidates: List[str] = []
+    if os.name == "nt":
+        candidates.extend(
+            [
+                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            ]
+        )
+    else:
+        candidates.extend(["/usr/bin/tesseract", "/usr/local/bin/tesseract"])
+
+    for c in candidates:
+        if os.path.exists(c):
+            pytesseract_module.pytesseract.tesseract_cmd = c
+            return
+
+
+def _ocr_image_bytes(data: bytes) -> Dict[str, Any]:
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return {
+            "extracted_text": "",
+            "extraction_method": "ocr_unavailable",
+            "error": "Pillow/pytesseract not installed",
+        }
+    try:
+        _configure_tesseract_if_needed(pytesseract)
+        img = Image.open(io.BytesIO(data))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        text = pytesseract.image_to_string(img)
+        return {
+            "extracted_text": _truncate(text),
+            "extraction_method": "tesseract_ocr",
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "extracted_text": "",
+            "extraction_method": "ocr_failed",
+            "error": str(e),
+        }
+
+
+def _ocr_pdf_bytes(data: bytes) -> Dict[str, Any]:
+    """
+    OCR fallback for scanned PDFs by rasterizing pages then using Tesseract.
+    """
+    try:
+        import pytesseract
+        import pypdfium2 as pdfium
+    except ImportError:
+        return {
+            "extracted_text": "",
+            "extraction_method": "pdf_ocr_unavailable",
+            "error": "pypdfium2/pytesseract not installed",
+        }
+    try:
+        _configure_tesseract_if_needed(pytesseract)
+        pdf = pdfium.PdfDocument(io.BytesIO(data))
+        chunks: List[str] = []
+        for i in range(len(pdf)):
+            page = pdf[i]
+            bitmap = page.render(scale=2.0).to_pil()
+            text = pytesseract.image_to_string(bitmap) or ""
+            chunks.append(text)
+        return {
+            "extracted_text": _truncate("\n".join(chunks)),
+            "extraction_method": "pdf_ocr",
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "extracted_text": "",
+            "extraction_method": "pdf_ocr_failed",
+            "error": str(e),
+        }
 
 
 def extract_text_from_bytes(data: bytes, filename: str) -> Dict[str, Any]:
@@ -75,6 +170,16 @@ def extract_text_from_bytes(data: bytes, filename: str) -> Dict[str, Any]:
                     t = ""
                 chunks.append(t)
             text = _truncate("\n".join(chunks))
+            if text.strip():
+                return {
+                    "extracted_text": text,
+                    "extraction_method": "pypdf",
+                    "error": err,
+                }
+            ocr_res = _ocr_pdf_bytes(data)
+            # If OCR unavailable/failed, preserve pypdf status for observability.
+            if (ocr_res.get("extracted_text") or "").strip():
+                return ocr_res
             return {
                 "extracted_text": text,
                 "extraction_method": "pypdf",
@@ -88,32 +193,7 @@ def extract_text_from_bytes(data: bytes, filename: str) -> Dict[str, Any]:
             }
 
     if ext in {"png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "gif"}:
-        try:
-            import pytesseract
-            from PIL import Image
-        except ImportError:
-            return {
-                "extracted_text": "",
-                "extraction_method": "ocr_unavailable",
-                "error": "Pillow/pytesseract not installed",
-            }
-        try:
-            img = Image.open(io.BytesIO(data))
-            if img.mode not in ("RGB", "L"):
-                img = img.convert("RGB")
-            text = pytesseract.image_to_string(img)
-            return {
-                "extracted_text": _truncate(text),
-                "extraction_method": "tesseract_ocr",
-                "error": None,
-            }
-        except Exception as e:
-            # Tesseract binary missing, invalid image, etc.
-            return {
-                "extracted_text": "",
-                "extraction_method": "ocr_failed",
-                "error": str(e),
-            }
+        return _ocr_image_bytes(data)
 
     return {
         "extracted_text": "",

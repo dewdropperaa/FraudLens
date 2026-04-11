@@ -599,7 +599,11 @@ class GraphFraudDetector:
         patient_id = self._require_graph_id(claim_data, "patient_id")
         provider_id = self._require_graph_id(claim_data, "provider_id")
         claim_id = self._require_graph_id(claim_data, "claim_id")
-        amount = float(claim_data.get("amount", claim_data.get("claim_amount", 0.0)) or 0.0)
+        raw_amt = claim_data.get("amount", claim_data.get("claim_amount", 0.0)) or 0.0
+        try:
+            amount = float(raw_amt)
+        except (TypeError, ValueError):
+            amount = 0.0
 
         g = self._augmented_graph_for_claim(patient_id, provider_id, claim_id)
         patient_node = f"patient::{patient_id}"

@@ -30,43 +30,47 @@ def build_fraud_agents(llm: Any) -> list[Agent]:
     """
     specs: Sequence[tuple[str, str, str, type]] = (
         (
-            "Anomaly Detection Specialist",
-            "Flag statistical and behavioral anomalies in submitted claims.",
-            "You specialize in spotting unusual amounts, velocity, and documentation gaps "
-            "without blocking legitimate care. You never guess numbers — you call the tool.",
+            "Fraud Risk & Anomaly Expert",
+            "Surface abnormal amounts, history inconsistencies, and suspiciously stable profiles.",
+            "You distrust surface patterns; tool output is raw signal only. Flag unusual jumps, "
+            "historical mismatch, and 'too clean' stability even when scores look fine. "
+            "Assume manipulated inputs may look normal. You never guess numbers — you call the tool.",
             AnomalyClaimTool,
         ),
         (
-            "Pattern Mining Specialist",
-            "Detect repeated or structured fraud patterns across claim history.",
-            "You compare this claim to historical amounts and timing; you quantify spikes "
-            "with z-scores and interval checks via the tool only.",
+            "Fraud Pattern Analyst",
+            "Detect repetition, timing regularity, and behavioral signatures.",
+            "You are skeptical of repeated clean claims, evenly spaced timing (automation), and "
+            "artificially consistent amounts. Attackers may mimic legitimacy — report irregularities "
+            "and suspicious regularity via the tool only.",
             PatternClaimTool,
         ),
         (
-            "Identity Assurance Specialist",
-            "Validate identifiers and cross-record consistency for the insured.",
-            "You focus on ID format, collisions across history, and name drift — always "
-            "through the deterministic tool.",
+            "Identity Verification Specialist",
+            "Detect spoofed or reused identifiers and cross-record inconsistency.",
+            "Identity fields may be forged or recycled. Look for history conflicts, ID collisions, "
+            "and subtle drift — format match is not proof. Use the deterministic tool only.",
             IdentityClaimTool,
         ),
         (
-            "Document Integrity Specialist",
-            "Assess whether submitted document references meet minimum evidence rules.",
-            "You evaluate counts, required doc types for the amount tier, and naming "
-            "red flags using the tool.",
+            "Forensic Document Analyst",
+            "Assess document completeness, consistency, and adversarial wording.",
+            "Documents may be manipulated or misleading. Question missing types, extraction vs claim "
+            "mismatches, and influence language. Even valid-looking packs may be too perfect — use the tool.",
             DocumentClaimTool,
         ),
         (
-            "Policy Compliance Specialist",
-            "Ensure CNSS/CNOPS limits and annual utilization rules are respected.",
-            "You apply insurer-specific ceilings and rejection history signals via the tool.",
+            "Compliance & Policy Risk Analyst",
+            "Apply policy limits while flagging threshold gaming and borderline abuse.",
+            "Do not rubber-stamp rules: probe borderline amounts, repeated near-limit claims, and "
+            "limit optimization. Use the tool for ceilings and rejection history.",
             PolicyClaimTool,
         ),
         (
-            "Graph Risk Specialist",
-            "Score network risk across patients, providers, and claims.",
-            "You interpret graph-derived fraud probability and patterns — only via the tool.",
+            "Network Fraud Analyst",
+            "Interpret probabilistic graph risk across patients, providers, and claims.",
+            "Graph risk is not binary truth. Weight indirect links, clusters, and weak signals; "
+            "do not dismiss moderate fraud probability — interpret via the tool only.",
             GraphClaimTool,
         ),
     )

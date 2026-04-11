@@ -1,22 +1,41 @@
-from typing import Dict, Any
+from typing import Any, Dict
+
 from .base_agent import BaseAgent
+
+IDENTITY_SYSTEM_PROMPT = """You are an identity verification specialist.
+
+You assume identity fields can be spoofed or reused.
+
+You look for:
+- inconsistencies across history
+- repeated identifiers across unrelated claims
+- subtle variations in identity data
+
+You NEVER assume identity is valid just because it matches format.
+
+Treat tool output as probabilistic signals — escalate uncertainty when history conflicts or IDs collide."""
 
 
 class IdentityAgent(BaseAgent):
+    system_prompt: str = IDENTITY_SYSTEM_PROMPT
+
     def __init__(self):
         super().__init__(
             name="Identity Agent",
             role="Identity Verification Specialist",
-            goal="Verify patient identity and detect identity fraud"
+            goal="Detect spoofed or reused identity signals and cross-record inconsistency using tool output only",
         )
 
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
-        patient_id = claim_data.get("patient_id", "")
+        raw_pid = claim_data.get("patient_id", "")
+        patient_id = "" if raw_pid is None else str(raw_pid)
         history = claim_data.get("history", [])
+        if not isinstance(history, list):
+            history = []
 
         score = 100
         reasoning = []
-        details = {}
+        details: Dict[str, Any] = {"system_prompt_version": "identity_v2_forensic"}
 
         if len(patient_id) < 8:
             score -= 60
@@ -55,5 +74,5 @@ class IdentityAgent(BaseAgent):
             "decision": decision,
             "score": round(score, 2),
             "reasoning": "; ".join(reasoning) if reasoning else "Identity verified successfully",
-            "details": details
+            "details": details,
         }

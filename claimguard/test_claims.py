@@ -309,3 +309,38 @@ def test_14_json_body_documents_base64_merges_extractions():
     assert posted["decision"] == "APPROVED"
     doc = next(ar for ar in posted["agent_results"] if ar["agent_name"] == "Document Agent")
     assert doc["decision"] is True
+
+
+def test_15_high_amount_with_sparse_evidence_rejected():
+    """
+    Regression guard: high-value claims must not pass with near-perfect scores when
+    history/docs are too sparse to support approval confidence.
+    """
+    claim_data = {
+        "patient_id": "12345678",
+        "provider_id": "3037",
+        "amount": 30000.0,
+        "documents": ["medical_report", "invoice"],
+        "history": [{"amount": 2500.0, "date": "2024-01-15", "recent": False}],
+        "insurance": "CNOPS",
+    }
+    posted = _post_claim(claim_data)
+    assert posted["decision"] == "REJECTED"
+
+
+def test_16_fraud_text_signal_in_documents_rejected():
+    raw = b"medical report invoice prescription. This invoice is forged and tampered."
+    b64 = base64.b64encode(raw).decode("ascii")
+    claim_data = {
+        "patient_id": "12345678",
+        "provider_id": "3037",
+        "amount": 6000.0,
+        "insurance": "CNSS",
+        "documents": [],
+        "documents_base64": [{"name": "evidence.txt", "content_base64": b64}],
+        "history": [{"amount": 2200.0, "date": "2024-01-15", "recent": False}],
+    }
+    posted = _post_claim(claim_data)
+    assert posted["decision"] == "REJECTED"
+    doc = next(ar for ar in posted["agent_results"] if ar["agent_name"] == "Document Agent")
+    assert doc["decision"] is False

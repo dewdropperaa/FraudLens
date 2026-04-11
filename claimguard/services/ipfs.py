@@ -11,6 +11,9 @@ from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 import time
 from functools import wraps
+from pathlib import Path
+
+from dotenv import dotenv_values
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -57,13 +60,34 @@ class IPFSService:
     """
     
     PINATA_API_URL = "https://api.pinata.cloud"
+
+    @staticmethod
+    def _pinata_env_from_project_dotenv() -> Dict[str, str]:
+        """
+        Read Pinata keys from project-local .env so runtime shell-level variables
+        cannot silently shadow the current project credentials.
+        """
+        # Keep tests deterministic/fast: avoid live Pinata network calls under pytest.
+        if os.getenv("PYTEST_CURRENT_TEST"):
+            return {}
+        env_path = Path(__file__).resolve().parents[1] / ".env"
+        if not env_path.exists():
+            return {}
+        vals = dotenv_values(env_path)
+        out: Dict[str, str] = {}
+        for key in ("PINATA_API_KEY", "PINATA_API_SECRET", "PINATA_JWT"):
+            val = vals.get(key)
+            if val is not None:
+                out[key] = str(val).strip()
+        return out
     
     def __init__(self):
         load_environment()
+        pinata_from_dotenv = self._pinata_env_from_project_dotenv()
         # Pinata API credentials
-        self.pinata_api_key = os.getenv("PINATA_API_KEY")
-        self.pinata_api_secret = os.getenv("PINATA_API_SECRET")
-        self.pinata_jwt = os.getenv("PINATA_JWT")
+        self.pinata_api_key = pinata_from_dotenv.get("PINATA_API_KEY") or os.getenv("PINATA_API_KEY")
+        self.pinata_api_secret = pinata_from_dotenv.get("PINATA_API_SECRET") or os.getenv("PINATA_API_SECRET")
+        self.pinata_jwt = pinata_from_dotenv.get("PINATA_JWT") or os.getenv("PINATA_JWT")
 
         raw_key = os.getenv("DOCUMENT_ENCRYPTION_KEY", "").strip()
         if not raw_key:
@@ -80,11 +104,15 @@ class IPFSService:
         if not self.pinata_jwt and not (self.pinata_api_key and self.pinata_api_secret):
             print("Warning: Pinata credentials not configured. IPFS uploads will be simulated.")
     
-    def _get_headers(self) -> Dict[str, str]:
-        """Get headers for Pinata API requests"""
-        headers = {
-            "Content-Type": "application/json"
-        }
+    def _get_headers(self, *, json_content: bool = False) -> Dict[str, str]:
+        """Get headers for Pinata API requests.
+
+        Keep Content-Type unset for multipart uploads so aiohttp can add
+        a proper boundary automatically.
+        """
+        headers: Dict[str, str] = {}
+        if json_content:
+            headers["Content-Type"] = "application/json"
         
         if self.pinata_jwt:
             headers["Authorization"] = f"Bearer {self.pinata_jwt}"
