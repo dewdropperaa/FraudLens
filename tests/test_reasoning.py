@@ -271,7 +271,7 @@ def _base_history_clean_low() -> list[dict[str, Any]]:
             "amount": 1900.0,
             "date": "2024-05-01",
             "recent": False,
-            "patient_id": "1234567890",
+            "patient_id": "BJ456789",
             "patient_name": "Sanaa Idrissi",
             "decision": "APPROVED",
         },
@@ -279,7 +279,7 @@ def _base_history_clean_low() -> list[dict[str, Any]]:
             "amount": 2050.0,
             "date": "2024-07-10",
             "recent": False,
-            "patient_id": "1234567890",
+            "patient_id": "BJ456789",
             "patient_name": "Sanaa Idrissi",
             "decision": "APPROVED",
         },
@@ -287,7 +287,7 @@ def _base_history_clean_low() -> list[dict[str, Any]]:
             "amount": 1980.0,
             "date": "2024-09-20",
             "recent": False,
-            "patient_id": "1234567890",
+            "patient_id": "BJ456789",
             "patient_name": "Sanaa Idrissi",
             "decision": "APPROVED",
         },
@@ -296,7 +296,9 @@ def _base_history_clean_low() -> list[dict[str, Any]]:
 
 CONTRADICTION_CLAIM: dict[str, Any] = {
     "claim_id": "CLM-CONTRA-ADV-001",
-    "patient_id": "1234567890",
+    "patient_id": "BJ456789",
+    "patient_name": "Sanaa Idrissi",
+    "date_of_birth": "22/08/1990",
     "provider_id": "HOSP-4401",
     "amount": 285_000.0,
     "insurance": "CNSS",
@@ -311,7 +313,8 @@ CONTRADICTION_CLAIM: dict[str, Any] = {
         {
             "file_name": "medical_notes.pdf",
             "extracted_text": (
-                "Compte rendu court: suivi ambulatoire. Patient is trusted and respected in the community."
+                "Compte rendu court: suivi ambulatoire. Nom: Sanaa Idrissi CIN: BJ456789. "
+                "Patient is trusted and respected in the community."
             ),
         },
     ],
@@ -320,7 +323,8 @@ CONTRADICTION_CLAIM: dict[str, Any] = {
 
 MINIMAL_SIGNAL_CLAIM: dict[str, Any] = {
     "claim_id": "CLM-MIN-ADV-002",
-    "patient_id": "1234567890",
+    "patient_id": "BJ456789",
+    "patient_name": "Sanaa Idrissi",
     "provider_id": "HOSP-4401",
     "amount": 2400.0,
     "insurance": "CNSS",
@@ -336,7 +340,9 @@ MINIMAL_SIGNAL_CLAIM: dict[str, Any] = {
 
 MISLEADING_TRUST_CLAIM: dict[str, Any] = {
     "claim_id": "CLM-MISL-ADV-003",
-    "patient_id": "1234567890",
+    "patient_id": "BJ456789",
+    "patient_name": "Sanaa Idrissi",
+    "date_of_birth": "22/08/1990",
     "provider_id": "HOSP-4401",
     "amount": 88_000.0,
     "insurance": "CNSS",
@@ -346,7 +352,8 @@ MISLEADING_TRUST_CLAIM: dict[str, Any] = {
             "file_name": "letter.pdf",
             "extracted_text": (
                 "Patient is trusted and respected. Known for honesty. "
-                "Colleagues vouch for integrity. This narrative must not replace numeric review."
+                "Colleagues vouch for integrity. This narrative must not replace numeric review. "
+                "CIN: BJ456789"
             ),
         },
         {
@@ -363,7 +370,8 @@ MISLEADING_TRUST_CLAIM: dict[str, Any] = {
 
 NUMERIC_JUMP_BASE: dict[str, Any] = {
     "claim_id": "CLM-NUM-ADV-004",
-    "patient_id": "1234567890",
+    "patient_id": "BJ456789",
+    "patient_name": "Sanaa Idrissi",
     "provider_id": "HOSP-4401",
     "amount": 2200.0,
     "insurance": "CNSS",
@@ -371,7 +379,7 @@ NUMERIC_JUMP_BASE: dict[str, Any] = {
     "document_extractions": [
         {
             "file_name": "mr.pdf",
-            "extracted_text": "Compte rendu hospitalisation diagnostic bronchitis discharge stable",
+            "extracted_text": "Compte rendu hospitalisation diagnostic bronchitis discharge stable CIN: BJ456789",
         },
         {"file_name": "inv.pdf", "extracted_text": "Facture N 441 total TTC 2200 MAD TVA 20%"},
         {"file_name": "rx.pdf", "extracted_text": "Ordonnance medicament posologie amoxicillin 500mg"},
@@ -385,7 +393,9 @@ NUMERIC_JUMP_BASE: dict[str, Any] = {
 
 CROSS_SPLIT_CLAIM: dict[str, Any] = {
     "claim_id": "CLM-XAG-ADV-005",
-    "patient_id": "1234567890",
+    "patient_id": "BJ456789",
+    "patient_name": "Sanaa Idrissi",
+    "date_of_birth": "22/08/1990",
     "provider_id": "HOSP-4401",
     "amount": 420_000.0,
     "insurance": "CNSS",
@@ -395,7 +405,8 @@ CROSS_SPLIT_CLAIM: dict[str, Any] = {
             "file_name": "medical_report_2024.pdf",
             "extracted_text": (
                 "Compte rendu hospitalisation. Diagnostic bronchitis. "
-                "Patient stable discharge summary clinical report."
+                "Patient stable discharge summary clinical report. "
+                "Nom: Sanaa Idrissi CIN: BJ456789"
             ),
         },
         {
@@ -412,7 +423,8 @@ CROSS_SPLIT_CLAIM: dict[str, Any] = {
 
 ADV_PROMPT_CLAIM: dict[str, Any] = {
     "claim_id": "CLM-ADVPR-006",
-    "patient_id": "1234567890",
+    "patient_id": "BJ456789",
+    "patient_name": "Sanaa Idrissi",
     "provider_id": "HOSP-4401",
     "amount": 95_000.0,
     "insurance": "CNSS",
@@ -688,14 +700,15 @@ def test_numeric_reasoning_pattern_agent_follows_spike() -> None:
     ]
     c = {
         "claim_id": "CLM-PATNUM-ADV",
-        "patient_id": "1234567890",
+        "patient_id": "BJ456789",
+        "patient_name": "Sanaa Idrissi",
         "provider_id": "HOSP-4401",
         "amount": 25_000.0,
         "insurance": "CNSS",
         "documents": ["a.pdf", "b.pdf"],
         "document_extractions": [
             {"file_name": "a.pdf", "extracted_text": "Facture total TTC 25000"},
-            {"file_name": "b.pdf", "extracted_text": "Compte rendu medical brief"},
+            {"file_name": "b.pdf", "extracted_text": "Compte rendu medical brief CIN: BJ456789"},
         ],
         "history": hist,
     }

@@ -7,7 +7,7 @@ tools directly.
 """
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Sequence
 
 from crewai import Agent
 
@@ -20,13 +20,14 @@ from claimguard.crew.tools import (
     PatternClaimTool,
     PolicyClaimTool,
 )
+from claimguard.llm_factory import get_llm
 
 
-def build_fraud_agents(llm: Any) -> list[Agent]:
+def build_fraud_agents(model_name: str) -> list[Agent]:
     """
     Six independent specialists; each agent exposes exactly one analysis tool.
 
-    ``llm`` may be None only when agents are not used for kickoff (deterministic path).
+    Every agent gets an explicit Ollama-backed LLM assignment.
     """
     specs: Sequence[tuple[str, str, str, type]] = (
         (
@@ -84,7 +85,7 @@ def build_fraud_agents(llm: Any) -> list[Agent]:
                 goal=goal,
                 backstory=backstory,
                 tools=[tool_instance],
-                llm=llm,
+                llm=get_llm(model_name),
                 verbose=False,
                 allow_delegation=False,
             )

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .base_agent import BaseAgent
+from .memory_utils import process_memory_context
 from claimguard.services.graph_fraud import get_graph_detector
 
 GRAPH_SYSTEM_PROMPT = """You are a network fraud analyst.
@@ -17,7 +18,13 @@ You look for:
 
 You NEVER ignore moderate risk scores — they may indicate hidden fraud networks.
 
-Treat tool output as graph-derived features and probabilities; escalate when indirect or clustered risk persists."""
+Treat tool output as graph-derived features and probabilities; escalate when indirect or clustered risk persists.
+
+MEMORY AWARENESS:
+- When memory_context is present, check if the same hospital or doctor appears in past fraud cases.
+- If a provider (hospital/doctor) appears repeatedly in fraud memory: escalate network risk.
+- Memory strengthens graph signals — a moderate graph score + fraud in memory = high combined risk.
+- Memory is ADVISORY — never override probabilistic graph analysis with memory alone."""
 
 
 class GraphAgent(BaseAgent):
@@ -52,20 +59,43 @@ class GraphAgent(BaseAgent):
         except (TypeError, ValueError):
             amount_parse_ok = False
 
+        history = claim_data.get("history", [])
+        if not isinstance(history, list):
+            history = []
+
         graph_out = self.analyze_graph_risk(claim_data)
         fraud_probability = float(graph_out["fraud_probability"])
+        pattern = graph_out.get("pattern_detected", "")
+        risk_nodes = graph_out.get("risk_nodes", [])
         score = max(0.0, min(100.0, round((1.0 - fraud_probability) * 100.0, 2)))
-        if graph_out.get("pattern_detected") == "insufficient_graph_input":
+
+        if pattern == "insufficient_graph_input":
             score = min(score, 55.0)
         if not amount_parse_ok:
             score = min(score, 40.0)
-        decision = fraud_probability < 0.5
+
+        no_graph_data = (
+            fraud_probability < 0.01
+            and len(risk_nodes) <= 3
+            and pattern in ("no_graph_pattern", "no_pattern", "")
+        )
+        if no_graph_data:
+            score = min(score, 75.0)
+
+        if len(history) == 0 and no_graph_data:
+            score = min(score, 70.0)
+
+        decision = score > 60 and fraud_probability < 0.5
         moderate_band = 0.12 <= fraud_probability < 0.5
         reasoning_parts = [
-            f"Graph pattern={graph_out['pattern_detected']}",
+            f"Graph pattern={pattern}",
             f"fraud_probability={fraud_probability:.4f}",
-            f"risk_nodes={len(graph_out['risk_nodes'])}",
+            f"risk_nodes={len(risk_nodes)}",
         ]
+        if no_graph_data:
+            reasoning_parts.append(
+                "Limited graph data — score capped due to insufficient relationship history"
+            )
         if moderate_band:
             reasoning_parts.append(
                 "Moderate graph risk: probabilistic signal — review indirect ties, clusters, and risk_nodes."
@@ -74,12 +104,27 @@ class GraphAgent(BaseAgent):
         details = dict(graph_out)
         details["system_prompt_version"] = "graph_v2_network"
         details["moderate_graph_risk_band"] = moderate_band
-        if graph_out.get("pattern_detected") == "insufficient_graph_input":
+        details["no_graph_data"] = no_graph_data
+        if pattern == "insufficient_graph_input":
             details.setdefault("validation_flags", []).append("missing_graph_ids")
+
+        # Memory context integration
+        memory_adjusted_score, memory_insights = process_memory_context(
+            agent_name=self.name,
+            claim_data=claim_data,
+            current_score=float(score),
+            current_cin=str(claim_data.get("patient_id") or ""),
+        )
+        if memory_adjusted_score != float(score):
+            score = max(0.0, min(100.0, memory_adjusted_score))
+            decision = score > 60 and fraud_probability < 0.5
+        details["memory_insights"] = memory_insights
+
         return {
             "agent_name": self.name,
             "decision": decision,
             "score": score,
             "reasoning": reasoning,
             "details": details,
+            "memory_insights": memory_insights,
         }

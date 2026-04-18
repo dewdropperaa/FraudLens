@@ -134,6 +134,11 @@ class ClaimResult(BaseModel):
     decision: DecisionType
     score: float
     agent_results: List[AgentResult]
+    consensus_decision: str | None = None
+    Ts: float | None = None
+    retry_count: int = 0
+    mahic_breakdown: Dict[str, float] = Field(default_factory=dict)
+    contradictions: List[Dict[str, Any]] = Field(default_factory=list)
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     tx_hash: str | None = None
     ipfs_hash: str | None = None

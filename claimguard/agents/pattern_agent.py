@@ -5,6 +5,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional
 
 from .base_agent import BaseAgent
+from .memory_utils import process_memory_context
 
 PATTERN_SYSTEM_PROMPT = """You are a fraud pattern analyst.
 
@@ -19,7 +20,13 @@ You assume attackers may try to mimic legitimate patterns.
 
 You highlight ANY statistical irregularity or suspicious regularity.
 
-Treat tool output as raw signals, not final truth — surface weak or ambiguous patterns for review."""
+Treat tool output as raw signals, not final truth — surface weak or ambiguous patterns for review.
+
+MEMORY AWARENESS:
+- When memory_context is present, look for recurring patterns across past cases.
+- If past fraud cases show the same hospital or doctor: flag systematic provider fraud.
+- If the same billing pattern (diagnosis + amount range) recurs: flag templated fraud.
+- Memory is ADVISORY — do not override your statistical analysis with memory alone."""
 
 
 def _parse_history_date(h: Dict[str, Any]) -> Optional[date]:
@@ -57,6 +64,11 @@ class PatternAgent(BaseAgent):
             history = []
         insurance = claim_data.get("insurance", "")
 
+        doc_count = max(
+            len(claim_data.get("documents") or []),
+            len(claim_data.get("document_extractions") or []),
+        )
+
         score = 100
         reasoning: List[str] = []
         details: Dict[str, Any] = {}
@@ -65,6 +77,19 @@ class PatternAgent(BaseAgent):
             score -= 45
             reasoning.append("Suspicious patient ID detected")
             details["suspicious_patient_id"] = True
+
+        if len(history) == 0:
+            score -= 15
+            reasoning.append(
+                "No claim history available — pattern analysis requires prior data points"
+            )
+            details["no_history_for_pattern"] = True
+            if doc_count < 2:
+                score -= 10
+                reasoning.append(
+                    "Insufficient data: no history and minimal documents to establish behavioral baseline"
+                )
+                details["insufficient_baseline_data"] = True
 
         if len(history) > 0:
             amounts = [float(h.get("amount", 0) or 0) for h in history]
@@ -147,14 +172,33 @@ class PatternAgent(BaseAgent):
             details["recent_claims_pattern"] = len(recent_claims)
 
         score = max(0, score)
-        decision = score >= 50
+        decision = score > 60
 
         details["system_prompt_version"] = "pattern_v2_forensic"
+
+        default_msg = (
+            "No suspicious patterns detected"
+            if len(history) > 0
+            else "Insufficient data to perform pattern analysis"
+        )
+
+        # Memory context integration
+        memory_adjusted_score, memory_insights = process_memory_context(
+            agent_name=self.name,
+            claim_data=claim_data,
+            current_score=float(score),
+            current_cin=str(claim_data.get("patient_id") or ""),
+        )
+        if memory_adjusted_score != float(score):
+            score = max(0, int(memory_adjusted_score))
+            decision = score > 60
+        details["memory_insights"] = memory_insights
 
         return {
             "agent_name": self.name,
             "decision": decision,
             "score": round(score, 2),
-            "reasoning": "; ".join(reasoning) if reasoning else "No suspicious patterns detected",
+            "reasoning": "; ".join(reasoning) if reasoning else default_msg,
             "details": details,
+            "memory_insights": memory_insights,
         }

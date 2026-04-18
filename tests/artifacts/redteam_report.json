@@ -1,0 +1,2653 @@
+{
+  "summary": {
+    "total_tests": 10,
+    "passed": 3,
+    "failed": 7,
+    "critical_failures": 2
+  },
+  "accuracy_metrics": {
+    "fraud_detection_rate": 1.0,
+    "false_positive_rate": 0.8333,
+    "false_negative_rate": 0.0
+  },
+  "reasoning_metrics": {
+    "hallucination_rate": 0.0,
+    "avg_confidence": 0.7683,
+    "false_confidence_rate": 0.0,
+    "reasoning_completeness_score": 1.0
+  },
+  "consistency_analysis": {
+    "inter_agent_agreement": 0.6677,
+    "contradiction_frequency": 0.0,
+    "contradiction_impact_on_ts": 0.0
+  },
+  "system_weaknesses": [
+    {
+      "issue": "alerts_not_triggered",
+      "frequency": 6,
+      "impact": "MEDIUM"
+    },
+    {
+      "issue": "identity_invalid_pipeline_continued",
+      "frequency": 1,
+      "impact": "LOW"
+    },
+    {
+      "issue": "fraud_cluster_not_flagged",
+      "frequency": 1,
+      "impact": "LOW"
+    },
+    {
+      "issue": "pipeline_execution_error",
+      "frequency": 1,
+      "impact": "LOW"
+    }
+  ],
+  "agent_performance": {
+    "AnomalyAgent": {
+      "runs": 9,
+      "avg_latency_ms": 0,
+      "avg_confidence": 0.78,
+      "hallucination_rate": 0.0,
+      "reasoning_completeness_score": 1.0
+    },
+    "DocumentAgent": {
+      "runs": 9,
+      "avg_latency_ms": 0,
+      "avg_confidence": 0.71,
+      "hallucination_rate": 0.0,
+      "reasoning_completeness_score": 1.0
+    },
+    "GraphRiskAgent": {
+      "runs": 9,
+      "avg_latency_ms": 0.11,
+      "avg_confidence": 0.74,
+      "hallucination_rate": 0.0,
+      "reasoning_completeness_score": 1.0
+    },
+    "IdentityAgent": {
+      "runs": 9,
+      "avg_latency_ms": 0.44,
+      "avg_confidence": 0.9,
+      "hallucination_rate": 0.0,
+      "reasoning_completeness_score": 1.0
+    },
+    "PatternAgent": {
+      "runs": 9,
+      "avg_latency_ms": 0,
+      "avg_confidence": 0.76,
+      "hallucination_rate": 0.0,
+      "reasoning_completeness_score": 1.0
+    },
+    "PolicyAgent": {
+      "runs": 9,
+      "avg_latency_ms": 0.11,
+      "avg_confidence": 0.72,
+      "hallucination_rate": 0.0,
+      "reasoning_completeness_score": 1.0
+    }
+  },
+  "memory_impact": {
+    "improvement": 0.0,
+    "fraud_detection_with_memory": 1.0,
+    "fraud_detection_without_memory": 1.0,
+    "false_positive_delta": 0.0,
+    "risks": [
+      "No major memory risk observed in this run."
+    ]
+  },
+  "graph_detection": {
+    "clusters_detected": 0,
+    "missed_clusters": 0
+  },
+  "alerts": {
+    "triggered": 1,
+    "missed": 7,
+    "false_alerts": 1
+  },
+  "performance_metrics": {
+    "latency_per_agent_ms": {
+      "IdentityAgent": 0.44,
+      "DocumentAgent": 0,
+      "PolicyAgent": 0.11,
+      "AnomalyAgent": 0,
+      "PatternAgent": 0,
+      "GraphRiskAgent": 0.11
+    },
+    "avg_total_pipeline_ms": 587.3,
+    "max_total_pipeline_ms": 5684,
+    "retry_overhead_ms": 0.0
+  },
+  "recommendations": [
+    "Hard-stop pipeline when identity validity checks fail early.",
+    "Introduce central alert policy to enforce mandatory threshold alerts.",
+    "Refine alert severity mapping to reduce noisy alerts."
+  ],
+  "run_metadata": {
+    "claims_generated": 10,
+    "random_seed": 42,
+    "with_memory_runs": 10,
+    "without_memory_runs": 10
+  },
+  "sample_traces": [
+    {
+      "claim_id": "rt-suspicious-0016",
+      "scenario": "suspicious",
+      "expected_decision": "HUMAN_REVIEW",
+      "expected_fraud": true,
+      "use_memory": true,
+      "error": null,
+      "total_pipeline_ms": 34,
+      "agent_outputs": [
+        {
+          "agent": "IdentityAgent",
+          "score": 0.9,
+          "confidence": 0.9,
+          "explanation": "Identity verified from CIN and records.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.9,
+            "confidence": 0.9,
+            "explanation": "Identity verified from CIN and records.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "DocumentAgent",
+          "score": 0.88,
+          "confidence": 0.71,
+          "explanation": "Missing documents materially reduce verification certainty.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "IdentityAgent"
+            ],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.88,
+            "confidence": 0.71,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "PolicyAgent",
+          "score": 0.86,
+          "confidence": 0.72,
+          "explanation": "Missing documents materially reduce verification certainty.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "IdentityAgent",
+              "DocumentAgent"
+            ],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.86,
+            "confidence": 0.72,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "AnomalyAgent",
+          "score": 0.2,
+          "confidence": 0.78,
+          "explanation": "No anomaly trend observed.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "IdentityAgent",
+              "DocumentAgent",
+              "PolicyAgent"
+            ],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.2,
+            "confidence": 0.78,
+            "explanation": "No anomaly trend observed.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "PatternAgent",
+          "score": 0.25,
+          "confidence": 0.76,
+          "explanation": "No repeated suspicious pattern.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "AnomalyAgent"
+            ],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.25,
+            "confidence": 0.76,
+            "explanation": "No repeated suspicious pattern.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "GraphRiskAgent",
+          "score": 0.2,
+          "confidence": 0.74,
+          "explanation": "Network links do not indicate fraud ring.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "PatternAgent"
+            ],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {
+              "cluster_membership": "none",
+              "reuse_detection": {
+                "cin_reuse_detected": false,
+                "doctor_reuse_detected": false,
+                "cin_claim_count": 1,
+                "doctor_claim_count": 0
+              },
+              "network_risk_score": 0.25,
+              "fraud_rings": {
+                "fraud_rings": []
+              }
+            }
+          },
+          "output_snapshot": {
+            "score": 0.25,
+            "confidence": 0.74,
+            "explanation": "Network links do not indicate fraud ring. [graph cluster=none; cin_reuse=False; doctor_reuse=False; network_risk=0.250]",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        }
+      ],
+      "blackboard_snapshots": [
+        {
+          "stage": "IdentityAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "DocumentAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "PolicyAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "AnomalyAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "PatternAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "GraphRiskAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "Consensus",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          },
+          "Ts": 75.85,
+          "decision": "HUMAN_REVIEW",
+          "retry_count": 0
+        }
+      ],
+      "Ts": 75.85,
+      "decision": "HUMAN_REVIEW",
+      "retry_count": 0,
+      "alerts": [],
+      "validation_failures": [
+        "alerts_not_triggered"
+      ],
+      "raw_response": {
+        "agent_outputs": [
+          {
+            "agent": "IdentityAgent",
+            "score": 0.9,
+            "confidence": 0.9,
+            "explanation": "Identity verified from CIN and records.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "DocumentAgent",
+            "score": 0.88,
+            "confidence": 0.71,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "IdentityAgent"
+              ],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "PolicyAgent",
+            "score": 0.86,
+            "confidence": 0.72,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "IdentityAgent",
+                "DocumentAgent"
+              ],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "AnomalyAgent",
+            "score": 0.2,
+            "confidence": 0.78,
+            "explanation": "No anomaly trend observed.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "IdentityAgent",
+                "DocumentAgent",
+                "PolicyAgent"
+              ],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "PatternAgent",
+            "score": 0.25,
+            "confidence": 0.76,
+            "explanation": "No repeated suspicious pattern.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "AnomalyAgent"
+              ],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "GraphRiskAgent",
+            "score": 0.2,
+            "confidence": 0.74,
+            "explanation": "Network links do not indicate fraud ring.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "PatternAgent"
+              ],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {
+                "cluster_membership": "none",
+                "reuse_detection": {
+                  "cin_reuse_detected": false,
+                  "doctor_reuse_detected": false,
+                  "cin_claim_count": 1,
+                  "doctor_claim_count": 0
+                },
+                "network_risk_score": 0.25,
+                "fraud_rings": {
+                  "fraud_rings": []
+                }
+              }
+            },
+            "output_snapshot": {
+              "score": 0.25,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring. [graph cluster=none; cin_reuse=False; doctor_reuse=False; network_risk=0.250]",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          }
+        ],
+        "blackboard": {
+          "request": {
+            "identity": {
+              "cin": "CIN-183667",
+              "name": "Claimant-rt-suspicious-0016",
+              "hospital": "HSP-975",
+              "doctor": "DOC-338",
+              "country": "ma"
+            },
+            "documents": [
+              {
+                "id": "doc-rt-suspicious-0016",
+                "document_type": "invoice",
+                "text": "Provider coding pattern appears unusual."
+              }
+            ],
+            "policy": {
+              "amount": 21309.0,
+              "country": "ma",
+              "hospital": "HSP-975",
+              "doctor": "DOC-338",
+              "diagnosis": "general-check"
+            },
+            "metadata": {
+              "claim_id": "rt-suspicious-0016",
+              "scenario": "suspicious",
+              "expected_decision": "HUMAN_REVIEW",
+              "expected_fraud": true,
+              "obvious_fraud": false,
+              "identity_invalid": false,
+              "has_minimal_data": false,
+              "anomaly_score": 0.25,
+              "expected_alerts": [
+                "contradictions"
+              ]
+            }
+          },
+          "routing_decision": {
+            "intent": "general_claim",
+            "complexity": "simple",
+            "model": "mistral:7b",
+            "reason": "intent=general_claim, complexity=simple",
+            "metadata": {
+              "document_count": 1
+            }
+          },
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          },
+          "memory_context": [],
+          "fraud_ring_analysis": {
+            "fraud_rings": []
+          },
+          "reflexive_retry_logs": [],
+          "score_evolution": [
+            75.85
+          ],
+          "consensus_entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          }
+        },
+        "routing_decision": {
+          "intent": "general_claim",
+          "complexity": "simple",
+          "model": "mistral:7b",
+          "reason": "intent=general_claim, complexity=simple",
+          "metadata": {
+            "document_count": 1
+          }
+        },
+        "goa_used": false,
+        "Ts": 75.85,
+        "decision": "HUMAN_REVIEW",
+        "retry_count": 0,
+        "mahic_breakdown": {
+          "billing": 19.25,
+          "clinical": 5.47,
+          "temporal": 2.8,
+          "geo": 2.44
+        },
+        "contradictions": [],
+        "trust_layer": null,
+        "memory_context": []
+      }
+    },
+    {
+      "claim_id": "rt-adversarial-0037",
+      "scenario": "adversarial",
+      "expected_decision": "HUMAN_REVIEW",
+      "expected_fraud": true,
+      "use_memory": true,
+      "error": null,
+      "total_pipeline_ms": 27,
+      "agent_outputs": [
+        {
+          "agent": "IdentityAgent",
+          "score": 0.9,
+          "confidence": 0.9,
+          "explanation": "Identity verified from CIN and records.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [],
+            "routing_model": "deepseek-r1",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.9,
+            "confidence": 0.9,
+            "explanation": "Identity verified from CIN and records.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "DocumentAgent",
+          "score": 0.88,
+          "confidence": 0.71,
+          "explanation": "Missing documents materially reduce verification certainty.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "IdentityAgent"
+            ],
+            "routing_model": "deepseek-r1",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.88,
+            "confidence": 0.71,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "PolicyAgent",
+          "score": 0.86,
+          "confidence": 0.72,
+          "explanation": "Missing documents materially reduce verification certainty.",
+          "elapsed_ms": 1,
+          "input_snapshot": {
+            "required_context": [
+              "IdentityAgent",
+              "DocumentAgent"
+            ],
+            "routing_model": "deepseek-r1",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.86,
+            "confidence": 0.72,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "AnomalyAgent",
+          "score": 0.2,
+          "confidence": 0.78,
+          "explanation": "No anomaly trend observed.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "IdentityAgent",
+              "DocumentAgent",
+              "PolicyAgent"
+            ],
+            "routing_model": "deepseek-r1",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.2,
+            "confidence": 0.78,
+            "explanation": "No anomaly trend observed.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "PatternAgent",
+          "score": 0.25,
+          "confidence": 0.76,
+          "explanation": "No repeated suspicious pattern.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "AnomalyAgent"
+            ],
+            "routing_model": "deepseek-r1",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.25,
+            "confidence": 0.76,
+            "explanation": "No repeated suspicious pattern.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "GraphRiskAgent",
+          "score": 0.2,
+          "confidence": 0.74,
+          "explanation": "Network links do not indicate fraud ring.",
+          "elapsed_ms": 1,
+          "input_snapshot": {
+            "required_context": [
+              "PatternAgent"
+            ],
+            "routing_model": "deepseek-r1",
+            "memory_cases_available": 0,
+            "graph_context": {
+              "cluster_membership": "none",
+              "reuse_detection": {
+                "cin_reuse_detected": false,
+                "doctor_reuse_detected": false,
+                "cin_claim_count": 1,
+                "doctor_claim_count": 1
+              },
+              "network_risk_score": 0.9,
+              "fraud_rings": {
+                "fraud_rings": []
+              }
+            }
+          },
+          "output_snapshot": {
+            "score": 0.9,
+            "confidence": 0.9100000000000001,
+            "explanation": "Network links do not indicate fraud ring. [graph cluster=none; cin_reuse=False; doctor_reuse=False; network_risk=0.900]",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        }
+      ],
+      "blackboard_snapshots": [
+        {
+          "stage": "IdentityAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "DocumentAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "PolicyAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "AnomalyAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "PatternAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "GraphRiskAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "Consensus",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          },
+          "Ts": 75.85,
+          "decision": "HUMAN_REVIEW",
+          "retry_count": 0
+        }
+      ],
+      "Ts": 75.85,
+      "decision": "HUMAN_REVIEW",
+      "retry_count": 0,
+      "alerts": [],
+      "validation_failures": [
+        "alerts_not_triggered"
+      ],
+      "raw_response": {
+        "agent_outputs": [
+          {
+            "agent": "IdentityAgent",
+            "score": 0.9,
+            "confidence": 0.9,
+            "explanation": "Identity verified from CIN and records.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [],
+              "routing_model": "deepseek-r1",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "DocumentAgent",
+            "score": 0.88,
+            "confidence": 0.71,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "IdentityAgent"
+              ],
+              "routing_model": "deepseek-r1",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "PolicyAgent",
+            "score": 0.86,
+            "confidence": 0.72,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "elapsed_ms": 1,
+            "input_snapshot": {
+              "required_context": [
+                "IdentityAgent",
+                "DocumentAgent"
+              ],
+              "routing_model": "deepseek-r1",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "AnomalyAgent",
+            "score": 0.2,
+            "confidence": 0.78,
+            "explanation": "No anomaly trend observed.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "IdentityAgent",
+                "DocumentAgent",
+                "PolicyAgent"
+              ],
+              "routing_model": "deepseek-r1",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "PatternAgent",
+            "score": 0.25,
+            "confidence": 0.76,
+            "explanation": "No repeated suspicious pattern.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "AnomalyAgent"
+              ],
+              "routing_model": "deepseek-r1",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "GraphRiskAgent",
+            "score": 0.2,
+            "confidence": 0.74,
+            "explanation": "Network links do not indicate fraud ring.",
+            "elapsed_ms": 1,
+            "input_snapshot": {
+              "required_context": [
+                "PatternAgent"
+              ],
+              "routing_model": "deepseek-r1",
+              "memory_cases_available": 0,
+              "graph_context": {
+                "cluster_membership": "none",
+                "reuse_detection": {
+                  "cin_reuse_detected": false,
+                  "doctor_reuse_detected": false,
+                  "cin_claim_count": 1,
+                  "doctor_claim_count": 1
+                },
+                "network_risk_score": 0.9,
+                "fraud_rings": {
+                  "fraud_rings": []
+                }
+              }
+            },
+            "output_snapshot": {
+              "score": 0.9,
+              "confidence": 0.9100000000000001,
+              "explanation": "Network links do not indicate fraud ring. [graph cluster=none; cin_reuse=False; doctor_reuse=False; network_risk=0.900]",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          }
+        ],
+        "blackboard": {
+          "request": {
+            "identity": {
+              "cin": "CIN-216739",
+              "name": "Claimant-rt-adversarial-0037",
+              "hospital": "HSP-23",
+              "doctor": "DOC-350",
+              "country": "ma"
+            },
+            "documents": [
+              {
+                "id": "doc-rt-adversarial-0037",
+                "document_type": "invoice",
+                "text": "OCR:: P4TI3NT N4M3 ?? ; invoice_total=19999 but handwritten total=9999. Field conflict with plausible diagnostics."
+              }
+            ],
+            "policy": {
+              "amount": 3953.0,
+              "country": "ma",
+              "hospital": "HSP-23",
+              "doctor": "DOC-350",
+              "diagnosis": "general-check"
+            },
+            "metadata": {
+              "claim_id": "rt-adversarial-0037",
+              "scenario": "adversarial",
+              "expected_decision": "HUMAN_REVIEW",
+              "expected_fraud": true,
+              "obvious_fraud": false,
+              "identity_invalid": false,
+              "has_minimal_data": false,
+              "anomaly_score": 0.9,
+              "expected_alerts": [
+                "contradictions"
+              ],
+              "manual_review": true
+            }
+          },
+          "routing_decision": {
+            "intent": "general_claim",
+            "complexity": "high-risk",
+            "model": "deepseek-r1",
+            "reason": "intent=general_claim, complexity=high-risk",
+            "metadata": {
+              "document_count": 1
+            }
+          },
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          },
+          "memory_context": [],
+          "fraud_ring_analysis": {
+            "fraud_rings": []
+          },
+          "reflexive_retry_logs": [],
+          "score_evolution": [
+            75.85
+          ],
+          "consensus_entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          }
+        },
+        "routing_decision": {
+          "intent": "general_claim",
+          "complexity": "high-risk",
+          "model": "deepseek-r1",
+          "reason": "intent=general_claim, complexity=high-risk",
+          "metadata": {
+            "document_count": 1
+          }
+        },
+        "goa_used": false,
+        "Ts": 75.85,
+        "decision": "HUMAN_REVIEW",
+        "retry_count": 0,
+        "mahic_breakdown": {
+          "billing": 19.25,
+          "clinical": 5.47,
+          "temporal": 2.8,
+          "geo": 2.44
+        },
+        "contradictions": [],
+        "trust_layer": null,
+        "memory_context": []
+      }
+    },
+    {
+      "claim_id": "rt-edge-0041",
+      "scenario": "edge",
+      "expected_decision": "HUMAN_REVIEW",
+      "expected_fraud": false,
+      "use_memory": true,
+      "error": null,
+      "total_pipeline_ms": 23,
+      "agent_outputs": [
+        {
+          "agent": "IdentityAgent",
+          "score": 0.9,
+          "confidence": 0.9,
+          "explanation": "Identity verified from CIN and records.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.9,
+            "confidence": 0.9,
+            "explanation": "Identity verified from CIN and records.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "DocumentAgent",
+          "score": 0.88,
+          "confidence": 0.71,
+          "explanation": "Missing documents materially reduce verification certainty.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "IdentityAgent"
+            ],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.88,
+            "confidence": 0.71,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "PolicyAgent",
+          "score": 0.86,
+          "confidence": 0.72,
+          "explanation": "Missing documents materially reduce verification certainty.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "IdentityAgent",
+              "DocumentAgent"
+            ],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.86,
+            "confidence": 0.72,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "AnomalyAgent",
+          "score": 0.2,
+          "confidence": 0.78,
+          "explanation": "No anomaly trend observed.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "IdentityAgent",
+              "DocumentAgent",
+              "PolicyAgent"
+            ],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.2,
+            "confidence": 0.78,
+            "explanation": "No anomaly trend observed.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "PatternAgent",
+          "score": 0.25,
+          "confidence": 0.76,
+          "explanation": "No repeated suspicious pattern.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "AnomalyAgent"
+            ],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {}
+          },
+          "output_snapshot": {
+            "score": 0.25,
+            "confidence": 0.76,
+            "explanation": "No repeated suspicious pattern.",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        },
+        {
+          "agent": "GraphRiskAgent",
+          "score": 0.2,
+          "confidence": 0.74,
+          "explanation": "Network links do not indicate fraud ring.",
+          "elapsed_ms": 0,
+          "input_snapshot": {
+            "required_context": [
+              "PatternAgent"
+            ],
+            "routing_model": "mistral:7b",
+            "memory_cases_available": 0,
+            "graph_context": {
+              "cluster_membership": "none",
+              "reuse_detection": {
+                "cin_reuse_detected": false,
+                "doctor_reuse_detected": false,
+                "cin_claim_count": 1,
+                "doctor_claim_count": 0
+              },
+              "network_risk_score": 0.25,
+              "fraud_rings": {
+                "fraud_rings": []
+              }
+            }
+          },
+          "output_snapshot": {
+            "score": 0.25,
+            "confidence": 0.74,
+            "explanation": "Network links do not indicate fraud ring. [graph cluster=none; cin_reuse=False; doctor_reuse=False; network_risk=0.250]",
+            "reasoning_steps": [
+              "Parsed claim payload and role-specific inputs.",
+              "Checked required context from blackboard entries.",
+              "Scored risk indicators and calibrated confidence."
+            ],
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          "memory_insights": {
+            "similar_cases_found": 0,
+            "fraud_matches": 0,
+            "identity_reuse_detected": false,
+            "impact_on_score": "neutral",
+            "notes": "simulated red-team memory reasoning"
+          }
+        }
+      ],
+      "blackboard_snapshots": [
+        {
+          "stage": "IdentityAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "DocumentAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "PolicyAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "AnomalyAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "PatternAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "GraphRiskAgent",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          },
+          "memory_context_count": 0
+        },
+        {
+          "stage": "Consensus",
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          },
+          "Ts": 75.85,
+          "decision": "HUMAN_REVIEW",
+          "retry_count": 0
+        }
+      ],
+      "Ts": 75.85,
+      "decision": "HUMAN_REVIEW",
+      "retry_count": 0,
+      "alerts": [],
+      "validation_failures": [
+        "alerts_not_triggered"
+      ],
+      "raw_response": {
+        "agent_outputs": [
+          {
+            "agent": "IdentityAgent",
+            "score": 0.9,
+            "confidence": 0.9,
+            "explanation": "Identity verified from CIN and records.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "DocumentAgent",
+            "score": 0.88,
+            "confidence": 0.71,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "IdentityAgent"
+              ],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "PolicyAgent",
+            "score": 0.86,
+            "confidence": 0.72,
+            "explanation": "Missing documents materially reduce verification certainty.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "IdentityAgent",
+                "DocumentAgent"
+              ],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "AnomalyAgent",
+            "score": 0.2,
+            "confidence": 0.78,
+            "explanation": "No anomaly trend observed.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "IdentityAgent",
+                "DocumentAgent",
+                "PolicyAgent"
+              ],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "PatternAgent",
+            "score": 0.25,
+            "confidence": 0.76,
+            "explanation": "No repeated suspicious pattern.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "AnomalyAgent"
+              ],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {}
+            },
+            "output_snapshot": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern.",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          },
+          {
+            "agent": "GraphRiskAgent",
+            "score": 0.2,
+            "confidence": 0.74,
+            "explanation": "Network links do not indicate fraud ring.",
+            "elapsed_ms": 0,
+            "input_snapshot": {
+              "required_context": [
+                "PatternAgent"
+              ],
+              "routing_model": "mistral:7b",
+              "memory_cases_available": 0,
+              "graph_context": {
+                "cluster_membership": "none",
+                "reuse_detection": {
+                  "cin_reuse_detected": false,
+                  "doctor_reuse_detected": false,
+                  "cin_claim_count": 1,
+                  "doctor_claim_count": 0
+                },
+                "network_risk_score": 0.25,
+                "fraud_rings": {
+                  "fraud_rings": []
+                }
+              }
+            },
+            "output_snapshot": {
+              "score": 0.25,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring. [graph cluster=none; cin_reuse=False; doctor_reuse=False; network_risk=0.250]",
+              "reasoning_steps": [
+                "Parsed claim payload and role-specific inputs.",
+                "Checked required context from blackboard entries.",
+                "Scored risk indicators and calibrated confidence."
+              ],
+              "memory_insights": {
+                "similar_cases_found": 0,
+                "fraud_matches": 0,
+                "identity_reuse_detected": false,
+                "impact_on_score": "neutral",
+                "notes": "simulated red-team memory reasoning"
+              }
+            },
+            "memory_insights": {
+              "similar_cases_found": 0,
+              "fraud_matches": 0,
+              "identity_reuse_detected": false,
+              "impact_on_score": "neutral",
+              "notes": "simulated red-team memory reasoning"
+            }
+          }
+        ],
+        "blackboard": {
+          "request": {
+            "identity": {
+              "cin": "CIN-376183",
+              "name": "Claimant-rt-edge-0041",
+              "hospital": "HSP-612",
+              "doctor": "DOC-880",
+              "country": "ma"
+            },
+            "documents": [],
+            "policy": {
+              "amount": 0.0,
+              "country": "ma",
+              "hospital": "HSP-612",
+              "doctor": "DOC-880",
+              "diagnosis": "general-check"
+            },
+            "metadata": {
+              "claim_id": "rt-edge-0041",
+              "scenario": "edge",
+              "expected_decision": "HUMAN_REVIEW",
+              "expected_fraud": false,
+              "obvious_fraud": false,
+              "identity_invalid": false,
+              "has_minimal_data": true,
+              "anomaly_score": 0.25,
+              "expected_alerts": [
+                "high_risk_score"
+              ]
+            }
+          },
+          "routing_decision": {
+            "intent": "general_claim",
+            "complexity": "simple",
+            "model": "mistral:7b",
+            "reason": "intent=general_claim, complexity=simple",
+            "metadata": {
+              "document_count": 0
+            }
+          },
+          "entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          },
+          "memory_context": [],
+          "fraud_ring_analysis": {
+            "fraud_rings": []
+          },
+          "reflexive_retry_logs": [],
+          "score_evolution": [
+            75.85
+          ],
+          "consensus_entries": {
+            "IdentityAgent": {
+              "score": 0.9,
+              "confidence": 0.9,
+              "explanation": "Identity verified from CIN and records."
+            },
+            "DocumentAgent": {
+              "score": 0.88,
+              "confidence": 0.71,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "PolicyAgent": {
+              "score": 0.86,
+              "confidence": 0.72,
+              "explanation": "Missing documents materially reduce verification certainty."
+            },
+            "AnomalyAgent": {
+              "score": 0.2,
+              "confidence": 0.78,
+              "explanation": "No anomaly trend observed."
+            },
+            "PatternAgent": {
+              "score": 0.25,
+              "confidence": 0.76,
+              "explanation": "No repeated suspicious pattern."
+            },
+            "GraphRiskAgent": {
+              "score": 0.2,
+              "confidence": 0.74,
+              "explanation": "Network links do not indicate fraud ring."
+            }
+          }
+        },
+        "routing_decision": {
+          "intent": "general_claim",
+          "complexity": "simple",
+          "model": "mistral:7b",
+          "reason": "intent=general_claim, complexity=simple",
+          "metadata": {
+            "document_count": 0
+          }
+        },
+        "goa_used": false,
+        "Ts": 75.85,
+        "decision": "HUMAN_REVIEW",
+        "retry_count": 0,
+        "mahic_breakdown": {
+          "billing": 19.25,
+          "clinical": 5.47,
+          "temporal": 2.8,
+          "geo": 2.44
+        },
+        "contradictions": [],
+        "trust_layer": null,
+        "memory_context": []
+      }
+    }
+  ],
+  "strict_mode": {
+    "failed": false,
+    "failure_reasons": [],
+    "thresholds": {
+      "critical_failures_threshold": 999,
+      "hallucination_rate_max": 1.0,
+      "fraud_detection_target": 0.0
+    }
+  },
+  "run_status": "PASSED"
+}

@@ -121,7 +121,9 @@ def _assert_with_context(
 
 CLEAN_CLAIM: dict[str, Any] = {
     "claim_id": "CLM-CLEAN-2024-889921",
-    "patient_id": "1234567890",
+    "patient_id": "BJ456789",
+    "patient_name": "Ahmed Benali",
+    "date_of_birth": "15/03/1985",
     "provider_id": "HOSP-4401",
     "amount": 2500.0,
     "insurance": "CNSS",
@@ -135,7 +137,9 @@ CLEAN_CLAIM: dict[str, Any] = {
             "file_name": "medical_report_2024.pdf",
             "extracted_text": (
                 "Compte rendu hospitalisation. Diagnostic bronchitis. "
-                "Patient stable discharge summary clinical report."
+                "Patient stable discharge summary clinical report. "
+                "Nom et prénom: Ahmed Benali. CIN: BJ456789. "
+                "Né le: 15/03/1985."
             ),
         },
         {
@@ -152,7 +156,7 @@ CLEAN_CLAIM: dict[str, Any] = {
             "amount": 1800.0,
             "date": "2024-06-01",
             "recent": False,
-            "patient_id": "1234567890",
+            "patient_id": "BJ456789",
             "patient_name": "Ahmed Benali",
             "decision": "APPROVED",
         },
@@ -160,7 +164,7 @@ CLEAN_CLAIM: dict[str, Any] = {
             "amount": 2100.0,
             "date": "2024-08-15",
             "recent": False,
-            "patient_id": "1234567890",
+            "patient_id": "BJ456789",
             "patient_name": "Ahmed Benali",
             "decision": "APPROVED",
         },
@@ -169,7 +173,8 @@ CLEAN_CLAIM: dict[str, Any] = {
 
 FRAUD_CLAIM: dict[str, Any] = {
     "claim_id": "CLM-FRAUD-001",
-    "patient_id": "9988776655",
+    "patient_id": "ZZ111111",
+    "patient_name": "Khaled Amrani",
     "provider_id": "PR_BURST",
     "amount": 95000.0,
     "insurance": "CNSS",
@@ -179,7 +184,7 @@ FRAUD_CLAIM: dict[str, Any] = {
             "file_name": "copy_scan_duplicate_001.pdf",
             "extracted_text": (
                 "fake invoice forged tampered altered duplicate billing "
-                "counterfeit falsified stolen identity"
+                "counterfeit falsified stolen identity CIN: CD987654"
             ),
         },
     ],
@@ -188,7 +193,7 @@ FRAUD_CLAIM: dict[str, Any] = {
             "amount": 1200.0,
             "date": "2025-01-05",
             "recent": True,
-            "patient_id": "9988776655",
+            "patient_id": "ZZ111111",
             "patient_name": "Other Name",
             "decision": "REJECTED",
         },
@@ -196,7 +201,7 @@ FRAUD_CLAIM: dict[str, Any] = {
             "amount": 1150.0,
             "date": "2025-01-06",
             "recent": True,
-            "patient_id": "9988776600",
+            "patient_id": "CD987654",
             "patient_name": "Other Name",
             "decision": "REJECTED",
         },
@@ -204,7 +209,7 @@ FRAUD_CLAIM: dict[str, Any] = {
             "amount": 1180.0,
             "date": "2025-01-07",
             "recent": True,
-            "patient_id": "9988776655",
+            "patient_id": "ZZ111111",
             "patient_name": "Khaled Amrani",
             "decision": "REJECTED",
         },
@@ -212,7 +217,7 @@ FRAUD_CLAIM: dict[str, Any] = {
             "amount": 1190.0,
             "date": "2025-01-08",
             "recent": True,
-            "patient_id": "9988776655",
+            "patient_id": "ZZ111111",
             "patient_name": "Khaled Amrani",
             "decision": "REJECTED",
         },
@@ -220,7 +225,7 @@ FRAUD_CLAIM: dict[str, Any] = {
             "amount": 1175.0,
             "date": "2025-01-09",
             "recent": True,
-            "patient_id": "9988776655",
+            "patient_id": "ZZ111111",
             "patient_name": "Khaled Amrani",
             "decision": "REJECTED",
         },
@@ -241,7 +246,8 @@ PROMPT_INJECTION_CLAIM["document_extractions"].append(
 
 SUBTLE_MANIPULATION_CLAIM: dict[str, Any] = {
     "claim_id": "CLM-SUBTLE-001",
-    "patient_id": "1234567890",
+    "patient_id": "BK78901",
+    "patient_name": "Fatima Zahri",
     "provider_id": "HOSP-4401",
     "amount": 1200.0,
     "insurance": "CNSS",

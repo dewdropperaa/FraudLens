@@ -1,6 +1,7 @@
 import { Icons } from '../components'
+import { ClaimFlowGraph } from '../components/ClaimFlowGraph'
 
-export default function SubmitClaim({ form, handleInputChange, handleFileChange, handleSubmit, isSubmitting, submitError, selectedFiles, lastResult, hasValidTxHash, safeText, shortHex, toIpfsUrl, scorePercent }) {
+export default function SubmitClaim({ form, handleInputChange, handleFileChange, handleSubmit, isSubmitting, submitError, selectedFiles, lastResult, hasValidTxHash, safeText, shortHex, toIpfsUrl, scorePercent, currentClaimId }) {
   return (
     <>
       <div className="cg-page-header">
@@ -9,6 +10,10 @@ export default function SubmitClaim({ form, handleInputChange, handleFileChange,
           <div className="cg-page-sub">Complete the form — our AI agents will analyse it in real time</div>
         </div>
       </div>
+
+      {(isSubmitting || lastResult) && currentClaimId && (
+        <ClaimFlowGraph claimId={currentClaimId} agentOutputs={lastResult?.agent_results || []} />
+      )}
 
       <div className="cg-two-col">
         {/* Form */}

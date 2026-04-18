@@ -1,11 +1,12 @@
 """
-Parallel fraud analysis entrypoints (sync + async).
+Sequential fraud analysis entrypoints (sync + async).
 
 * Default (``CREW_USE_LLM`` unset/0): deterministic tools only — no LLM latency/cost.
-* Optional (``CREW_USE_LLM=1``): six independent single-task Crews kicked off in parallel.
+* Optional (``CREW_USE_LLM=1``): six single-task Crews executed in strict sequence.
 
-CrewAI 1.x note: ``Process.parallel`` was removed; parallel execution is achieved via
-thread-pooled ``kickoff`` of independent mini-crews (or thread-pooled deterministic tools).
+Memory integration: before agents run, similar past cases are retrieved from the
+Case Memory Layer and injected into claim_data under "memory_context" so every
+agent can reason over historical evidence.
 """
 from __future__ import annotations
 
@@ -13,7 +14,6 @@ import asyncio
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List
 
 from crewai.crews.crew_output import CrewOutput
@@ -28,19 +28,29 @@ from claimguard.crew.consensus import enrich_legacy_with_audit, log_agent_decisi
 from claimguard.crew.crew import build_mini_crews
 from claimguard.crew.models import AgentDecisionOutput
 from claimguard.crew.tools import ALL_CLAIM_TOOLS
+from claimguard.v2.memory import get_memory_layer
 
 logger = logging.getLogger("claimguard.crew.runner")
 
-_MAX_WORKERS = len(ALL_CLAIM_TOOLS)
+from claimguard.v2.flow_tracker import get_tracker
 
 _AGENT_KEYS: tuple[str, ...] = (
-    "anomaly",
-    "pattern",
     "identity",
     "document",
     "policy",
+    "anomaly",
+    "pattern",
     "graph",
 )
+
+_AGENT_NAMES = {
+    "identity": "IdentityAgent",
+    "document": "DocumentAgent",
+    "policy": "PolicyAgent",
+    "anomaly": "AnomalyAgent",
+    "pattern": "PatternAgent",
+    "graph": "GraphAgent",
+}
 
 _AGENT_RUNNERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "anomaly": lambda d: AnomalyAgent().analyze(d),
@@ -56,9 +66,43 @@ def _use_llm_crew() -> bool:
     return os.getenv("CREW_USE_LLM", "").strip().lower() in {"1", "true", "yes"}
 
 
-def _run_deterministic_parallel(claim_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-        raw = list(pool.map(lambda k: _AGENT_RUNNERS[k](claim_data), _AGENT_KEYS))
+def _inject_memory_context(claim_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Retrieve similar past cases and inject them into claim_data.
+
+    Returns a shallow copy of claim_data with 'memory_context' added so the
+    original dict is not mutated.  Failures are logged and silenced — memory
+    is advisory and must never block the pipeline.
+    """
+    try:
+        memory = get_memory_layer()
+        similar_cases = memory.retrieve_similar_cases(claim_data)
+        if similar_cases:
+            logger.info(
+                "legacy_memory_context_injected count=%d", len(similar_cases)
+            )
+        return {**claim_data, "memory_context": similar_cases}
+    except Exception as exc:
+        logger.warning("legacy_memory_inject_failed error=%s — running without memory", exc)
+        return claim_data
+
+
+def _run_deterministic_sequential(claim_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    enriched_data = _inject_memory_context(claim_data)
+    claim_id = enriched_data.get("claim_id", "unknown")
+    tracker = get_tracker(claim_id)
+    
+    raw = []
+    for key in _AGENT_KEYS:
+        agent_name = _AGENT_NAMES[key]
+        tracker.update(agent_name, "RUNNING")
+        try:
+            result = _AGENT_RUNNERS[key](enriched_data)
+            tracker.update(agent_name, "COMPLETED")
+            raw.append(result)
+        except Exception as exc:
+            tracker.update(agent_name, "FAILED")
+            raise exc
+
     enriched = [enrich_legacy_with_audit(dict(r)) for r in raw]
     log_agent_decisions(enriched)
     return sort_agent_dicts(enriched)
@@ -89,25 +133,26 @@ def _parse_structured_output(crew_out: CrewOutput) -> AgentDecisionOutput | None
         return None
 
 
-def _kickoff_one_crew(crew) -> CrewOutput:
-    return crew.kickoff()
-
-
-def _run_llm_mini_crews_parallel(claim_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _run_llm_mini_crews_sequential(claim_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    claim_data = _inject_memory_context(claim_data)
+    claim_id = claim_data.get("claim_id", "unknown")
+    tracker = get_tracker(claim_id)
     claim_json = json.dumps(claim_data, sort_keys=True, ensure_ascii=False)
     crews = build_mini_crews(claim_json)
-    keys = list(_AGENT_KEYS)
-    results: list[Dict[str, Any] | None] = [None] * len(keys)
-
-    def run_one(idx: int, crew) -> tuple[int, CrewOutput]:
-        return idx, _kickoff_one_crew(crew)
-
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-        futs = [pool.submit(run_one, i, c) for i, c in enumerate(crews)]
-        for fut in as_completed(futs):
-            idx, cout = fut.result()
+    by_key = dict(zip(_AGENT_KEYS, crews))
+    out: List[Dict[str, Any]] = []
+    
+    for key in _AGENT_KEYS:
+        agent_name = _AGENT_NAMES[key]
+        tracker.update(agent_name, "RUNNING")
+        crew = by_key.get(key)
+        if crew is None:
+            tracker.update(agent_name, "FAILED")
+            raise RuntimeError(f"CrewAI configuration error: missing crew for agent key '{key}'.")
+        
+        try:
+            cout: CrewOutput = crew.kickoff()
             parsed = _parse_structured_output(cout)
-            key = keys[idx]
             truth = _AGENT_RUNNERS[key](claim_data)
             if parsed is not None:
                 det = dict(truth.get("details") or {})
@@ -122,26 +167,28 @@ def _run_llm_mini_crews_parallel(claim_data: Dict[str, Any]) -> List[Dict[str, A
                     "details": det,
                 }
             else:
-                logger.warning(
-                    "crew_kickoff_parse_failed agent_key=%s — using deterministic output only",
-                    key,
+                raise RuntimeError(
+                    f"CrewAI/Ollama output parsing failed for agent key '{key}'. "
+                    "No deterministic fallback is allowed in LLM mode."
                 )
-                merged = dict(truth)
-            results[idx] = enrich_legacy_with_audit(merged)
+            tracker.update(agent_name, "COMPLETED")
+            out.append(enrich_legacy_with_audit(merged))
+        except Exception as exc:
+            tracker.update(agent_name, "FAILED")
+            raise exc
 
-    out = [r for r in results if r is not None]
     log_agent_decisions(out)
     return sort_agent_dicts(out)
 
 
 def run_claim_agents(claim_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Sync entry: parallel analysis, structured legacy dicts (AgentResult-compatible)."""
+    """Sync entry: sequential analysis, structured legacy dicts (AgentResult-compatible)."""
     if _use_llm_crew():
-        return _run_llm_mini_crews_parallel(claim_data)
-    return _run_deterministic_parallel(claim_data)
+        return _run_llm_mini_crews_sequential(claim_data)
+    return _run_deterministic_sequential(claim_data)
 
 
 async def run_claim_agents_async(claim_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Async entry: offload sync parallel work so the event loop stays responsive."""
+    """Async entry: offload sync sequential work so the event loop stays responsive."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, run_claim_agents, claim_data)

@@ -22,7 +22,7 @@ from claimguard.config import (
 from claimguard.firebase_config import is_test_environment
 from claimguard.rate_limiting import limiter
 from claimguard.middleware_body import MaxBodySizeMiddleware
-from claimguard.routes import claims_router
+from claimguard.routes import claims_router, v2_router
 
 load_environment()
 
@@ -36,6 +36,10 @@ _FAVICON_PNG = base64.b64decode(
 async def lifespan(app: FastAPI):
     load_environment()
     validate_required_settings()
+    # Fail fast at startup if Ollama is unavailable for ClaimGuard v2.
+    from claimguard.v2 import get_v2_orchestrator
+
+    get_v2_orchestrator()
     # Claims persist in Cloud Firestore (tests use in-memory store; see services.storage).
     if not is_test_environment():
         from claimguard.firestore_provision import ensure_default_firestore_database
@@ -100,6 +104,7 @@ def create_app() -> FastAPI:
     )
 
     application.include_router(claims_router)
+    application.include_router(v2_router)
     return application
 
 

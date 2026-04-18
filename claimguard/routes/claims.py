@@ -11,8 +11,14 @@ from claimguard.services.document_extraction import (
     build_extractions_from_base64_parts,
     build_extractions_from_upload_files,
 )
+from claimguard.v2.flow_tracker import get_tracker
 
 router = APIRouter()
+
+@router.get("/claim/{claim_id}/flow", dependencies=[Depends(verify_request_auth)])
+async def get_claim_flow(claim_id: str) -> dict:
+    tracker = get_tracker(claim_id)
+    return tracker.get_state()
 
 
 def _claim_payload_from_json_body(claim: ClaimInput) -> dict:

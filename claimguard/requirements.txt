@@ -32,14 +32,19 @@ pypdfium2>=4.30.0
 Pillow>=10.0.0
 pytesseract>=0.3.10
 networkx>=3.2.0
+matplotlib>=3.8.0
 pandas>=2.1.0
 numpy>=1.26.0
 scikit-learn>=1.3.0
 
-# Multi-agent orchestration (optional LLM path via CREW_USE_LLM=1)
+# Multi-agent orchestration
 crewai>=0.70.0
 crewai-tools>=0.12.0
-# LangChain chat models — foundation for LLM routing; CrewAI unwraps these via create_llm()
+# LangChain model wrappers (Ollama local models)
 langchain-core>=0.3.0
-langchain-openai>=0.2.0
 langchain-community>=0.3.0
+
+# Case Memory Layer — vector store for similar-case retrieval (FAISS optional but recommended)
+# Install: pip install faiss-cpu
+# If not installed, the memory layer automatically falls back to pure-Python cosine similarity.
+faiss-cpu>=1.7.4

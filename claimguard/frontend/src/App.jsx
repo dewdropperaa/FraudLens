@@ -84,6 +84,7 @@ export default function App() {
   const [form,          setForm]          = useState({ patient_id: '', provider_id: '', amount: '', insurance: 'CNSS' })
   const [selectedFiles, setSelectedFiles] = useState([])
   const [isSubmitting,  setIsSubmitting]  = useState(false)
+  const [currentClaimId, setCurrentClaimId] = useState(null)
   const [submitError,   setSubmitError]   = useState('')
   const [lastResult,    setLastResult]    = useState(null)
 
@@ -141,11 +142,14 @@ export default function App() {
   function handleFileChange(e)  { setSelectedFiles(Array.from(e.target.files ?? [])) }
 
   async function handleSubmit(e) {
-    e.preventDefault(); setSubmitError(''); setIsSubmitting(true)
+    e.preventDefault(); setSubmitError(''); setIsSubmitting(true); setLastResult(null)
+    const claimId = `claim-${Date.now()}`
+    setCurrentClaimId(claimId)
     try {
       const fd = new FormData()
       fd.append('patient_id', form.patient_id.trim()); fd.append('provider_id', form.provider_id.trim())
       fd.append('amount', String(Number(form.amount))); fd.append('insurance', form.insurance)
+      fd.append('claim_id', claimId)
       fd.append('history_json', JSON.stringify([]))
       for (const file of selectedFiles) fd.append('files', file)
       const res = await api.post('/claim/upload', fd)
@@ -162,7 +166,7 @@ export default function App() {
   const submitProps = {
     form, handleInputChange, handleFileChange, handleSubmit,
     isSubmitting, submitError, selectedFiles,
-    lastResult, hasValidTxHash, safeText, shortHex, toIpfsUrl, scorePercent,
+    lastResult, hasValidTxHash, safeText, shortHex, toIpfsUrl, scorePercent, currentClaimId
   }
 
   /* ── Render page content ────────────────────────────────────── */

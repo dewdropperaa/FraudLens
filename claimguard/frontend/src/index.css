@@ -505,6 +505,11 @@ body {
 }
 .cg-btn-primary .cg-spinner { border-color: rgba(255,255,255,0.3); border-top-color: #fff; }
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-4px); }
+  40%, 80% { transform: translateX(4px); }
+}
 
 /* ── Empty state ─────────────────────────────────────────────── */
 .cg-empty { padding: 36px 20px; text-align: center; color: var(--text-muted); font-size: 12px; }

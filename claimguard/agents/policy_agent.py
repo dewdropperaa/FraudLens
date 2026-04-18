@@ -1,6 +1,7 @@
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from .base_agent import BaseAgent
+from .memory_utils import process_memory_context
 
 POLICY_SYSTEM_PROMPT = """You are a compliance and fraud risk analyst.
 
@@ -13,7 +14,27 @@ You question:
 
 You assume attackers may optimize claims to stay just below limits.
 
-Treat tool output as structured limits and signals — combine with cumulative and marginal abuse patterns."""
+Treat tool output as structured limits and signals — combine with cumulative and marginal abuse patterns.
+
+MEMORY AWARENESS:
+- When memory_context is present, check if this identity has previously gamed policy thresholds.
+- If past cases show repeated near-limit claims from the same CIN: flag systematic policy exploitation.
+- Memory is ADVISORY — do not override rule-based compliance checks with memory alone."""
+
+_MEDICAL_EVIDENCE_KEYWORDS: tuple[str, ...] = (
+    "medical",
+    "médical",
+    "clinique",
+    "consultation",
+    "diagnostic",
+    "traitement",
+    "ordonnance",
+    "prescription",
+    "hospitalisation",
+    "facture",
+    "invoice",
+    "honoraires",
+)
 
 
 class PolicyAgent(BaseAgent):
@@ -26,6 +47,22 @@ class PolicyAgent(BaseAgent):
             goal="Apply CNSS/CNOPS rules while flagging threshold gaming and borderline abuse via tool signals",
         )
 
+    @staticmethod
+    def _build_corpus(claim_data: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for doc in (claim_data.get("documents") or []):
+            parts.append(str(doc).lower())
+        for ex in (claim_data.get("document_extractions") or []):
+            if isinstance(ex, dict):
+                parts.append((ex.get("file_name") or "").lower())
+                parts.append((ex.get("extracted_text") or "").lower())
+        return " ".join(parts)
+
+    @staticmethod
+    def _has_medical_evidence(corpus: str) -> bool:
+        hits = sum(1 for kw in _MEDICAL_EVIDENCE_KEYWORDS if kw in corpus)
+        return hits >= 2
+
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
         insurance = claim_data.get("insurance", "")
         try:
@@ -36,8 +73,14 @@ class PolicyAgent(BaseAgent):
         if not isinstance(history, list):
             history = []
 
+        doc_count = max(
+            len(claim_data.get("documents") or []),
+            len(claim_data.get("document_extractions") or []),
+        )
+        corpus = self._build_corpus(claim_data)
+
         score = 100
-        reasoning = []
+        reasoning: List[str] = []
         details: Dict[str, Any] = {"system_prompt_version": "policy_v2_forensic"}
 
         if insurance not in ["CNSS", "CNOPS"]:
@@ -60,6 +103,19 @@ class PolicyAgent(BaseAgent):
                 details["coverage_limit_exceeded"] = True
                 details["cnops_limit"] = 50000
 
+        if doc_count == 0:
+            score -= 20
+            reasoning.append(
+                "No supporting documents — policy compliance cannot be fully verified"
+            )
+            details["no_documents_for_policy"] = True
+        elif not self._has_medical_evidence(corpus):
+            score -= 15
+            reasoning.append(
+                "Documents do not contain sufficient medical/billing evidence to support the claim"
+            )
+            details["insufficient_medical_evidence"] = True
+
         if len(history) > 0:
             total_claimed = sum(h.get("amount", 0) for h in history)
             annual_limit = 100000 if insurance == "CNSS" else 150000
@@ -79,7 +135,19 @@ class PolicyAgent(BaseAgent):
                 details["recent_rejections"] = recent_rejections
 
         score = max(0, score)
-        decision = score >= 50
+        decision = score > 60
+
+        # Memory context integration
+        memory_adjusted_score, memory_insights = process_memory_context(
+            agent_name=self.name,
+            claim_data=claim_data,
+            current_score=float(score),
+            current_cin=str(claim_data.get("patient_id") or ""),
+        )
+        if memory_adjusted_score != float(score):
+            score = max(0, int(memory_adjusted_score))
+            decision = score > 60
+        details["memory_insights"] = memory_insights
 
         return {
             "agent_name": self.name,
@@ -87,4 +155,5 @@ class PolicyAgent(BaseAgent):
             "score": round(score, 2),
             "reasoning": "; ".join(reasoning) if reasoning else "Policy coverage validated",
             "details": details,
+            "memory_insights": memory_insights,
         }

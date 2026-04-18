@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from claimguard.config import get_sepolia_private_key
 from claimguard.models import AgentResult, ClaimResult
@@ -16,184 +16,207 @@ from claimguard.services.blockchain import get_blockchain_service
 from claimguard.services.ipfs import get_ipfs_service
 
 
-# Higher weight reduces dilution from low-risk agents (policy/docs) on borderline cases.
-DEFAULT_AGENT_WEIGHTS: Dict[str, float] = {
-    "Anomaly Agent": 2.0,
-    "Pattern Agent": 1.25,
-    "Identity Agent": 1.0,
-    "Document Agent": 1.0,
-    "Policy Agent": 1.0,
-    "Graph Agent": 2.0,
+from claimguard.v2.flow_tracker import get_tracker
+
+NEXUS_AGENT_WEIGHTS: Dict[str, float] = {
+    "Identity Agent": 0.1,
+    "Document Agent": 0.15,
+    "Policy Agent": 0.2,
+    "Anomaly Agent": 0.2,
+    "Pattern Agent": 0.15,
+    "Graph Agent": 0.2,
 }
 
 
-def _agent_weights() -> Dict[str, float]:
-    raw = os.getenv("CONSENSUS_AGENT_WEIGHTS")
-    if not raw:
-        return dict(DEFAULT_AGENT_WEIGHTS)
-    out: Dict[str, float] = dict(DEFAULT_AGENT_WEIGHTS)
-    for part in raw.split(","):
-        if "=" not in part:
-            continue
-        name, w = part.split("=", 1)
-        name, w = name.strip(), w.strip()
-        try:
-            out[name] = float(w)
-        except ValueError:
-            continue
-    return out
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
 
 
 class ConsensusSystem:
-    """
-    Weighted consensus with critical-agent overrides:
-    - Weighted average score (Graph / Anomaly weighted higher by default).
-    - Reject if ANY agent returns decision=False.
-    - Critical override: material graph fraud probability or strong anomaly signal
-      can force REJECT even when the simple average would look acceptable.
-    - Approve only if ALL approve AND weighted score >= threshold (default 75).
-    - Extreme fraud veto (amount + graph FP) remains as defense in depth.
-    """
-
     def __init__(self) -> None:
         self._store = get_claim_store()
-        self._weights = _agent_weights()
-        self._expected_agents = set(self._weights.keys())
-        self._threshold = float(os.getenv("CONSENSUS_APPROVAL_THRESHOLD", "75"))
-        self._graph_fp_force = float(os.getenv("GRAPH_FRAUD_FORCE_REJECT_FP", "0.12"))
-        self._anomaly_score_force = float(os.getenv("ANOMALY_FORCE_REJECT_SCORE", "40"))
+        self._weights = dict(NEXUS_AGENT_WEIGHTS)
+        self._max_reflexive_retries = 3
         self._blockchain_enabled = bool(
             os.getenv("CONTRACT_ADDRESS", "").strip() and get_sepolia_private_key()
         )
         self._ipfs_enabled = True
 
-    @property
-    def approval_threshold(self) -> float:
-        """Minimum weighted consensus score (0–100) required for approval."""
-        return self._threshold
-
-    def _weighted_score(self, agent_results: List[AgentResult]) -> float:
-        total_w = 0.0
-        acc = 0.0
-        for r in agent_results:
-            w = float(self._weights.get(r.agent_name, 1.0))
-            acc += w * float(r.score)
-            total_w += w
-        return round(acc / total_w, 2) if total_w else 0.0
-
-    def _agent_coverage_ratio(self, agent_results: List[AgentResult]) -> float:
-        """
-        Fraction of expected agents present in this decision round.
-        Keeps consensus mathematically honest if orchestration returns partial results.
-        """
-        if not self._expected_agents:
-            return 1.0
-        present = {r.agent_name for r in agent_results}
-        covered = len(self._expected_agents.intersection(present))
-        return covered / len(self._expected_agents)
-
-    def _critical_agent_force_reject(self, agent_results: List[AgentResult]) -> bool:
-        """
-        Graph: material fraud probability forces reject (overrides weak averaging).
-        Anomaly: explicit fail or very low score forces reject.
-        """
-        by_name = {r.agent_name: r for r in agent_results}
-        graph = by_name.get("Graph Agent")
-        if graph:
-            fp = float(graph.details.get("fraud_probability", 0))
-            if fp >= self._graph_fp_force:
-                return True
-        anomaly = by_name.get("Anomaly Agent")
-        if anomaly:
-            if not anomaly.decision:
-                return True
-            if float(anomaly.score) < self._anomaly_score_force:
-                return True
-        return False
-
-    def _finalize(self, agent_results: List[AgentResult]) -> Tuple[str, float]:
-        raw_score = self._weighted_score(agent_results)
-        coverage_ratio = self._agent_coverage_ratio(agent_results)
-        consensus_score = round(raw_score * coverage_ratio, 2)
-
-        # Fail closed if any expected agent is missing.
-        if coverage_ratio < 1.0:
-            return "REJECTED", consensus_score
-
-        if any(not r.decision for r in agent_results):
-            return "REJECTED", consensus_score
-
-        if self._critical_agent_force_reject(agent_results):
-            return "REJECTED", consensus_score
-
-        if consensus_score >= self._threshold:
-            return "APPROVED", consensus_score
-
-        return "REJECTED", consensus_score
+    def _weighted_sum(self, entries: Dict[str, Dict[str, Any]]) -> float:
+        return sum(
+            self._weights.get(agent, 0.0) * float(payload.get("confidence", 0.0))
+            for agent, payload in entries.items()
+        )
 
     @staticmethod
-    def _effective_document_count(claim_data: Dict[str, Any]) -> int:
-        """Use whichever source has richer evidence: raw doc ids or extracted uploads."""
-        documents = claim_data.get("documents") or []
-        extractions = claim_data.get("document_extractions") or []
-        return max(len(documents), len(extractions))
+    def _detect_contradictions(entries: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        contradictions: List[Dict[str, Any]] = []
+        identity = entries.get("Identity Agent", {})
+        anomaly = entries.get("Anomaly Agent", {})
+        policy = entries.get("Policy Agent", {})
+        document = entries.get("Document Agent", {})
+        graph = entries.get("Graph Agent", {})
 
-    def _insufficient_evidence_force_reject(self, claim_data: Dict[str, Any]) -> bool:
-        """
-        Defense-in-depth for high-value claims:
-        force reject when claim amount is high but documentary/history evidence is thin.
-        """
+        if bool(identity.get("decision", False)) and (not bool(anomaly.get("decision", True))):
+            contradictions.append(
+                {
+                    "agents": ["Identity Agent", "Anomaly Agent"],
+                    "H_penalty": 0.22,
+                    "reason": "Identity validated while anomaly engine raised high risk.",
+                }
+            )
+        if bool(policy.get("decision", False)) and (not bool(document.get("decision", True))):
+            contradictions.append(
+                {
+                    "agents": ["Policy Agent", "Document Agent"],
+                    "H_penalty": 0.18,
+                    "reason": "Policy appears compliant while documents fail consistency checks.",
+                }
+            )
+        if float(anomaly.get("score", 100.0)) >= 75.0 and float(graph.get("score", 100.0)) <= 35.0:
+            contradictions.append(
+                {
+                    "agents": ["Anomaly Agent", "Graph Agent"],
+                    "H_penalty": 0.14,
+                    "reason": "Behavioral anomaly appears low while graph risk remains high.",
+                }
+            )
+
+        doc_score = float(document.get("score", 50.0))
+        identity_score = float(identity.get("score", 50.0))
+        if identity_score >= 70.0 and doc_score < 40.0:
+            contradictions.append(
+                {
+                    "agents": ["Identity Agent", "Document Agent"],
+                    "H_penalty": 0.15,
+                    "reason": "Identity appears verified but documentation is critically insufficient.",
+                }
+            )
+
+        policy_score = float(policy.get("score", 50.0))
+        if policy_score >= 80.0 and doc_score < 50.0:
+            contradictions.append(
+                {
+                    "agents": ["Policy Agent", "Document Agent"],
+                    "H_penalty": 0.12,
+                    "reason": "Policy score is high but document evidence does not support the claim.",
+                }
+            )
+
+        return contradictions
+
+    @staticmethod
+    def _compute_ts(weighted_sum: float, contradictions: List[Dict[str, Any]]) -> float:
+        penalty_product = 1.0
+        for contradiction in contradictions:
+            penalty_product *= 1.0 - _clamp01(float(contradiction.get("H_penalty", 0.0)))
+        return round(_clamp01(weighted_sum * penalty_product) * 100.0, 2)
+
+    @staticmethod
+    def _decision_for_ts(ts: float) -> str:
+        if ts > 90:
+            return "AUTO_APPROVE"
+        if 60 <= ts <= 90:
+            return "HUMAN_REVIEW"
+        return "REFLEXIVE_TRIGGER"
+
+    @staticmethod
+    def _to_entries(agent_results: List[AgentResult]) -> Dict[str, Dict[str, Any]]:
+        entries: Dict[str, Dict[str, Any]] = {}
+        for row in agent_results:
+            entries[row.agent_name] = {
+                "score": float(row.score),
+                "confidence": _clamp01(float(row.score) / 100.0),
+                "decision": bool(row.decision),
+                "reasoning": row.reasoning,
+                "details": dict(row.details or {}),
+            }
+        return entries
+
+    def _mahic_breakdown(self, claim_data: Dict[str, Any], entries: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
         amount = float(claim_data.get("amount") or 0.0)
-        history_len = len(claim_data.get("history") or [])
-        doc_count = self._effective_document_count(claim_data)
+        billing_raw = _clamp01(1.0 - (float(entries.get("Document Agent", {}).get("score", 50.0)) / 100.0))
+        clinical_raw = _clamp01(1.0 - (float(entries.get("Policy Agent", {}).get("score", 50.0)) / 100.0))
+        anomaly_risk = _clamp01(1.0 - (float(entries.get("Anomaly Agent", {}).get("score", 50.0)) / 100.0))
+        graph_risk = _clamp01(1.0 - (float(entries.get("Graph Agent", {}).get("score", 50.0)) / 100.0))
+        temporal_raw = _clamp01((0.7 * anomaly_risk) + (0.3 if amount > 30_000 else 0.05))
+        geo_raw = _clamp01((0.75 * graph_risk) + 0.05)
+        return {
+            "billing": round(0.35 * billing_raw * 100.0, 2),
+            "clinical": round(0.30 * clinical_raw * 100.0, 2),
+            "temporal": round(0.20 * temporal_raw * 100.0, 2),
+            "geo": round(0.15 * geo_raw * 100.0, 2),
+        }
 
-        # Moderate-high amount: require a minimum investigation trail.
-        if amount >= 25_000 and (doc_count < 3 or history_len < 2):
-            return True
+    def _apply_self_correction(
+        self, claim_data: Dict[str, Any], entries: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        adjusted = {k: dict(v) for k, v in entries.items()}
+        docs = claim_data.get("documents") or []
+        history = claim_data.get("history") or []
+        for name, entry in adjusted.items():
+            score = float(entry.get("score", 50.0))
+            confidence = float(entry.get("confidence", 0.5))
+            if name in {"Document Agent", "Policy Agent"} and len(docs) < 2:
+                score -= 8.0
+            if name in {"Anomaly Agent", "Graph Agent"} and len(history) > 3:
+                score -= 5.0
+            if "limit" in str(entry.get("reasoning", "")).lower() and name == "Policy Agent":
+                confidence = min(1.0, confidence + 0.05)
+            entry["score"] = round(max(0.0, min(100.0, score)), 2)
+            entry["confidence"] = round(_clamp01(confidence), 4)
+            entry["decision"] = bool(entry["score"] >= 50.0)
+        return adjusted
 
-        # Very high amount: require stronger corroboration from both docs and history.
-        if amount >= 40_000 and (doc_count < 4 or history_len < 3):
-            return True
+    def evaluate_consensus(self, claim_data: Dict[str, Any], agent_results: List[AgentResult]) -> Dict[str, Any]:
+        entries = self._to_entries(agent_results)
+        retry_count = 0
+        retry_logs: List[Dict[str, Any]] = []
+        score_evolution: List[float] = []
 
-        return False
+        while True:
+            contradictions = self._detect_contradictions(entries)
+            weighted_sum = self._weighted_sum(entries)
+            ts = self._compute_ts(weighted_sum, contradictions)
+            score_evolution.append(ts)
+            consensus_decision = self._decision_for_ts(ts)
+            logging.getLogger("claimguard.consensus").info(
+                "nexus_eval retry=%s Ts=%.2f decision=%s contradictions=%s",
+                retry_count,
+                ts,
+                consensus_decision,
+                contradictions,
+            )
 
-    @staticmethod
-    def _extreme_fraud_veto(
-        claim_data: Dict[str, Any], agent_results: List[AgentResult]
-    ) -> bool:
-        amount = float(claim_data.get("amount") or 0)
-        graph = next((r for r in agent_results if r.agent_name == "Graph Agent"), None)
-        if not graph:
-            return False
-        fp = float(graph.details.get("fraud_probability", 0))
-        insurance = claim_data.get("insurance", "")
+            if consensus_decision != "REFLEXIVE_TRIGGER":
+                break
+            if retry_count >= self._max_reflexive_retries:
+                consensus_decision = "REJECTED"
+                break
+            retry_count += 1
+            entries = self._apply_self_correction(claim_data, entries)
+            retry_log = {
+                "retry": retry_count,
+                "reason": "Ts < 60 triggered reflexive verifier.",
+                "updated_entries": entries,
+            }
+            retry_logs.append(retry_log)
+            logging.getLogger("claimguard.consensus").info("reflexive_retry=%s details=%s", retry_count, retry_log)
 
-        if amount >= 45_000 and fp >= 0.08:
-            return True
-        if insurance == "CNSS" and amount > 30_000 and fp >= 0.12:
-            return True
-        if insurance == "CNOPS" and amount > 50_000 and fp >= 0.12:
-            return True
-        return False
-
-    def evaluate_consensus(
-        self, claim_data: Dict[str, Any], agent_results: List[AgentResult]
-    ) -> Tuple[str, float, bool]:
-        """
-        Return ``(decision, weighted_consensus_score, veto_applied)``.
-
-        Applies the same rules as before: weighted score, unanimous approval,
-        critical-agent overrides, then optional extreme-fraud veto.
-        """
-        decision, consensus_score = self._finalize(agent_results)
-        veto_applied = False
-        if decision == "APPROVED" and self._insufficient_evidence_force_reject(claim_data):
-            decision = "REJECTED"
-            veto_applied = True
-        if decision == "APPROVED" and self._extreme_fraud_veto(claim_data, agent_results):
-            decision = "REJECTED"
-            veto_applied = True
-        return decision, consensus_score, veto_applied
+        # Keep v1 public decision contract binary for compatibility.
+        final_decision = "APPROVED" if consensus_decision == "AUTO_APPROVE" else "REJECTED"
+        return {
+            "decision": final_decision,
+            "consensus_decision": consensus_decision,
+            "score": ts,
+            "veto_applied": False,
+            "Ts": ts,
+            "retry_count": retry_count,
+            "mahic_breakdown": self._mahic_breakdown(claim_data, entries),
+            "contradictions": contradictions,
+            "score_evolution": score_evolution,
+            "retry_logs": retry_logs,
+        }
 
     async def process_claim(self, claim_data: Dict[str, Any]) -> ClaimResult:
         raw_in = claim_data.get("claim_id")
@@ -208,9 +231,19 @@ class ConsensusSystem:
         raw_agent_results = await run_claim_agents_async(enriched)
         agent_results = [AgentResult(**r) for r in raw_agent_results]
 
-        decision, consensus_score, veto_applied = self.evaluate_consensus(
-            enriched, agent_results
-        )
+        tracker = get_tracker(claim_id)
+        tracker.update("Consensus", "RUNNING")
+
+        consensus = self.evaluate_consensus(enriched, agent_results)
+        decision = consensus["decision"]
+        consensus_score = float(consensus["score"])
+        veto_applied = bool(consensus["veto_applied"])
+        
+        tracker.update("Consensus", "COMPLETED")
+        if consensus["consensus_decision"] == "HUMAN_REVIEW":
+            tracker.update("HumanReview", "RUNNING")
+        else:
+            tracker.update("HumanReview", "SKIPPED")
 
         audit = build_final_consensus_payload(
             enriched,
@@ -218,7 +251,7 @@ class ConsensusSystem:
             final_decision=decision,
             weighted_score=consensus_score,
             veto_applied=veto_applied,
-            consensus_threshold=self.approval_threshold,
+            consensus_threshold=90.0,
         )
         logging.getLogger("claimguard.consensus").info(
             "consensus_audit %s",
@@ -263,6 +296,11 @@ class ConsensusSystem:
             decision=decision,
             score=consensus_score,
             agent_results=agent_results,
+            consensus_decision=consensus["consensus_decision"],
+            Ts=consensus["Ts"],
+            retry_count=consensus["retry_count"],
+            mahic_breakdown=consensus["mahic_breakdown"],
+            contradictions=consensus["contradictions"],
             timestamp=datetime.now(timezone.utc),
             tx_hash=tx_hash,
             ipfs_hash=ipfs_hash,
