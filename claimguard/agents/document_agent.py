@@ -280,11 +280,11 @@ class DocumentAgent(BaseAgent):
         total_text_len = self._extraction_text_length(extractions)
 
         if effective_count == 0:
-            score -= 60
+            score -= 40
             reasoning.append("No documents submitted")
             details["doc_count"] = 0
         elif effective_count < 2:
-            score -= 25
+            score -= 10
             reasoning.append("Insufficient documentation — only one document provided")
             details["doc_count"] = effective_count
         else:
@@ -302,7 +302,7 @@ class DocumentAgent(BaseAgent):
             missing_docs.append(req)
 
         if missing_docs:
-            penalty_per_doc = 18
+            penalty_per_doc = 5
             score -= penalty_per_doc * len(missing_docs)
             reasoning.append(f"Missing required documents: {', '.join(missing_docs)}")
             details["missing_docs"] = missing_docs
@@ -343,11 +343,11 @@ class DocumentAgent(BaseAgent):
 
         failed_ext = [ex for ex in extractions if (ex.get("extracted_text") or "").strip() == ""]
         if extractions and len(failed_ext) == len(extractions):
-            score -= 20
+            score -= 8
             reasoning.append("No extractable text from uploaded files (try OCR or text-based PDFs)")
             details["extraction_all_empty"] = True
         elif failed_ext:
-            score -= 5 * len(failed_ext)
+            score -= 2 * len(failed_ext)
             details["extraction_partial_failures"] = len(failed_ext)
 
         score = max(0.0, score)

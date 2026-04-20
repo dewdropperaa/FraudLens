@@ -420,10 +420,10 @@ class IdentityAgent(BaseAgent):
             observations.extend(ocr_obs)
 
             if not cin_found_in_ocr:
-                score -= 30
+                score -= 10
                 confidence = min(confidence, 60)
                 reasoning_steps.append(
-                    "CIN not found anywhere in document text → applied -30 penalty"
+                    "CIN not found anywhere in document text → applied -10 penalty"
                 )
             elif not cin_matches:
                 ocr_match = False
@@ -488,9 +488,9 @@ class IdentityAgent(BaseAgent):
 
         if not input_dob:
             missing_data.append("date_of_birth")
-            score -= 20
+            score -= 5
             confidence = min(confidence, 65)
-            reasoning_steps.append("Date of birth missing → applied -20 penalty")
+            reasoning_steps.append("Date of birth missing → applied -5 penalty")
         elif ocr_dob:
             dob_norm_input = re.sub(r"[/\-.]", "", input_dob)
             dob_norm_ocr = re.sub(r"[/\-.]", "", ocr_dob)
@@ -575,8 +575,8 @@ class IdentityAgent(BaseAgent):
             )
             if ext_list and empty_extractions == len(ext_list):
                 fraud_signals.append("All documents have empty/unreadable text — possible poor quality or tampering")
-                score -= 10
-                reasoning_steps.append("All document extractions empty → applied -10 penalty")
+                score -= 3
+                reasoning_steps.append("All document extractions empty → applied -3 penalty")
 
         if injection_detected:
             fraud_signals.append("Prompt injection patterns detected in document text")

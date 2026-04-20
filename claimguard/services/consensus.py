@@ -114,9 +114,9 @@ class ConsensusSystem:
 
     @staticmethod
     def _decision_for_ts(ts: float) -> str:
-        if ts > 90:
+        if ts > 70:
             return "AUTO_APPROVE"
-        if 60 <= ts <= 90:
+        if 50 <= ts <= 70:
             return "HUMAN_REVIEW"
         return "REFLEXIVE_TRIGGER"
 

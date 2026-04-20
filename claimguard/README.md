@@ -2,6 +2,131 @@
 
 A sophisticated multi-agent AI system for automated insurance claim verification using CrewAI and FastAPI.
 
+---
+
+## HOW TO RUN THE PROJECT (Step by Step)
+
+### Prerequisites
+- Python 3.10+ installed
+- Node.js 18+ installed
+- Git Bash or PowerShell terminal
+
+---
+
+### STEP 1 — Activate the virtual environment
+
+Open a terminal at the **repo root** (`ClaimGuard_v2/`):
+
+```bash
+# On Windows (Git Bash / bash)
+source venv/Scripts/activate
+
+# On Windows (PowerShell)
+venv\Scripts\Activate.ps1
+```
+
+You should see `(venv)` at the start of your prompt.
+
+---
+
+### STEP 2 — Install Python dependencies
+
+```bash
+pip install -r claimguard/requirements.txt
+```
+
+> This installs fastapi, uvicorn, crewai, langchain, web3, and all other backend dependencies.
+> It will take several minutes the first time.
+
+---
+
+### STEP 3 — Set up environment variables
+
+```bash
+cp claimguard/.env.example claimguard/.env
+```
+
+Then open `claimguard/.env` and set at minimum:
+
+```
+ENVIRONMENT=development
+DOCUMENT_ENCRYPTION_KEY=your32characterkeyhere1234567890
+CLAIMAGUARD_API_KEYS=my-secret-key
+```
+
+> For development, you can skip Firebase, Ethereum, and Pinata variables.
+
+---
+
+### STEP 4 — Start the backend server
+
+```bash
+cd claimguard
+python main.py
+```
+
+Or with auto-reload:
+
+```bash
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Backend runs at: **http://localhost:8000**
+API docs at: **http://localhost:8000/docs**
+
+---
+
+### STEP 5 — Start the frontend (new terminal)
+
+Open a **second terminal**, then:
+
+```bash
+cd claimguard/frontend
+npm install
+npm run dev
+```
+
+Frontend runs at: **http://localhost:5173**
+
+---
+
+### STEP 6 — Set up frontend environment variables
+
+```bash
+cp claimguard/frontend/.env.example claimguard/frontend/.env
+```
+
+Default values should work for local dev:
+
+```
+VITE_API_BASE_URL=http://localhost:8000
+VITE_API_TIMEOUT_MS=30000
+VITE_PROXY_TARGET=http://localhost:8000
+VITE_CLAIMAGUARD_API_KEY=my-secret-key
+```
+
+> `VITE_CLAIMAGUARD_API_KEY` must match what you set in the backend `CLAIMAGUARD_API_KEYS`.
+
+---
+
+### Quick summary
+
+| Terminal | Command | URL |
+|----------|---------|-----|
+| 1 (backend) | `source venv/Scripts/activate` then `cd claimguard && python main.py` | http://localhost:8000 |
+| 2 (frontend) | `cd claimguard/frontend && npm run dev` | http://localhost:5173 |
+
+---
+
+### Run tests
+
+```bash
+cd claimguard
+pytest test_claims.py -v -s
+```
+
+---
+
 ## Architecture
 
 ClaimGuard uses a multi-agent architecture with 5 specialized AI agents:

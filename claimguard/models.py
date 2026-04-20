@@ -5,7 +5,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 InsuranceType = Literal["CNSS", "CNOPS"]
@@ -47,6 +47,8 @@ class DocumentBase64Part(BaseModel):
 
 
 class ClaimInput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     patient_id: str = Field(..., min_length=1, max_length=128, description="Patient identifier")
     provider_id: str = Field(
         ...,

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 from uuid import uuid4
 
-from google.cloud.firestore import Query, SERVER_TIMESTAMP
+from google.cloud.firestore import Query, SERVER_TIMESTAMP  # type: ignore[import]
 
 from claimguard.firebase_config import get_firestore_client
 from claimguard.models import ClaimResult
@@ -79,6 +79,27 @@ class FirestoreClaimStore:
             pass
         return sum(1 for _ in q.stream())
 
+    def update_decision(self, claim_id: str, decision: str, reviewer_id: str) -> bool:
+        ref = self._col().document(claim_id)
+        snap = ref.get()
+        if not snap.exists:
+            return False
+        dn = decision.upper()
+        d = snap.to_dict() or {}
+        payload = d.get("payload")
+        if isinstance(payload, dict):
+            payload["decision"] = dn
+        ref.set(
+            {
+                "decision": dn,
+                "payload": payload,
+                "reviewed_by": reviewer_id,
+                "reviewed_at": SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return True
+
     def list_page(
         self,
         decision: str | None = None,
@@ -89,21 +110,26 @@ class FirestoreClaimStore:
         limit = min(max(1, limit), 500)
 
         col = self._col()
-        if decision is None:
-            q = col.order_by("created_at", direction=Query.DESCENDING)
-        else:
-            q = col.where("decision", "==", decision.upper()).order_by(
-                "created_at", direction=Query.DESCENDING
-            )
 
-        total = self._count_matching(decision)
+        # Fetch all docs, then filter and sort in Python.
+        # This avoids any composite index requirements in Firestore.
+        all_docs = list(col.stream())
 
-        if offset:
-            q = q.offset(offset)
-        q = q.limit(limit)
+        if decision is not None:
+            dn = decision.upper()
+            all_docs = [d for d in all_docs if (d.to_dict() or {}).get("decision", "").upper() == dn]
 
+        all_docs.sort(
+            key=lambda d: (d.to_dict() or {}).get("created_at") or datetime.min,
+            reverse=True,
+        )
+
+        total = len(all_docs)
+        docs = all_docs
+
+        paged = docs[offset: offset + limit]
         items: List[ClaimResult] = []
-        for doc in q.stream():
+        for doc in paged:
             d = doc.to_dict() or {}
             raw = d.get("payload")
             if not isinstance(raw, dict):

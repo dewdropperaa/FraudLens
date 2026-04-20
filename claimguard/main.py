@@ -22,7 +22,7 @@ from claimguard.config import (
 from claimguard.firebase_config import is_test_environment
 from claimguard.rate_limiting import limiter
 from claimguard.middleware_body import MaxBodySizeMiddleware
-from claimguard.routes import claims_router, v2_router
+from claimguard.routes import auth_router, claims_router, v2_router
 
 load_environment()
 
@@ -40,6 +40,8 @@ async def lifespan(app: FastAPI):
     from claimguard.v2 import get_v2_orchestrator
 
     get_v2_orchestrator()
+    # Seed default admin/patient accounts in Firestore if they don't exist.
+    _seed_firestore_users()
     # Claims persist in Cloud Firestore (tests use in-memory store; see services.storage).
     if not is_test_environment():
         from claimguard.firestore_provision import ensure_default_firestore_database
@@ -48,6 +50,25 @@ async def lifespan(app: FastAPI):
         ensure_default_firestore_database()
         get_firestore_client()
     yield
+
+
+def _seed_firestore_users() -> None:
+    """Write the default assureur account to Firestore if it doesn't exist."""
+    from claimguard.firebase_config import get_firestore_client
+    from claimguard.security import hash_password
+    from google.cloud.firestore import SERVER_TIMESTAMP
+
+    col = get_firestore_client().collection("users")
+    existing = col.where("email", "==", "admin@gmail.com").limit(1).stream()
+    if not any(True for _ in existing):
+        col.add({
+            "email":         "admin@gmail.com",
+            "password_hash": hash_password("admin123"),
+            "role":          "assureur",
+            "full_name":     "Assureur",
+            "patient_id":    None,
+            "created_at":    SERVER_TIMESTAMP,
+        })
 
 
 def create_app() -> FastAPI:
@@ -103,6 +124,7 @@ def create_app() -> FastAPI:
         max_age=600,
     )
 
+    application.include_router(auth_router)
     application.include_router(claims_router)
     application.include_router(v2_router)
     return application

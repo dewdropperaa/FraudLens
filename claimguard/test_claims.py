@@ -57,9 +57,12 @@ def test_1_valid_claim_cnss_approved_and_get_works():
         "provider_id": "3037",
         "amount": 5000.0,
         "documents": ["medical_report", "invoice", "prescription"],
+        "identity": {"cin": "BK847293", "name": "Ahmed Benali", "date_of_birth": "1985-03-12"},
+        "patient_name": "Ahmed Benali",
+        "date_of_birth": "1985-03-12",
         "history": [
-            {"amount": 2000.0, "date": "2024-01-15", "recent": False},
-            {"amount": 3000.0, "date": "2024-02-20", "recent": False},
+            {"amount": 2000.0, "date": "2023-01-15", "recent": False},
+            {"amount": 3000.0, "date": "2023-08-20", "recent": False},
         ],
         "insurance": "CNSS",
     }
@@ -86,9 +89,12 @@ def test_2_valid_claim_cnops_approved():
         "provider_id": "1543",
         "amount": 10000.0,
         "documents": ["medical_report", "invoice", "prescription", "lab_results"],
+        "identity": {"cin": "BH392847", "name": "Fatima Zahra", "date_of_birth": "1990-07-22"},
+        "patient_name": "Fatima Zahra",
+        "date_of_birth": "1990-07-22",
         "history": [
-            {"amount": 5000.0, "date": "2024-01-10", "recent": False},
-            {"amount": 4000.0, "date": "2024-03-05", "recent": False},
+            {"amount": 5000.0, "date": "2023-01-10", "recent": False},
+            {"amount": 4000.0, "date": "2023-09-05", "recent": False},
         ],
         "insurance": "CNOPS",
     }
@@ -272,19 +278,22 @@ def test_12_sequential_claim_requests_stay_fast():
 
 
 def test_13_multipart_upload_extracts_text_and_approves():
-    content = b"medical report invoice prescription ordonnance facture"
+    content = b"Patient: Ahmed Benali BK847293 DOB:1985-03-12 medical report invoice prescription ordonnance facture"
     response = client.post(
         "/claim/upload",
         data={
-            "patient_id": "12345678",
+            "patient_id": "BK847293",
             "provider_id": "3037",
             "amount": "5000",
             "insurance": "CNSS",
             "history_json": json.dumps(
-                [{"amount": 2000.0, "date": "2024-01-15", "recent": False}]
+                [{"amount": 2000.0, "date": "2023-01-15", "recent": False}]
             ),
         },
-        files=[("files", ("evidence.txt", content, "text/plain"))],
+        files=[
+            ("files", ("evidence.txt", content, "text/plain")),
+            ("files", ("lab_results.txt", b"lab results analysis complete", "text/plain")),
+        ],
         headers=API_HEADERS,
     )
     assert response.status_code == 200
@@ -294,16 +303,22 @@ def test_13_multipart_upload_extracts_text_and_approves():
 
 
 def test_14_json_body_documents_base64_merges_extractions():
-    raw = b"medical report invoice prescription ordonnance facture"
+    raw = b"Patient: Ahmed Benali BK847293 DOB:1985-03-12 medical report invoice prescription ordonnance facture"
     b64 = base64.b64encode(raw).decode("ascii")
     claim_data = {
-        "patient_id": "12345678",
+        "patient_id": "BK847293",
         "provider_id": "3037",
         "amount": 5000.0,
         "insurance": "CNSS",
         "documents": [],
-        "documents_base64": [{"name": "pack.txt", "content_base64": b64}],
-        "history": [{"amount": 2000.0, "date": "2024-01-15", "recent": False}],
+        "documents_base64": [
+            {"name": "pack.txt", "content_base64": b64},
+            {"name": "lab.txt", "content_base64": base64.b64encode(b"lab results analysis complete").decode("ascii")},
+        ],
+        "identity": {"cin": "BK847293", "name": "Ahmed Benali", "date_of_birth": "1985-03-12"},
+        "patient_name": "Ahmed Benali",
+        "date_of_birth": "1985-03-12",
+        "history": [{"amount": 2000.0, "date": "2023-01-15", "recent": False}],
     }
     posted = _post_claim(claim_data)
     assert posted["decision"] == "APPROVED"

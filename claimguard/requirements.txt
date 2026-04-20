@@ -42,7 +42,12 @@ crewai>=0.70.0
 crewai-tools>=0.12.0
 # LangChain model wrappers (Ollama local models)
 langchain-core>=0.3.0
+langchain-openai>=0.2.0
 langchain-community>=0.3.0
+langchain-ollama>=0.2.0
+
+# Utilities
+rich>=13.0.0
 
 # Case Memory Layer — vector store for similar-case retrieval (FAISS optional but recommended)
 # Install: pip install faiss-cpu

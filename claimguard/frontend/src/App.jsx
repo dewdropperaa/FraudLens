@@ -2,10 +2,12 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import axios from 'axios'
 import { ethers } from 'ethers'
 import { Icons, SidebarItem } from './components'
-import Dashboard  from './pages/Dashboard'
-import SubmitClaim from './pages/SubmitClaim'
-import Analytics  from './pages/Analytics'
-import Database   from './pages/Database'
+import Dashboard   from './pages/Dashboard'
+import SubmitClaim  from './pages/SubmitClaim'
+import Database    from './pages/Database'
+import AdminReview from './pages/AdminReview'
+import Login      from './pages/Login'
+import { useAuth } from './context/AuthContext'
 
 /* ── API ─────────────────────────────────────────────────────── */
 const api = axios.create({
@@ -70,23 +72,28 @@ async function fetchAllClaimsAllPages() {
   return items
 }
 
-/* ── Nav config ──────────────────────────────────────────────── */
-const NAV_LINKS = [
-  { id: 'dashboard', label: 'Home',       Icon: Icons.Home      },
-  { id: 'submit',    label: 'New Claim',   Icon: Icons.FileText  },
-  { id: 'analytics', label: 'Analytics',   Icon: Icons.BarChart2 },
-  { id: 'database',  label: 'Database',    Icon: Icons.Database  },
-]
-
 /* ── App ─────────────────────────────────────────────────────── */
 export default function App() {
+  const { user, token, logout, isAuthenticated } = useAuth()
+
+  /* Inject JWT; remove X-API-Key so the JWT role is used on the backend */
+  useEffect(() => {
+    if (token) {
+      api.defaults.headers.common['Authorization'] = `Bearer ${token}`
+      delete api.defaults.headers.common['X-API-Key']
+    } else {
+      delete api.defaults.headers.common['Authorization']
+      if (apiKey) api.defaults.headers.common['X-API-Key'] = apiKey
+    }
+  }, [token])
+
   /* Form */
-  const [form,          setForm]          = useState({ patient_id: '', provider_id: '', amount: '', insurance: 'CNSS' })
-  const [selectedFiles, setSelectedFiles] = useState([])
-  const [isSubmitting,  setIsSubmitting]  = useState(false)
+  const [form,           setForm]          = useState({ patient_id: '', provider_id: '', amount: '', insurance: 'CNSS' })
+  const [selectedFiles,  setSelectedFiles] = useState([])
+  const [isSubmitting,   setIsSubmitting]  = useState(false)
   const [currentClaimId, setCurrentClaimId] = useState(null)
-  const [submitError,   setSubmitError]   = useState('')
-  const [lastResult,    setLastResult]    = useState(null)
+  const [submitError,    setSubmitError]   = useState('')
+  const [lastResult,     setLastResult]    = useState(null)
 
   /* Claims */
   const [claims,        setClaims]        = useState([])
@@ -94,13 +101,13 @@ export default function App() {
   const [claimsError,   setClaimsError]   = useState('')
   const [filter,        setFilter]        = useState('all')
 
-  /* Chart */
+  /* Chart (Dashboard only) */
   const [chartTick,    setChartTick]    = useState(0)
   const [dailyClaims,  setDailyClaims]  = useState([])
   const [chartLoading, setChartLoading] = useState(false)
 
   /* Page routing */
-  const [activePage,   setActivePage]   = useState('dashboard')
+  const [activePage, setActivePage] = useState('dashboard')
 
   /* ── Stats ─────────────────────────────────────────────────── */
   const stats = useMemo(() => {
@@ -113,17 +120,17 @@ export default function App() {
   const hasValidTxHash = useMemo(() => lastResult?.tx_hash ? ethers.isHexString(lastResult.tx_hash) : false, [lastResult])
 
   /* ── Fetch claims ───────────────────────────────────────────── */
-  const fetchClaims = useCallback(async (activeFilter = filter) => {
+  const fetchClaims = useCallback(async () => {
     setClaimsLoading(true); setClaimsError('')
     try {
-      const res = await api.get('/claims', { params: { filter: activeFilter } })
+      const res = await api.get('/claims', { params: { filter: 'all', page_size: 100 } })
       setClaims(res.data?.items ?? [])
     } catch (err) {
       setClaimsError(formatApiError(err) || 'Failed to fetch claims.')
     } finally { setClaimsLoading(false) }
-  }, [filter])
+  }, [])
 
-  useEffect(() => { fetchClaims(filter) }, [filter, fetchClaims])
+  useEffect(() => { fetchClaims() }, [fetchClaims])
 
   useEffect(() => {
     let cancelled = false
@@ -160,27 +167,29 @@ export default function App() {
     } finally { setIsSubmitting(false) }
   }
 
-  /* ── Shared props passed to all pages ───────────────────────── */
+  /* ── Shared props ───────────────────────────────────────────── */
   const shared = { claims, claimsLoading, claimsError, filter, setFilter, fetchClaims, shortHex, toIpfsUrl, safeText }
 
   const submitProps = {
     form, handleInputChange, handleFileChange, handleSubmit,
     isSubmitting, submitError, selectedFiles,
-    lastResult, hasValidTxHash, safeText, shortHex, toIpfsUrl, scorePercent, currentClaimId
+    lastResult, hasValidTxHash, safeText, shortHex, toIpfsUrl, scorePercent, currentClaimId,
   }
 
-  /* ── Render page content ────────────────────────────────────── */
+  /* ── Render page ────────────────────────────────────────────── */
   function renderPage() {
     switch (activePage) {
-      case 'dashboard':  return <Dashboard  {...shared} stats={stats} dailyClaims={dailyClaims} chartLoading={chartLoading} />
-      case 'submit':     return <SubmitClaim {...submitProps} />
-      case 'analytics':  return <Analytics  dailyClaims={dailyClaims} chartLoading={chartLoading} stats={stats} claimsLoading={claimsLoading} />
+      case 'dashboard': return <Dashboard  {...shared} stats={stats} dailyClaims={dailyClaims} chartLoading={chartLoading} />
+      case 'submit':    return <SubmitClaim {...submitProps} />
+      case 'admin':     return <AdminReview {...shared} />
       case 'database':
-      case 'admin':
-      case 'claims':     return <Database   {...shared} />
-      default:           return <Dashboard  {...shared} stats={stats} dailyClaims={dailyClaims} chartLoading={chartLoading} />
+      case 'claims':    return <Database   {...shared} />
+      default:          return <Dashboard  {...shared} stats={stats} dailyClaims={dailyClaims} chartLoading={chartLoading} />
     }
   }
+
+  /* ── Auth gate ──────────────────────────────────────────────── */
+  if (!isAuthenticated) return <Login />
 
   return (
     <div className="cg-layout">
@@ -189,11 +198,15 @@ export default function App() {
       <nav className="cg-nav">
         <div className="cg-nav-brand">
           <div className="cg-nav-brand-icon"><Icons.Shield /></div>
-          <span className="cg-nav-brand-name">ClaimGuard</span>
+          <span className="cg-nav-brand-name">FraudLens</span>
         </div>
 
         <div className="cg-nav-links">
-          {NAV_LINKS.map(({ id, label, Icon }) => (
+          {[
+            { id: 'dashboard', label: 'Home',      Icon: Icons.Home     },
+            { id: 'submit',    label: 'New Claim',  Icon: Icons.FileText },
+            { id: 'database',  label: 'All Claims', Icon: Icons.Database },
+          ].map(({ id, label, Icon }) => (
             <button key={id} className={`cg-nav-link${activePage === id ? ' active' : ''}`} onClick={() => setActivePage(id)}>
               <Icon />{label}
             </button>
@@ -204,22 +217,35 @@ export default function App() {
           <button className="cg-nav-icon-btn" aria-label="Notifications">
             <Icons.Bell />{lastResult && <span className="dot" />}
           </button>
-          <div className="cg-avatar">A</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <div style={{ textAlign: 'right' }}>
+              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-primary)', lineHeight: 1.2 }}>
+                {user?.full_name ?? user?.email}
+              </div>
+              <div style={{ fontSize: '11px', color: 'var(--text-muted)', lineHeight: 1.2 }}>Assureur</div>
+            </div>
+            <div className="cg-avatar" style={{ background: 'var(--accent)' }}>
+              {(user?.full_name?.[0] ?? user?.email?.[0] ?? 'A').toUpperCase()}
+            </div>
+            <button
+              onClick={logout}
+              title="Se déconnecter"
+              style={{ background: 'none', border: '1px solid var(--border)', borderRadius: '6px', padding: '5px 8px', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '4px' }}
+            >
+              <Icons.LogOut style={{ width: 14, height: 14 }} />
+            </button>
+          </div>
         </div>
       </nav>
 
       {/* ── Sidebar ────────────────────────────────────────────── */}
       <aside className="cg-sidebar">
         <div className="cg-sidebar-label">Overview</div>
-        <SidebarItem icon={Icons.Home}       label="Dashboard"    active={activePage === 'dashboard'}  onClick={() => setActivePage('dashboard')} />
-        <SidebarItem icon={Icons.PlusCircle} label="Submit Claim" active={activePage === 'submit'}     onClick={() => setActivePage('submit')} />
-
-        <div className="cg-sidebar-label">Analysis</div>
-        <SidebarItem icon={Icons.BarChart2}  label="Analytics"    active={activePage === 'analytics'}  onClick={() => setActivePage('analytics')} />
-        <SidebarItem icon={Icons.Cpu}        label="AI Agents"    active={activePage === 'agents'}     onClick={() => setActivePage('agents')} />
+        <SidebarItem icon={Icons.Home}       label="Dashboard"  active={activePage === 'dashboard'} onClick={() => setActivePage('dashboard')} />
+        <SidebarItem icon={Icons.PlusCircle} label="New Claim"  active={activePage === 'submit'}    onClick={() => setActivePage('submit')} />
 
         <div className="cg-sidebar-label">Management</div>
-        <SidebarItem icon={Icons.Database}   label="Admin View"   active={activePage === 'admin'}      onClick={() => setActivePage('database')} />
+        <SidebarItem icon={Icons.Database} label="Admin View" active={activePage === 'admin'} onClick={() => setActivePage('admin')} />
         <SidebarItem
           icon={Icons.Inbox}
           label="All Claims"
@@ -227,10 +253,6 @@ export default function App() {
           active={activePage === 'claims' || activePage === 'database'}
           onClick={() => setActivePage('database')}
         />
-
-        <div className="cg-sidebar-label">System</div>
-        <SidebarItem icon={Icons.Box}  label="Blockchain" active={activePage === 'blockchain'} onClick={() => setActivePage('database')} />
-        <SidebarItem icon={Icons.Link} label="IPFS Docs"  active={activePage === 'ipfs'}      onClick={() => setActivePage('database')} />
       </aside>
 
       {/* ── Page content ───────────────────────────────────────── */}

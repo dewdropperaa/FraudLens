@@ -2,11 +2,13 @@ import json
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from pydantic import BaseModel
 
 from claimguard.rate_limiting import limiter
 from claimguard.models import ClaimInput, ClaimListResponse, ClaimResult
-from claimguard.security import verify_request_auth
+from claimguard.security import verify_request_auth, AuthContext
 from claimguard.services import get_consensus_system
+from claimguard.services.storage import get_claim_store
 from claimguard.services.document_extraction import (
     build_extractions_from_base64_parts,
     build_extractions_from_upload_files,
@@ -14,6 +16,30 @@ from claimguard.services.document_extraction import (
 from claimguard.v2.flow_tracker import get_tracker
 
 router = APIRouter()
+
+class ReviewBody(BaseModel):
+    decision: str  # "APPROVED" or "REJECTED"
+
+
+@router.patch("/claim/{claim_id}/review")
+@limiter.limit("120/minute")
+async def review_claim(
+    request: Request,
+    claim_id: str,
+    body: ReviewBody,
+    auth: AuthContext = Depends(verify_request_auth),
+) -> dict:
+    if len(claim_id) > 128:
+        raise HTTPException(status_code=400, detail="claim_id too long")
+    decision = body.decision.strip().upper()
+    if decision not in ("APPROVED", "REJECTED"):
+        raise HTTPException(status_code=400, detail="decision must be APPROVED or REJECTED")
+    store = get_claim_store()
+    updated = store.update_decision(claim_id, decision, reviewer_id=auth.user_id or "unknown")
+    if not updated:
+        raise HTTPException(status_code=404, detail="Claim not found")
+    return {"claim_id": claim_id, "decision": decision, "status": "updated"}
+
 
 @router.get("/claim/{claim_id}/flow", dependencies=[Depends(verify_request_auth)])
 async def get_claim_flow(claim_id: str) -> dict:

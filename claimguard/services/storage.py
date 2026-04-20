@@ -22,6 +22,8 @@ class ClaimStoreProtocol(Protocol):
         limit: int,
     ) -> Tuple[List[ClaimResult], int]: ...
 
+    def update_decision(self, claim_id: str, decision: str, reviewer_id: str) -> bool: ...
+
 
 class MemoryClaimStore:
     """In-process claim storage for ``ENVIRONMENT=test`` (pytest) only."""
@@ -55,6 +57,14 @@ class MemoryClaimStore:
         total = len(items)
         page = items[offset : offset + limit]
         return page, total
+
+    def update_decision(self, claim_id: str, decision: str, reviewer_id: str) -> bool:
+        claim = self._claims.get(claim_id)
+        if claim is None:
+            return False
+        updated = claim.model_copy(update={"decision": decision.upper()})
+        self._claims[claim_id] = updated
+        return True
 
 
 _store: ClaimStoreProtocol | None = None

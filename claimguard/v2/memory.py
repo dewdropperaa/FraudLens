@@ -177,6 +177,7 @@ class CaseMemoryLayer:
         self._use_faiss: bool = False
         self._faiss_checked: bool = False   # avoid repeated import attempts
 
+        self._using_fake_embeddings = False
         self._embedder = self._init_embedder()
         self._load_store()
 
@@ -195,6 +196,7 @@ class CaseMemoryLayer:
             return emb
         except Exception as exc:
             LOGGER.warning("memory_embedder_ollama_unavailable reason=%s — using FakeEmbeddings", exc)
+            self._using_fake_embeddings = True
             from langchain_community.embeddings import FakeEmbeddings
             return FakeEmbeddings(size=64)
 
@@ -263,7 +265,7 @@ class CaseMemoryLayer:
         Each result dict: claim_id, cin, fraud_label, similarity, summary,
                           hospital, doctor, diagnosis, ts_score, timestamp.
         """
-        if not self._entries:
+        if not self._entries or self._using_fake_embeddings:
             return []
 
         query_text = _build_query_text(current_claim)

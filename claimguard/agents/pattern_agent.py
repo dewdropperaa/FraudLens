@@ -73,11 +73,6 @@ class PatternAgent(BaseAgent):
         reasoning: List[str] = []
         details: Dict[str, Any] = {}
 
-        if len(patient_id) < 8 or not patient_id.isdigit():
-            score -= 45
-            reasoning.append("Suspicious patient ID detected")
-            details["suspicious_patient_id"] = True
-
         if len(history) == 0:
             score -= 15
             reasoning.append(
@@ -146,12 +141,21 @@ class PatternAgent(BaseAgent):
                 prev_date = history[i - 1].get("date", "") if isinstance(history[i - 1], dict) else ""
                 curr_date = history[i].get("date", "") if isinstance(history[i], dict) else ""
                 if prev_date and curr_date:
-                    claim_intervals.append(1)
+                    try:
+                        d1 = date.fromisoformat(str(prev_date))
+                        d2 = date.fromisoformat(str(curr_date))
+                        interval = abs((d2 - d1).days)
+                        claim_intervals.append(interval)
+                    except ValueError:
+                        claim_intervals.append(0)
 
-            if len(claim_intervals) > 0 and len(claim_intervals) < 7:
+            short_intervals = [d for d in claim_intervals if d < 14]
+            if len(short_intervals) > 0 and len(short_intervals) >= len(claim_intervals) // 2 + 1:
                 score -= 20
                 reasoning.append("Suspiciously short intervals between claims")
-                details["avg_interval_days"] = 7
+                details["avg_interval_days"] = round(sum(short_intervals) / len(short_intervals), 1)
+            elif claim_intervals:
+                details["avg_interval_days"] = round(sum(claim_intervals) / len(claim_intervals), 1)
 
         if len(history) > 0:
             similar_amounts = sum(1 for h in history if abs(float(h.get("amount", 0) or 0) - amount) < 100)

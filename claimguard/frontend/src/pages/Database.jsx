@@ -3,6 +3,12 @@ import { Icons } from '../components'
 const FILTERS = ['all', 'fraud', 'valid']
 
 export default function Database({ claims, claimsLoading, claimsError, filter, setFilter, fetchClaims, shortHex, toIpfsUrl, safeText }) {
+  const visible = filter === 'fraud'
+    ? claims.filter(c => c.decision === 'REJECTED')
+    : filter === 'valid'
+    ? claims.filter(c => c.decision === 'APPROVED')
+    : claims
+
   return (
     <>
       <div className="cg-page-header">
@@ -19,7 +25,7 @@ export default function Database({ claims, claimsLoading, claimsError, filter, s
               </button>
             ))}
           </div>
-          <button className="cg-btn cg-btn-ghost cg-btn-sm" onClick={() => fetchClaims(filter)}>
+          <button className="cg-btn cg-btn-ghost cg-btn-sm" onClick={() => fetchClaims()}>
             <Icons.RefreshCw /> Refresh
           </button>
         </div>
@@ -30,7 +36,7 @@ export default function Database({ claims, claimsLoading, claimsError, filter, s
         <div className="cg-stat-card">
           <div className="cg-stat-icon-wrap blue"><Icons.Inbox /></div>
           <div className="cg-stat-label">Showing</div>
-          <div className="cg-stat-value">{claimsLoading ? '—' : claims.length}</div>
+          <div className="cg-stat-value">{claimsLoading ? '—' : visible.length}</div>
           <div className="cg-stat-sub">claims ({filter})</div>
         </div>
         <div className="cg-stat-card">
@@ -48,7 +54,7 @@ export default function Database({ claims, claimsLoading, claimsError, filter, s
       <div className="cg-card">
         <div className="cg-card-header">
           <div className="cg-card-title"><div className="cg-card-title-icon"><Icons.Database /></div>Claims List</div>
-          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{claims.length} record{claims.length !== 1 ? 's' : ''}</span>
+          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{visible.length} record{visible.length !== 1 ? 's' : ''}</span>
         </div>
 
         {claimsLoading && <div className="cg-empty"><span className="cg-spinner" style={{ width: 18, height: 18, color: '#6366f1' }} /><div style={{ marginTop: 8 }}>Loading claims…</div></div>}
@@ -67,7 +73,7 @@ export default function Database({ claims, claimsLoading, claimsError, filter, s
                 </tr>
               </thead>
               <tbody>
-                {claims.map((claim) => (
+                {visible.map((claim) => (
                   <tr key={claim.claim_id}>
                     <td className="mono">{shortHex(claim.claim_id)}</td>
                     <td className={claim.decision === 'APPROVED' ? 'approved' : 'rejected'}>{claim.decision}</td>
@@ -80,7 +86,7 @@ export default function Database({ claims, claimsLoading, claimsError, filter, s
                     </td>
                   </tr>
                 ))}
-                {claims.length === 0 && (
+                {visible.length === 0 && (
                   <tr><td colSpan={5} style={{ padding: '28px', textAlign: 'center', color: 'var(--text-muted)' }}>No claims match this filter.</td></tr>
                 )}
               </tbody>

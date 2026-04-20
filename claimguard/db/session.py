@@ -13,9 +13,8 @@ from claimguard.db.models import Base, ClaimRecord  # noqa: F401 — register ta
 
 load_environment()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./claimguard.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip() or "sqlite:///./claimguard.db"
 
-# SQLite needs check_same_thread=False for FastAPI threadpool usage
 _connect_args: dict = {}
 _engine_kwargs: dict = {"pool_pre_ping": True}
 if "sqlite" in DATABASE_URL:
