@@ -52,10 +52,10 @@ _PLACEHOLDER_PRIVATE_KEYS = frozenset({"your_private_key_here", "your_private_ke
 
 def get_sepolia_rpc_url() -> str:
     """
-    Sepolia JSON-RPC HTTP(S) URL. Prefer Alchemy (ALCHEMY_URL), then SEPOLIA_RPC_URL, then a public fallback.
+    JSON-RPC HTTP(S) URL. Prefers Ganache local, then Alchemy, then SEPOLIA_RPC_URL, then public fallback.
     """
     load_environment()
-    for key in ("ALCHEMY_URL", "SEPOLIA_RPC_URL"):
+    for key in ("GANACHE_RPC_URL", "ALCHEMY_URL", "SEPOLIA_RPC_URL"):
         v = os.getenv(key, "").strip()
         if v:
             return v
@@ -64,11 +64,11 @@ def get_sepolia_rpc_url() -> str:
 
 def get_sepolia_private_key() -> str:
     """
-    Hex private key for signing (deploy / validateClaim). SEPOLIA_PRIVATE_KEY or PRIVATE_KEY alias.
+    Hex private key for signing (deploy / validateClaim). Prefers GANACHE_PRIVATE_KEY, then SEPOLIA_PRIVATE_KEY.
     Returns empty string if unset or a known placeholder.
     """
     load_environment()
-    for key in ("SEPOLIA_PRIVATE_KEY", "PRIVATE_KEY"):
+    for key in ("GANACHE_PRIVATE_KEY", "SEPOLIA_PRIVATE_KEY", "PRIVATE_KEY"):
         v = os.getenv(key, "").strip()
         if v.lower().startswith("0x"):
             v = v[2:]

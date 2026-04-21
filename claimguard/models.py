@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 InsuranceType = Literal["CNSS", "CNOPS"]
-DecisionType = Literal["APPROVED", "REJECTED"]
+DecisionType = Literal["APPROVED", "REJECTED", "PENDING"]
 
 _MAX_B64_DECODED_BYTES = 5 * 1024 * 1024
 

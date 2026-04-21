@@ -114,9 +114,9 @@ class ConsensusSystem:
 
     @staticmethod
     def _decision_for_ts(ts: float) -> str:
-        if ts > 70:
+        if ts > 75:
             return "AUTO_APPROVE"
-        if 50 <= ts <= 70:
+        if 60 <= ts <= 75:
             return "HUMAN_REVIEW"
         return "REFLEXIVE_TRIGGER"
 
@@ -203,8 +203,12 @@ class ConsensusSystem:
             retry_logs.append(retry_log)
             logging.getLogger("claimguard.consensus").info("reflexive_retry=%s details=%s", retry_count, retry_log)
 
-        # Keep v1 public decision contract binary for compatibility.
-        final_decision = "APPROVED" if consensus_decision == "AUTO_APPROVE" else "REJECTED"
+        if consensus_decision == "AUTO_APPROVE":
+            final_decision = "APPROVED"
+        elif consensus_decision == "HUMAN_REVIEW":
+            final_decision = "PENDING"
+        else:
+            final_decision = "REJECTED"
         return {
             "decision": final_decision,
             "consensus_decision": consensus_decision,

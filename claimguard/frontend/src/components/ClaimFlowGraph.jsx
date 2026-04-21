@@ -89,13 +89,13 @@ export function ClaimFlowGraph({ claimId, agentOutputs = [] }) {
 
     const fetchFlow = async () => {
       try {
-        const token = localStorage.getItem('token');
+        const token = localStorage.getItem('cg_token');
+        const apiKey = import.meta.env.VITE_CLAIMAGUARD_API_KEY;
         const baseUrl = import.meta.env.VITE_API_BASE_URL || '/api';
-        const res = await fetch(`${baseUrl}/claim/${claimId}/flow`, {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        });
+        const headers = token
+          ? { 'Authorization': `Bearer ${token}` }
+          : apiKey ? { 'X-API-Key': apiKey } : {};
+        const res = await fetch(`${baseUrl}/claim/${claimId}/flow`, { headers });
         if (res.ok) {
           const data = await res.json();
           setFlowState(data.steps);
@@ -106,7 +106,7 @@ export function ClaimFlowGraph({ claimId, agentOutputs = [] }) {
     };
 
     fetchFlow();
-    const interval = setInterval(fetchFlow, 1000);
+    const interval = setInterval(fetchFlow, 3000);
     return () => clearInterval(interval);
   }, [claimId]);
 

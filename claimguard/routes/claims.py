@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
@@ -16,6 +18,8 @@ from claimguard.services.document_extraction import (
 from claimguard.v2.flow_tracker import get_tracker
 
 router = APIRouter()
+_log = logging.getLogger("claimguard.review")
+
 
 class ReviewBody(BaseModel):
     decision: str  # "APPROVED" or "REJECTED"
@@ -34,11 +38,53 @@ async def review_claim(
     decision = body.decision.strip().upper()
     if decision not in ("APPROVED", "REJECTED"):
         raise HTTPException(status_code=400, detail="decision must be APPROVED or REJECTED")
+
     store = get_claim_store()
-    updated = store.update_decision(claim_id, decision, reviewer_id=auth.user_id or "unknown")
-    if not updated:
+    claim = store.get(claim_id)
+    if claim is None:
         raise HTTPException(status_code=404, detail="Claim not found")
-    return {"claim_id": claim_id, "decision": decision, "status": "updated"}
+
+    tx_hash: str | None = None
+    ipfs_hash: str | None = None
+
+    # Admin approves a PENDING claim → upload IPFS then blockchain
+    if decision == "APPROVED" and claim.decision == "PENDING":
+        # 1. Upload to IPFS
+        try:
+            from claimguard.services.consensus import ConsensusSystem
+            from claimguard.services.ipfs import get_ipfs_service
+            ipfs_service = get_ipfs_service()
+            result = await ipfs_service.upload_json(
+                {"claim_id": claim_id, "decision": "APPROVED", "score": claim.score},
+                f"{claim_id}_approved.json",
+                encrypt=True,
+            )
+            ipfs_hash = result.ipfs_hash
+            _log.info("human_review_ipfs claim_id=%s hash=%s", claim_id, ipfs_hash)
+        except Exception as exc:
+            _log.warning("ipfs_on_review_failed claim_id=%s error=%s", claim_id, exc)
+
+        # 2. Blockchain
+        try:
+            from claimguard.services.blockchain import get_blockchain_service
+            svc = get_blockchain_service()
+            if svc.contract:
+                chain_result = await asyncio.to_thread(
+                    lambda: svc.validate_claim_on_chain(
+                        claim_id=claim_id,
+                        score=float(claim.score),
+                        decision="APPROVED",
+                        ipfs_hashes=[ipfs_hash] if ipfs_hash else [],
+                        patient_id="",
+                    )
+                )
+                tx_hash = chain_result.get("tx_hash")
+                _log.info("human_review_blockchain claim_id=%s tx=%s", claim_id, tx_hash)
+        except Exception as exc:
+            _log.warning("blockchain_on_review_failed claim_id=%s error=%s", claim_id, exc)
+
+    store.update_decision(claim_id, decision, reviewer_id=auth.user_id or "unknown")
+    return {"claim_id": claim_id, "decision": decision, "status": "updated", "tx_hash": tx_hash, "ipfs_hash": ipfs_hash}
 
 
 @router.get("/claim/{claim_id}/flow", dependencies=[Depends(verify_request_auth)])
@@ -155,8 +201,10 @@ async def list_claims(
         decision = "REJECTED"
     elif filter_normalized == "valid":
         decision = "APPROVED"
+    elif filter_normalized in ("pending", "human_review"):
+        decision = "PENDING"
     else:
-        raise HTTPException(status_code=400, detail="filter must be one of: all, fraud, valid")
+        raise HTTPException(status_code=400, detail="filter must be one of: all, fraud, valid, pending")
     offset = (page - 1) * page_size
     items, total = consensus_system.list_claims(decision, offset=offset, limit=page_size)
     return ClaimListResponse(items=items, total=total, page=page, page_size=page_size)

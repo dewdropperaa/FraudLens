@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Icons } from '../components'
 
-const FILTERS = ['all', 'pending', 'approved', 'rejected']
+const FILTERS = ['pending', 'all', 'approved', 'rejected']
 
 function StatusBadge({ decision }) {
   const color = decision === 'APPROVED' ? 'var(--success)' : decision === 'REJECTED' ? 'var(--danger)' : 'var(--text-muted)'
@@ -27,7 +27,8 @@ function ScoreBar({ score }) {
 }
 
 export default function AdminReview({ claims, claimsLoading, claimsError, fetchClaims, shortHex, safeText }) {
-  const [filter, setFilter]     = useState('all')
+  const [filter, setFilter]     = useState('pending')
+  const [pdfUrl, setPdfUrl]     = useState(null)
   const [selected, setSelected] = useState(null)
   const [actioning, setActioning] = useState(false)
   const [actionError, setActionError] = useState('')
@@ -37,6 +38,8 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
     ? claims.filter(c => c.decision === 'APPROVED')
     : filter === 'rejected'
     ? claims.filter(c => c.decision === 'REJECTED')
+    : filter === 'pending'
+    ? claims.filter(c => c.decision === 'PENDING')
     : claims
 
   async function submitReview(claimId, decision) {
@@ -107,7 +110,7 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
               {visible.map(claim => (
                 <div
                   key={claim.claim_id}
-                  onClick={() => { setSelected(claim); setActionError(''); setActionSuccess('') }}
+                  onClick={() => { setSelected(claim); setActionError(''); setActionSuccess(''); setPdfUrl(null) }}
                   style={{
                     padding: '12px 16px',
                     borderBottom: '1px solid var(--border)',
@@ -173,6 +176,50 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
               {actionError   && <div className="cg-alert error"   style={{ marginTop: '10px' }}><Icons.AlertTriangle />{actionError}</div>}
             </div>
 
+            {/* Documents + PDF Viewer */}
+            {(selected.ipfs_hash || selected.ipfs_hashes?.length > 0 || selected.documents?.length > 0) && (
+              <div className="cg-card">
+                <div className="cg-card-header">
+                  <div className="cg-card-title"><div className="cg-card-title-icon"><Icons.FileText /></div>Documents</div>
+                  {selected.ipfs_hashes?.length > 0 || selected.ipfs_hash ? (
+                    <button
+                      className="cg-btn cg-btn-ghost cg-btn-sm"
+                      onClick={() => setPdfUrl(v => v ? null : `https://gateway.pinata.cloud/ipfs/${(selected.ipfs_hashes?.[0] || selected.ipfs_hash)}`)}
+                    >
+                      {pdfUrl ? 'Masquer' : 'Voir PDF'}
+                    </button>
+                  ) : null}
+                </div>
+                <div style={{ padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {(selected.ipfs_hashes?.length > 0 ? selected.ipfs_hashes : selected.ipfs_hash ? [selected.ipfs_hash] : []).map((hash, i) => (
+                    <a
+                      key={i}
+                      href={`https://gateway.pinata.cloud/ipfs/${hash}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 12px', background: 'var(--bg-elevated)', borderRadius: '6px', textDecoration: 'none', color: 'var(--accent)', fontSize: '12px', fontFamily: 'monospace' }}
+                    >
+                      <Icons.ExternalLink style={{ width: 13, height: 13, flexShrink: 0 }} />
+                      IPFS: {hash.slice(0, 12)}...{hash.slice(-8)}
+                    </a>
+                  ))}
+                  {selected.documents?.map((doc, i) => (
+                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 12px', background: 'var(--bg-elevated)', borderRadius: '6px', fontSize: '12px', color: 'var(--text-secondary)' }}>
+                      <Icons.File style={{ width: 13, height: 13, flexShrink: 0 }} />
+                      {doc}
+                    </div>
+                  ))}
+                  {pdfUrl && (
+                    <iframe
+                      src={pdfUrl}
+                      title="Document"
+                      style={{ width: '100%', height: '500px', border: '1px solid var(--border)', borderRadius: '6px', marginTop: '8px' }}
+                    />
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* Score + trust breakdown */}
             <div className="cg-card">
               <div className="cg-card-header">
@@ -213,9 +260,6 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
                         <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-primary)' }}>{ag.agent_name}</span>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                          <span style={{ fontSize: '11px', color: ag.decision ? 'var(--danger)' : 'var(--success)', fontWeight: 600 }}>
-                            {ag.decision ? 'FRAUD' : 'LEGIT'}
-                          </span>
                           <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)' }}>
                             {typeof ag.score === 'number' ? ag.score.toFixed(1) : ag.score}
                           </span>

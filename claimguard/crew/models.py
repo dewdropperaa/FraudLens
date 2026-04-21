@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-DecisionLabel = Literal["APPROVED", "REJECTED"]
+DecisionLabel = Literal["APPROVED", "REJECTED", "PENDING"]
 
 
 class AgentDecisionOutput(BaseModel):
