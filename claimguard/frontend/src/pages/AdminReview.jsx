@@ -1,14 +1,14 @@
 import { useState } from 'react'
 import { Icons } from '../components'
 
-const FILTERS = ['pending', 'all', 'approved', 'rejected']
+const FILTERS = ['human_review', 'all', 'approved', 'rejected']
 
 function StatusBadge({ decision }) {
   const color = decision === 'APPROVED' ? 'var(--success)' : decision === 'REJECTED' ? 'var(--danger)' : 'var(--text-muted)'
   const bg    = decision === 'APPROVED' ? 'var(--success-bg)' : decision === 'REJECTED' ? 'var(--danger-bg)' : 'var(--bg-elevated)'
   return (
     <span style={{ background: bg, color, border: `1px solid ${color}`, borderRadius: '5px', padding: '2px 8px', fontSize: '11px', fontWeight: 700, letterSpacing: '0.04em' }}>
-      {decision ?? 'PENDING'}
+      {decision ?? 'HUMAN_REVIEW'}
     </span>
   )
 }
@@ -27,7 +27,7 @@ function ScoreBar({ score }) {
 }
 
 export default function AdminReview({ claims, claimsLoading, claimsError, fetchClaims, shortHex, safeText }) {
-  const [filter, setFilter]     = useState('pending')
+  const [filter, setFilter]     = useState('human_review')
   const [pdfUrl, setPdfUrl]     = useState(null)
   const [selected, setSelected] = useState(null)
   const [actioning, setActioning] = useState(false)
@@ -38,8 +38,8 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
     ? claims.filter(c => c.decision === 'APPROVED')
     : filter === 'rejected'
     ? claims.filter(c => c.decision === 'REJECTED')
-    : filter === 'pending'
-    ? claims.filter(c => c.decision === 'PENDING')
+    : filter === 'human_review'
+    ? claims.filter(c => c.decision === 'HUMAN_REVIEW')
     : claims
 
   async function submitReview(claimId, decision) {
@@ -85,8 +85,8 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
         <div className="cg-filter-group" style={{ flexWrap: 'wrap' }}>
           {FILTERS.map(f => (
             <button key={f} type="button" onClick={() => setFilter(f)}
-              className={`cg-filter-pill${filter === f ? ` active-${f === 'pending' ? 'all' : f}` : ''}`}>
-              {f.charAt(0).toUpperCase() + f.slice(1)}
+              className={`cg-filter-pill${filter === f ? ` active-${f === 'human_review' ? 'all' : f}` : ''}`}>
+              {f === 'human_review' ? 'Human Review' : (f.charAt(0).toUpperCase() + f.slice(1))}
             </button>
           ))}
         </div>

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
+from claimguard.v2.schemas import AgentOutput
+
 LOGGER = logging.getLogger("claimguard.v2.consensus")
 
 AGENT_WEIGHTS: Dict[str, float] = {
@@ -29,6 +31,61 @@ class Contradiction:
             "H_penalty": round(self.penalty, 4),
             "reason": self.reason,
         }
+
+
+@dataclass(frozen=True)
+class ConsensusConfig:
+    hallucination_confidence_floor: float = 0.7
+    max_contradiction_threshold: float = 0.3
+    auto_approve_threshold: float = 90.0
+    degraded_memory_penalty: float = 0.15
+    unavailable_memory_penalty: float = 0.25
+
+
+def should_force_human_review(
+    agent_outputs: List[AgentOutput],
+    blackboard: Dict[str, Any],
+    config: ConsensusConfig,
+) -> tuple[bool, str]:
+    hallucination_agents: List[str] = []
+    low_confidence_ungrounded_agents: List[str] = []
+    for output in agent_outputs:
+        hallucination_detected = bool(output.hallucination_flags)
+        if hallucination_detected:
+            hallucination_agents.append(output.agent)
+
+        evidence_grounded = any(bool(claim.verified) for claim in output.claims)
+        if output.confidence < config.hallucination_confidence_floor and not evidence_grounded:
+            low_confidence_ungrounded_agents.append(output.agent)
+
+    contradiction_penalty = 0.0
+    contradictions = blackboard.get("contradictions", [])
+    if isinstance(contradictions, list):
+        for row in contradictions:
+            if isinstance(row, dict):
+                contradiction_penalty += float(row.get("H_penalty", 0.0))
+
+    if len(hallucination_agents) >= 2:
+        return True, (
+            "Hallucination guard: multiple agents produced hallucination flags "
+            f"({', '.join(sorted(hallucination_agents))})."
+        )
+    if low_confidence_ungrounded_agents:
+        return True, (
+            "Hallucination guard: low-confidence ungrounded output from "
+            f"{', '.join(sorted(low_confidence_ungrounded_agents))}."
+        )
+    if contradiction_penalty > config.max_contradiction_threshold:
+        return True, (
+            "Hallucination guard: contradiction penalty exceeded threshold "
+            f"({contradiction_penalty:.3f}>{config.max_contradiction_threshold:.3f})."
+        )
+    return False, (
+        "Hallucination guard: no force condition met "
+        f"(hallucination_agents={len(hallucination_agents)}, "
+        f"low_confidence_ungrounded={len(low_confidence_ungrounded_agents)}, "
+        f"contradiction_penalty={contradiction_penalty:.3f})."
+    )
 
 
 class ConsensusEngine:
@@ -121,7 +178,7 @@ class ConsensusEngine:
     @staticmethod
     def _decision_for_ts(ts: float) -> str:
         if ts > 90:
-            return "AUTO_APPROVE"
+            return "APPROVED"
         if 60 <= ts <= 90:
             return "HUMAN_REVIEW"
         return "REFLEXIVE_TRIGGER"
@@ -206,8 +263,26 @@ class ConsensusEngine:
         *,
         claim_request: Dict[str, Any],
         entries: Dict[str, Dict[str, Any]],
+        blackboard: Dict[str, Any] | None = None,
+        config: ConsensusConfig | None = None,
     ) -> Dict[str, Any]:
+        config = config or ConsensusConfig()
         current_entries = {k: dict(v) for k, v in entries.items()}
+        board = dict(blackboard or {})
+        memory_degraded = bool(board.get("memory_degraded"))
+        memory_status = str(board.get("memory_status", "")).upper()
+        if memory_degraded and memory_status in {"DEGRADED", "DISABLED"}:
+            penalty = (
+                config.unavailable_memory_penalty
+                if memory_status == "DISABLED"
+                else config.degraded_memory_penalty
+            )
+            for agent_name in ("PatternAgent", "GraphRiskAgent"):
+                if agent_name in current_entries:
+                    current_entries[agent_name]["confidence"] = round(
+                        max(0.0, float(current_entries[agent_name].get("confidence", 0.0)) - penalty),
+                        4,
+                    )
         score_evolution: List[float] = []
         retry_logs: List[Dict[str, Any]] = []
         retry_count = 0

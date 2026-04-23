@@ -2,6 +2,8 @@ class ClaimFlowTracker:
     def __init__(self, claim_id: str):
         self.claim_id = claim_id
         self.steps = {
+            "OCR Extraction": {"status": "PENDING", "score": None, "confidence": None, "explanation": "", "is_fraud": False},
+            "ClaimValidation": {"status": "PENDING", "score": None, "confidence": None, "explanation": "", "is_fraud": False},
             "IdentityAgent": {"status": "PENDING", "score": None, "confidence": None, "explanation": "", "is_fraud": False},
             "DocumentAgent": {"status": "PENDING", "score": None, "confidence": None, "explanation": "", "is_fraud": False},
             "PolicyAgent": {"status": "PENDING", "score": None, "confidence": None, "explanation": "", "is_fraud": False},

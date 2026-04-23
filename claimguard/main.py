@@ -20,9 +20,11 @@ from claimguard.config import (
 )
 
 from claimguard.firebase_config import is_test_environment
+from claimguard.integrity import verify_single_source_execution
 from claimguard.rate_limiting import limiter
 from claimguard.middleware_body import MaxBodySizeMiddleware
 from claimguard.routes import auth_router, claims_router, v2_router
+from claimguard.v2 import get_v2_orchestrator
 
 load_environment()
 
@@ -36,6 +38,7 @@ _FAVICON_PNG = base64.b64decode(
 async def lifespan(app: FastAPI):
     load_environment()
     validate_required_settings()
+    verify_single_source_execution("claimguard")
     # Fail fast at startup if Ollama is unavailable for ClaimGuard v2.
     from claimguard.v2 import get_v2_orchestrator
 
@@ -144,12 +147,19 @@ async def root():
         ),
         "interactive_docs": "http://127.0.0.1:8000/docs",
         "endpoints": {
-            "POST /claim": "Submit JSON claim (optional documents_base64[] for inline files)",
-            "POST /claim/upload": "Multipart claim with file parts (extracts PDF/text/OCR)",
+            "POST /v2/claim/analyze": "Submit claim to the only production pipeline (ClaimGuard v2)",
+            "POST /claim": "Legacy route disabled",
+            "POST /claim/upload": "Legacy route disabled",
             "GET /claim/{id}": "Retrieve claim results by ID",
-            "GET /claims": "List claims with pagination (filter=all|fraud|valid)",
+            "GET /claims": "List claims with pagination (filter=all|fraud|valid|pending)",
         },
     }
+
+
+@app.get("/health/memory")
+async def memory_health() -> dict:
+    orchestrator = get_v2_orchestrator()
+    return orchestrator.get_memory_health_report().to_dict()
 
 
 if __name__ == "__main__":

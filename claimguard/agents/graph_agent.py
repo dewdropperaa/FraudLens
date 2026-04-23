@@ -3,13 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 
-from .base_agent import BaseAgent
-from .memory_utils import process_memory_context
+from claimguard.agents.base_agent import BaseAgent
+from claimguard.agents.llm_consistency import run_agent_consistency_check
+from claimguard.agents.memory_utils import process_memory_context
 from claimguard.services.graph_fraud import get_graph_detector
 
 GRAPH_SYSTEM_PROMPT = """You are a network fraud analyst.
 
 You interpret graph risk as probabilistic, not absolute.
+You MUST base your reasoning on the provided OCR text and verified fields. You MUST produce DIFFERENT outputs for different inputs. Generic responses are forbidden.
 
 You look for:
 - indirect connections
@@ -52,6 +54,7 @@ class GraphAgent(BaseAgent):
             }
 
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
+        memory_status = str(claim_data.get("memory_status", "OK") or "OK").upper()
         raw_amt = claim_data.get("amount", claim_data.get("claim_amount", 0.0))
         amount_parse_ok = True
         try:
@@ -119,12 +122,29 @@ class GraphAgent(BaseAgent):
             score = max(0.0, min(100.0, memory_adjusted_score))
             decision = score > 60 and fraud_probability < 0.5
         details["memory_insights"] = memory_insights
+        if memory_status != "OK":
+            score = max(0.0, min(100.0, score - 12.0))
+            decision = score > 60 and fraud_probability < 0.5
+            reasoning = (
+                f"{reasoning}; Memory status is {memory_status}; "
+                "reduced confidence in graph/pattern correlation."
+            )
+        details["memory_status"] = memory_status
+        confidence = max(0.2, min(0.95, score / 100.0))
 
+        llm_explanation, llm_meta = run_agent_consistency_check(
+            agent_name=self.name,
+            claim_data=claim_data,
+            draft_reasoning=reasoning,
+        )
+        details["llm_consistency"] = llm_meta
         return {
             "agent_name": self.name,
             "decision": decision,
             "score": score,
-            "reasoning": reasoning,
+            "confidence": round(confidence, 2),
+            "reasoning": llm_explanation,
+            "explanation": llm_explanation,
             "details": details,
             "memory_insights": memory_insights,
         }

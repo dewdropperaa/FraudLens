@@ -1,9 +1,4 @@
-"""
-Fraud detection crews: six independent single-task crews executed in parallel.
 
-CrewAI 1.x removed ``Process.parallel``; independent mini-crews preserve parallel
-execution without sequential blocking between specialists.
-"""
 from __future__ import annotations
 
 from crewai import Crew, Process

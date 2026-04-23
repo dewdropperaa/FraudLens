@@ -6,6 +6,10 @@ import Dashboard   from './pages/Dashboard'
 import SubmitClaim  from './pages/SubmitClaim'
 import Database    from './pages/Database'
 import AdminReview from './pages/AdminReview'
+import InvestigatorDashboard from './pages/InvestigatorDashboard'
+import InvestigatorAnalytics from './pages/InvestigatorAnalytics'
+import InvestigationClaimPage from './pages/InvestigationClaimPage'
+import ProofModePage from './pages/ProofModePage'
 import Login      from './pages/Login'
 import { useAuth } from './context/AuthContext'
 
@@ -87,6 +91,21 @@ export default function App() {
     }
   }, [token])
 
+  useEffect(() => {
+    const interceptorId = api.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        if (error?.response?.status === 401) {
+          logout()
+        }
+        return Promise.reject(error)
+      },
+    )
+    return () => {
+      api.interceptors.response.eject(interceptorId)
+    }
+  }, [logout])
+
   /* Form */
   const [form,           setForm]          = useState({ patient_id: '', provider_id: '', amount: '', insurance: 'CNSS' })
   const [selectedFiles,  setSelectedFiles] = useState([])
@@ -107,7 +126,20 @@ export default function App() {
   const [chartLoading, setChartLoading] = useState(false)
 
   /* Page routing */
-  const [activePage, setActivePage] = useState('dashboard')
+  const initialPath = typeof window !== 'undefined' ? window.location.pathname : '/'
+  const investigationMatch = initialPath.match(/^\/investigation\/([^/]+)$/)
+  const proofMatch = initialPath.match(/^\/proof\/([^/]+)$/)
+  const [activePage, setActivePage] = useState(
+    initialPath === '/investigator-analytics'
+      ? 'investigator-analytics'
+      : proofMatch
+        ? 'proof-mode'
+      : investigationMatch
+        ? 'investigation-claim'
+        : 'dashboard',
+  )
+  const [investigationClaimId, setInvestigationClaimId] = useState(investigationMatch?.[1] || null)
+  const [proofClaimId, setProofClaimId] = useState(proofMatch?.[1] || null)
 
   /* ── Stats ─────────────────────────────────────────────────── */
   const stats = useMemo(() => {
@@ -121,6 +153,12 @@ export default function App() {
 
   /* ── Fetch claims ───────────────────────────────────────────── */
   const fetchClaims = useCallback(async () => {
+    if (!token) {
+      setClaims([])
+      setClaimsLoading(false)
+      setClaimsError('')
+      return
+    }
     setClaimsLoading(true); setClaimsError('')
     try {
       const res = await api.get('/claims', { params: { filter: 'all', page_size: 100 } })
@@ -128,11 +166,16 @@ export default function App() {
     } catch (err) {
       setClaimsError(formatApiError(err) || 'Failed to fetch claims.')
     } finally { setClaimsLoading(false) }
-  }, [])
+  }, [token])
 
   useEffect(() => { fetchClaims() }, [fetchClaims])
 
   useEffect(() => {
+    if (!token) {
+      setDailyClaims([])
+      setChartLoading(false)
+      return
+    }
     let cancelled = false
     async function loadChart() {
       setChartLoading(true)
@@ -142,7 +185,7 @@ export default function App() {
     }
     loadChart()
     return () => { cancelled = true }
-  }, [chartTick])
+  }, [chartTick, token])
 
   /* ── Handlers ───────────────────────────────────────────────── */
   function handleInputChange(e) { const { name, value } = e.target; setForm(p => ({ ...p, [name]: value })) }
@@ -153,15 +196,46 @@ export default function App() {
     const claimId = `claim-${Date.now()}`
     setCurrentClaimId(claimId)
     try {
-      const fd = new FormData()
-      fd.append('patient_id', form.patient_id.trim()); fd.append('provider_id', form.provider_id.trim())
-      fd.append('amount', String(Number(form.amount))); fd.append('insurance', form.insurance)
-      fd.append('claim_id', claimId)
-      fd.append('history_json', JSON.stringify([]))
-      for (const file of selectedFiles) fd.append('files', file)
-      const res = await api.post('/claim/upload', fd)
+      const documentsBase64 = await Promise.all(
+        selectedFiles.map((file) => new Promise((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = () => {
+            const result = String(reader.result || '')
+            const base64 = result.includes(',') ? result.split(',')[1] : result
+            resolve({ name: file.name, content_base64: base64 })
+          }
+          reader.onerror = () => reject(reader.error || new Error('Failed to read file'))
+          reader.readAsDataURL(file)
+        })),
+      )
+      const res = await api.post('/v2/claim/analyze', {
+        identity: {
+          cin: form.patient_id.trim(),
+        },
+        policy: {
+          insurance: form.insurance,
+        },
+        metadata: {
+          claim_id: claimId,
+          provider: form.provider_id.trim(),
+          amount: Number(form.amount),
+        },
+        documents: selectedFiles.map((file) => ({ id: file.name, document_type: file.type || 'uploaded_file' })),
+        documents_base64: documentsBase64,
+      })
       const body = res.data
+      console.log('🚀 USING V2 PIPELINE')
+      console.log('BACKEND RESPONSE:', body)
+      console.log('FINAL DECISION FROM BACKEND:', body?.decision)
       setLastResult(body?.data != null ? body.data : body)
+      const normalizedResult = body?.data != null ? body.data : body
+      if (normalizedResult?.decision === 'HUMAN_REVIEW' && normalizedResult?.claim_id) {
+        setInvestigationClaimId(normalizedResult.claim_id)
+        setActivePage('investigation-claim')
+        if (typeof window !== 'undefined') {
+          window.history.replaceState({}, '', `/investigation/${normalizedResult.claim_id}`)
+        }
+      }
       await fetchClaims(filter); setChartTick(t => t + 1)
     } catch (err) { setSubmitError(formatApiError(err) || 'Claim submission failed.')
     } finally { setIsSubmitting(false) }
@@ -177,8 +251,87 @@ export default function App() {
   }
 
   /* ── Render page ────────────────────────────────────────────── */
+  const isAdminDemoUser = (user?.email || '').toLowerCase() === 'admin@gmail.com'
+  const canInvestigate = user?.role === 'investigator' || user?.role === 'admin' || isAdminDemoUser
+  const canSeeAnalytics = user?.role === 'admin'
+
+  function setPageAndPath(nextPage) {
+    setActivePage(nextPage)
+    if (nextPage !== 'investigation-claim') {
+      setInvestigationClaimId(null)
+    }
+    if (nextPage !== 'proof-mode') {
+      setProofClaimId(null)
+    }
+    const path = nextPage === 'investigator-analytics'
+      ? '/investigator-analytics'
+      : nextPage === 'proof-mode' && proofClaimId
+        ? `/proof/${proofClaimId}`
+        : '/'
+    if (typeof window !== 'undefined' && window.location.pathname !== path) {
+      window.history.replaceState({}, '', path)
+    }
+  }
+
   function renderPage() {
     switch (activePage) {
+      case 'investigator':
+        return canInvestigate
+          ? <InvestigatorDashboard claims={claims} claimsLoading={claimsLoading} fetchClaims={fetchClaims} user={user} />
+          : (
+            <div className="cg-card">
+              <div className="cg-card-title">Restricted Access</div>
+              <div className="cg-page-sub" style={{ marginTop: 8 }}>
+                Investigator dashboard is available only for investigator/admin roles.
+              </div>
+            </div>
+          )
+      case 'investigator-analytics':
+        return canSeeAnalytics
+          ? <InvestigatorAnalytics user={user} />
+          : (
+            <div className="cg-card">
+              <div className="cg-card-title">Restricted Access</div>
+              <div className="cg-page-sub" style={{ marginTop: 8 }}>
+                Investigator analytics are available only for admin role.
+              </div>
+            </div>
+          )
+      case 'investigation-claim':
+        return canInvestigate && investigationClaimId
+          ? (
+            <InvestigationClaimPage
+              claimId={investigationClaimId}
+              user={user}
+              token={token}
+              onBackToDashboard={() => setPageAndPath('investigator')}
+            />
+          )
+          : (
+            <div className="cg-card">
+              <div className="cg-card-title">No investigation selected</div>
+              <div className="cg-page-sub" style={{ marginTop: 8 }}>
+                Submit a claim or pick one from investigator dashboard.
+              </div>
+            </div>
+          )
+      case 'proof-mode':
+        return proofClaimId
+          ? (
+            <ProofModePage
+              claimId={proofClaimId}
+              token={token}
+              onBack={() => setPageAndPath('investigator')}
+            />
+          )
+          : (
+            <div className="cg-card">
+              <div className="cg-card-title">No proof trace selected</div>
+              <div className="cg-page-sub" style={{ marginTop: 8 }}>
+                Open a proof URL like /proof/&lt;claim_id&gt; or launch from claim actions.
+              </div>
+            </div>
+          )
       case 'dashboard': return <Dashboard  {...shared} stats={stats} dailyClaims={dailyClaims} chartLoading={chartLoading} />
       case 'submit':    return <SubmitClaim {...submitProps} />
       case 'admin':     return <AdminReview {...shared} />
@@ -204,13 +357,19 @@ export default function App() {
         <div className="cg-nav-links">
           {[
             { id: 'dashboard', label: 'Home',      Icon: Icons.Home     },
+            { id: 'investigator', label: 'Investigation', Icon: Icons.AlertTriangle },
             { id: 'submit',    label: 'New Claim',  Icon: Icons.FileText },
             { id: 'database',  label: 'All Claims', Icon: Icons.Database },
           ].map(({ id, label, Icon }) => (
-            <button key={id} className={`cg-nav-link${activePage === id ? ' active' : ''}`} onClick={() => setActivePage(id)}>
+            <button key={id} className={`cg-nav-link${activePage === id ? ' active' : ''}`} onClick={() => setPageAndPath(id)}>
               <Icon />{label}
             </button>
           ))}
+          {canSeeAnalytics && (
+            <button className={`cg-nav-link${activePage === 'investigator-analytics' ? ' active' : ''}`} onClick={() => setPageAndPath('investigator-analytics')}>
+              <Icons.BarChart2 />Analytics
+            </button>
+          )}
         </div>
 
         <div className="cg-nav-actions">
@@ -241,17 +400,21 @@ export default function App() {
       {/* ── Sidebar ────────────────────────────────────────────── */}
       <aside className="cg-sidebar">
         <div className="cg-sidebar-label">Overview</div>
-        <SidebarItem icon={Icons.Home}       label="Dashboard"  active={activePage === 'dashboard'} onClick={() => setActivePage('dashboard')} />
-        <SidebarItem icon={Icons.PlusCircle} label="New Claim"  active={activePage === 'submit'}    onClick={() => setActivePage('submit')} />
+        <SidebarItem icon={Icons.Home}       label="Dashboard"  active={activePage === 'dashboard'} onClick={() => setPageAndPath('dashboard')} />
+        <SidebarItem icon={Icons.AlertTriangle} label="Investigator" active={activePage === 'investigator'} onClick={() => setPageAndPath('investigator')} />
+        <SidebarItem icon={Icons.PlusCircle} label="New Claim"  active={activePage === 'submit'}    onClick={() => setPageAndPath('submit')} />
+        {canSeeAnalytics && (
+          <SidebarItem icon={Icons.BarChart2} label="Analytics" active={activePage === 'investigator-analytics'} onClick={() => setPageAndPath('investigator-analytics')} />
+        )}
 
         <div className="cg-sidebar-label">Management</div>
-        <SidebarItem icon={Icons.Database} label="Admin View" active={activePage === 'admin'} onClick={() => setActivePage('admin')} />
+        <SidebarItem icon={Icons.Database} label="Admin View" active={activePage === 'admin'} onClick={() => setPageAndPath('admin')} />
         <SidebarItem
           icon={Icons.Inbox}
           label="All Claims"
           badge={stats.total > 0 ? stats.total : undefined}
           active={activePage === 'claims' || activePage === 'database'}
-          onClick={() => setActivePage('database')}
+          onClick={() => setPageAndPath('database')}
         />
       </aside>
 

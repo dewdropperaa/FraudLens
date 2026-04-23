@@ -13,9 +13,10 @@ import re
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
-from .base_agent import BaseAgent
-from .memory_utils import process_memory_context
-from .security_utils import (
+from claimguard.agents.base_agent import BaseAgent
+from claimguard.agents.llm_consistency import run_agent_consistency_check
+from claimguard.agents.memory_utils import process_memory_context
+from claimguard.agents.security_utils import (
     bump_risk,
     coerce_risk_output,
     detect_prompt_injection,
@@ -29,9 +30,10 @@ IDENTITY_SYSTEM_PROMPT = """You are an identity verification specialist operatin
 
 You NEVER claim a CIN is "officially valid" or "verified with authority".
 You NEVER assume identity is valid just because it matches format.
+You MUST base your reasoning on the provided OCR text and verified fields. You MUST produce DIFFERENT outputs for different inputs. Generic responses are forbidden.
 
 You assess:
-- structural validity of Moroccan CIN
+- structural validity of Moroccan CIN and IPP
 - contextual consistency across documents and OCR
 - fraud likelihood based on patterns and contradictions
 
@@ -47,6 +49,7 @@ MEMORY AWARENESS:
 
 _CIN_PATTERN = re.compile(r"^[A-Z]{1,2}[0-9]{5,6}$")
 _CIN_EXTRACT_PATTERN = re.compile(r"\b([A-Z]{1,2}[0-9]{5,6})\b")
+_IPP_PATTERN = re.compile(r"^\d{6,10}$")
 
 _SUSPICIOUS_LETTER_COMBOS = frozenset({
     "QQ", "ZZ", "XX", "YY", "WW", "KK",
@@ -318,8 +321,19 @@ class IdentityAgent(BaseAgent):
                 return str(val).strip()
         return ""
 
+    @staticmethod
+    def _resolve_ipp(claim_data: Dict[str, Any]) -> str:
+        identity = claim_data.get("identity")
+        if isinstance(identity, dict):
+            for key in ("ipp", "IPP"):
+                val = identity.get(key)
+                if val and str(val).strip():
+                    return str(val).strip()
+        return ""
+
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
         cin_raw = self._resolve_cin(claim_data)
+        ipp_raw = self._resolve_ipp(claim_data)
         history = claim_data.get("history", [])
         if not isinstance(history, list):
             history = []
@@ -370,6 +384,7 @@ class IdentityAgent(BaseAgent):
                 )
 
         details["cin_input"] = cin_raw or None
+        details["ipp_input"] = ipp_raw or None
         details["format_valid"] = format_valid
 
         # ── 2. Semantic realism check ──────────────────────────────────
@@ -441,6 +456,10 @@ class IdentityAgent(BaseAgent):
 
         details["ocr_checked"] = ocr_checked
         details["ocr_match"] = ocr_match
+        ipp_found = False
+        if ipp_raw and _IPP_PATTERN.fullmatch(ipp_raw):
+            ipp_found = ipp_raw in re.sub(r"[^0-9]", "", sanitized_corpus)
+        details["evidence"] = {"cin_found": bool(ocr_match), "ipp_found": bool(ipp_found)}
 
         # ── 4. Identity consistency ────────────────────────────────────
         reasoning_steps.append("Step 4: Check identity field consistency (name, DOB)")
@@ -606,6 +625,8 @@ class IdentityAgent(BaseAgent):
             confidence = min(confidence, 84)
 
         confidence = _clamp(confidence)
+        if (cin_raw or ipp_raw) and not (ocr_match or ipp_found):
+            score = min(score, 20)
 
         # ── 8. Build explanation ───────────────────────────────────────
         reasoning_steps.append("Step 7: Build final assessment")
@@ -742,20 +763,27 @@ class IdentityAgent(BaseAgent):
             decision = score > 60
         details["memory_insights"] = memory_insights
 
+        llm_explanation, llm_meta = run_agent_consistency_check(
+            agent_name=self.name,
+            claim_data=claim_data,
+            draft_reasoning=explanation,
+        )
+        details["llm_consistency"] = llm_meta
         return {
             "agent_name": self.name,
             "decision": decision,
             "score": round(score, 2),
-            "reasoning": "; ".join(reasoning_steps),
+            "reasoning": llm_explanation,
             "details": details,
             "cin_analysis": cin_analysis,
+            "evidence": {"cin_found": bool(ocr_match), "ipp_found": bool(ipp_found)},
             "observations": observations,
             "missing_data": missing_data,
             "contradictions": contradictions,
             "fraud_signals": fraud_signals,
             "reasoning_steps": reasoning_steps,
             "confidence": confidence,
-            "explanation": explanation,
+            "explanation": llm_explanation,
             "risk_score": final_risk,
             "flags": validated.flags,
             "memory_insights": memory_insights,

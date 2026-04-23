@@ -265,7 +265,7 @@ class ClaimGuardRedTeamEngine:
         hospital = f"HSP-{self._rng.randint(100, 999)}"
         doctor = f"DOC-{self._rng.randint(100, 999)}"
         document_text = "Medical report confirms diagnosis and billing."
-        expected_decision = "AUTO_APPROVE"
+        expected_decision = "APPROVED"
         expected_fraud = False
         identity_invalid = False
         obvious_fraud = False
@@ -273,7 +273,7 @@ class ClaimGuardRedTeamEngine:
         has_minimal_data = False
 
         if scenario == "clean":
-            expected_decision = "AUTO_APPROVE"
+            expected_decision = "APPROVED"
         elif scenario == "suspicious":
             expected_decision = "HUMAN_REVIEW"
             expected_fraud = True
@@ -548,7 +548,7 @@ class ClaimGuardRedTeamEngine:
         if claim.get("metadata", {}).get("identity_invalid") and decision != "REJECTED":
             failures.append("identity_invalid_pipeline_continued")
 
-        if claim.get("metadata", {}).get("obvious_fraud") and decision == "AUTO_APPROVE":
+        if claim.get("metadata", {}).get("obvious_fraud") and decision == "APPROVED":
             failures.append("obvious_fraud_not_detected")
 
         if retry_count > 1:

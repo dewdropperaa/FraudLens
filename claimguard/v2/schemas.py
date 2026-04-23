@@ -7,11 +7,33 @@ from pydantic import BaseModel, Field
 
 ComplexityLabel = Literal["simple", "complex", "high_risk"]
 ModelRoute = Literal["mistral", "llama3", "deepseek-r1"]
+ValidationStatus = Literal["VALID", "INVALID"]
+DecisionEnum = Literal["APPROVED", "HUMAN_REVIEW", "REJECTED"]
+DECISION_ENUM_VALUES: tuple[DecisionEnum, ...] = ("APPROVED", "HUMAN_REVIEW", "REJECTED")
+DocumentType = Literal[
+    "medical_invoice",
+    "medical_prescription",
+    "lab_report",
+    "medical_certificate",
+    "insurance_attestation",
+    "pharmacy_invoice",
+    "hospital_bill",
+    "irrelevant_document",
+    "unknown"
+]
 
 
 class ClaimRequestV2(BaseModel):
-    identity: Dict[str, Any] = Field(default_factory=dict)
+    class IdentityPayload(BaseModel):
+        cin: str | None = None
+        ipp: str | None = None
+
+    identity: IdentityPayload = Field(default_factory=IdentityPayload)
     documents: List[Dict[str, Any]] = Field(default_factory=list)
+    documents_base64: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Optional inline files with keys {name, content_base64}; server extracts text/OCR.",
+    )
     policy: Dict[str, Any] = Field(default_factory=dict)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -41,14 +63,52 @@ class MemoryInsights(BaseModel):
 
 
 class AgentOutput(BaseModel):
+    class ClaimEvidence(BaseModel):
+        statement: str
+        evidence: str
+        verified: bool
+
+    class HallucinationDebug(BaseModel):
+        claims_checked: int = Field(ge=0, default=0)
+        verified_claims: int = Field(ge=0, default=0)
+        hallucination_flags: List[str] = Field(default_factory=list)
+        confidence_adjusted: float = Field(ge=0, le=1, default=0.0)
+
     agent: str
     score: float = Field(ge=0, le=1)
     confidence: float = Field(ge=0, le=1)
+    claims: List[ClaimEvidence] = Field(default_factory=list)
+    hallucination_flags: List[str] = Field(default_factory=list)
     explanation: str
+    hallucination_penalty: float = Field(ge=0, le=1, default=0.0)
+    debug_log: HallucinationDebug | None = None
     elapsed_ms: int = Field(ge=0)
     input_snapshot: Dict[str, Any] = Field(default_factory=dict)
     output_snapshot: Dict[str, Any] = Field(default_factory=dict)
     memory_insights: Optional[MemoryInsights] = None
+
+
+class ValidationResult(BaseModel):
+    """Result of claim validation performed by ClaimValidationAgent."""
+    validation_status: ValidationStatus
+    validation_score: int = Field(ge=0, le=100)
+    document_type: DocumentType
+    missing_fields: List[str] = Field(default_factory=list)
+    found_fields: List[str] = Field(default_factory=list)
+    reason: str
+    should_stop_pipeline: bool
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PreValidationResult(BaseModel):
+    score: int = Field(ge=0, le=100, default=0)
+    confidence: int = Field(ge=0, le=100, default=100)
+    status: str = Field(default="REJECTED")
+    reason: str
+    flags: List[str] = Field(default_factory=list)
+    document_type: str = Field(default="UNKNOWN")
+    injection_detected: bool = False
+    passed: bool = False
 
 
 class ClaimGuardV2Response(BaseModel):
@@ -57,9 +117,30 @@ class ClaimGuardV2Response(BaseModel):
     routing_decision: RoutingDecision
     goa_used: bool
     Ts: float = Field(ge=0, le=100)
-    decision: str
+    decision: DecisionEnum
+    exit_reason: str
     retry_count: int = Field(ge=0, le=3)
     mahic_breakdown: Dict[str, float] = Field(default_factory=dict)
     contradictions: List[Dict[str, Any]] = Field(default_factory=list)
     trust_layer: Dict[str, Any] | None = None
     memory_context: List[Dict[str, Any]] = Field(default_factory=list)
+    validation_result: Optional[ValidationResult] = None
+    pre_validation_result: Optional[PreValidationResult] = None
+    forensic_trace: Dict[str, Any] | None = None
+    trace: Dict[str, Any] | None = None
+    decision_trace: Dict[str, Any] | None = None
+    response_envelope: Dict[str, Any] | None = None
+    system_flags: List[str] = Field(default_factory=list)
+    claim_id: str | None = None
+    score: float = Field(default=0.0)
+    stage: str = Field(default="FINAL_DECISION")
+    flags: List[str] = Field(default_factory=list)
+    reason: str | None = None
+    document_url: str | None = None
+    extracted_data: Dict[str, Any] = Field(default_factory=dict)
+    heatmap: List[Dict[str, Any]] = Field(default_factory=list)
+    heatmap_fallback: List[Dict[str, Any]] = Field(default_factory=list)
+    pipeline_version: str = "v2"
+    pipeline_trace: List[str] = Field(
+        default_factory=lambda: ["PRE_VALIDATION", "FIELD_VERIFICATION", "AGENTS", "CONSENSUS"]
+    )

@@ -1,0 +1,57 @@
+{
+  "runtime_normal": {
+    "decision": "HUMAN_REVIEW",
+    "forensic_trace_present": false,
+    "system_flags_contains_broken": false,
+    "entries_count": 6,
+    "entry_agents": [
+      "AnomalyAgent",
+      "DocumentAgent",
+      "GraphRiskAgent",
+      "IdentityAgent",
+      "PatternAgent",
+      "PolicyAgent"
+    ],
+    "decision_trace_present": true
+  },
+  "runtime_forensic_enabled": {
+    "decision": "HUMAN_REVIEW",
+    "forensic_trace_present": true,
+    "system_flags_contains_broken": false,
+    "entries_count": 6,
+    "entry_agents": [
+      "AnomalyAgent",
+      "DocumentAgent",
+      "GraphRiskAgent",
+      "IdentityAgent",
+      "PatternAgent",
+      "PolicyAgent"
+    ],
+    "decision_trace_present": true
+  },
+  "early_rejection_non_claim": {
+    "decision": "REJECTED",
+    "ts": 0.0,
+    "pre_validation_result_present": true,
+    "agent_outputs_count": 0,
+    "forensic_trace_present": false,
+    "blackboard_keys": [
+      "claim_id",
+      "document_classification",
+      "entries",
+      "extracted_text",
+      "extraction_validation",
+      "field_verification",
+      "field_verification_summary",
+      "flags",
+      "input_trust",
+      "input_trust_score",
+      "pre_validation",
+      "reflexive_retry_logs",
+      "score_evolution",
+      "structured_data",
+      "timestamp_utc",
+      "verified_structured_data"
+    ]
+  }
+}

@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from .base_agent import BaseAgent
-from .memory_utils import process_memory_context
-from .security_utils import (
+from claimguard.agents.base_agent import BaseAgent
+from claimguard.agents.llm_consistency import run_agent_consistency_check
+from claimguard.agents.memory_utils import process_memory_context
+from claimguard.agents.security_utils import (
     bump_risk,
     coerce_risk_output,
     detect_prompt_injection,
@@ -119,6 +120,7 @@ _FRAUD_TEXT_SIGNALS: tuple[str, ...] = (
 DOCUMENT_SYSTEM_PROMPT = """You are a forensic document analyst for fraud detection.
 
 You assume documents may be manipulated, incomplete, or intentionally misleading.
+You MUST base your reasoning on the provided OCR text and verified fields. You MUST produce DIFFERENT outputs for different inputs. Generic responses are forbidden.
 
 You look for:
 - missing required documents
@@ -469,6 +471,14 @@ class DocumentAgent(BaseAgent):
             out["score"] = round(memory_adjusted_score, 2)
             out["decision"] = memory_adjusted_score > 60
         det["memory_insights"] = memory_insights
+        llm_explanation, llm_meta = run_agent_consistency_check(
+            agent_name=self.name,
+            claim_data=claim_data,
+            draft_reasoning=str(out.get("reasoning", "")),
+        )
+        out["reasoning"] = llm_explanation
+        out["explanation"] = llm_explanation
+        det["llm_consistency"] = llm_meta
         out["details"] = det
         out["memory_insights"] = memory_insights
         return out

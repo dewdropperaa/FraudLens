@@ -1,0 +1,18 @@
+{"extracted_text":"Facture Clinique Atlas. Patient: Sara Benali CIN AB123456. Date: 2026-03-01. Consultation generale. Montant total: 450 MAD.", "label":"CLAIM"}
+{"extracted_text":"Invoice - Hopital Al Amal. Patient ID: CD789012. Service: Radiologie. Date 2026/02/18. Total amount 1200 dh.", "label":"CLAIM"}
+{"extracted_text":"Facture pharmacie centrale. Ordonnance Dr. Karim. Patient: Youssef Ait. Date 14-02-2026. Total TTC 275 MAD.", "label":"CLAIM"}
+{"extracted_text":"Hospital bill statement. Patient Nadia El Idrissi. Admission 2026-01-11. Discharge 2026-01-14. Amount due 5400 DH.", "label":"CLAIM"}
+{"extracted_text":"Rapport de soins clinique Noor. Patient Amal Karim. Date 2026-03-12. Prestations medicales et montant 980 mad.", "label":"CLAIM"}
+{"extracted_text":"Facture laboratoire medical Ibn Rochd. Patient: Imane. Date 2026-03-05. Analyses sanguines. Total 630 MAD.", "label":"CLAIM"}
+{"extracted_text":"Travel blog post about hiking trails in the Atlas mountains and best weather months for tourism.", "label":"NON_CLAIM"}
+{"extracted_text":"Electronics store receipt for headphones, keyboard, and shipping insurance. Order number 55321.", "label":"NON_CLAIM"}
+{"extracted_text":"Meeting notes from software sprint planning: backlog grooming, API deadlines, and deployment tasks.", "label":"NON_CLAIM"}
+{"extracted_text":"Rental contract addendum for apartment maintenance and annual utility adjustments.", "label":"NON_CLAIM"}
+{"extracted_text":"Cooking recipe collection with ingredient substitutions and weekly meal prep tips.", "label":"NON_CLAIM"}
+{"extracted_text":"Car insurance claim newsletter discussing road safety statistics and regional traffic updates.", "label":"NON_CLAIM"}
+{"extracted_text":"Patient information brochure from Clinique Atlas with appointment instructions and contact numbers. Date 2026-03-01 listed, no billing amount.", "label":"UNCERTAIN"}
+{"extracted_text":"Ordonnance medicale: traitement antibiotique, posologie, et nom du patient. No invoice total is present.", "label":"UNCERTAIN"}
+{"extracted_text":"Medical test result summary for glycemie and cholesterol, includes patient name and date but no payment section.", "label":"UNCERTAIN"}
+{"extracted_text":"CNSS attestation with beneficiary details and coverage validity dates, without any facture or amount to reimburse.", "label":"UNCERTAIN"}
+{"extracted_text":"Clinical visit note with doctor observations, patient ID, and service date 2026-02-20. Billing information missing.", "label":"UNCERTAIN"}
+{"extracted_text":"Document mentions patient, consultation, and hospital address, but no clear invoice format or monetary total.", "label":"UNCERTAIN"}

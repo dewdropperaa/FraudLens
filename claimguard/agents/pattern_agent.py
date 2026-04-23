@@ -4,12 +4,14 @@ import statistics
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from .base_agent import BaseAgent
-from .memory_utils import process_memory_context
+from claimguard.agents.base_agent import BaseAgent
+from claimguard.agents.llm_consistency import run_agent_consistency_check
+from claimguard.agents.memory_utils import process_memory_context
 
 PATTERN_SYSTEM_PROMPT = """You are a fraud pattern analyst.
 
 You detect repetition, timing patterns, and behavioral signatures.
+You MUST base your reasoning on the provided OCR text and verified fields. You MUST produce DIFFERENT outputs for different inputs. Generic responses are forbidden.
 
 You are skeptical of:
 - repeated "clean" claims
@@ -53,6 +55,7 @@ class PatternAgent(BaseAgent):
         )
 
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
+        memory_status = str(claim_data.get("memory_status", "OK") or "OK").upper()
         raw_pid = claim_data.get("patient_id", "")
         patient_id = "" if raw_pid is None else str(raw_pid)
         try:
@@ -197,12 +200,28 @@ class PatternAgent(BaseAgent):
             score = max(0, int(memory_adjusted_score))
             decision = score > 60
         details["memory_insights"] = memory_insights
+        if memory_status != "OK":
+            score = max(0, score - 15)
+            decision = score > 60
+            reasoning.append(
+                f"Memory status is {memory_status}; reduced confidence in pattern detection."
+            )
+        details["memory_status"] = memory_status
+        confidence = max(0.2, min(0.95, score / 100.0))
 
+        llm_explanation, llm_meta = run_agent_consistency_check(
+            agent_name=self.name,
+            claim_data=claim_data,
+            draft_reasoning="; ".join(reasoning) if reasoning else default_msg,
+        )
+        details["llm_consistency"] = llm_meta
         return {
             "agent_name": self.name,
             "decision": decision,
             "score": round(score, 2),
-            "reasoning": "; ".join(reasoning) if reasoning else default_msg,
+            "confidence": round(confidence, 2),
+            "reasoning": llm_explanation,
+            "explanation": llm_explanation,
             "details": details,
             "memory_insights": memory_insights,
         }

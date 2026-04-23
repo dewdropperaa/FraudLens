@@ -12,8 +12,10 @@
   "dependencies": {
     "axios": "^1.14.0",
     "ethers": "^6.16.0",
+    "pdfjs-dist": "^5.6.205",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
+    "react-pdf": "^10.4.1",
     "recharts": "^3.8.1"
   },
   "devDependencies": {

@@ -423,7 +423,7 @@ def _build_query_text(claim: Dict[str, Any]) -> str:
 
 def decision_to_fraud_label(decision: str, ts_score: float) -> str:
     """Convert an orchestrator decision + Ts score into a fraud label."""
-    if decision == "AUTO_APPROVE":
+    if decision == "APPROVED":
         return "clean"
     if decision in ("REJECTED", "REFLEXIVE_TRIGGER"):
         return "fraud"

@@ -1,11 +1,13 @@
 from typing import Any, Dict, List
 
-from .base_agent import BaseAgent
-from .memory_utils import process_memory_context
+from claimguard.agents.base_agent import BaseAgent
+from claimguard.agents.llm_consistency import run_agent_consistency_check
+from claimguard.agents.memory_utils import process_memory_context
 
 POLICY_SYSTEM_PROMPT = """You are a compliance and fraud risk analyst.
 
 You do not blindly apply policy rules.
+You MUST base your reasoning on the provided OCR text and verified fields. You MUST produce DIFFERENT outputs for different inputs. Generic responses are forbidden.
 
 You question:
 - borderline cases
@@ -149,11 +151,18 @@ class PolicyAgent(BaseAgent):
             decision = score > 60
         details["memory_insights"] = memory_insights
 
+        llm_explanation, llm_meta = run_agent_consistency_check(
+            agent_name=self.name,
+            claim_data=claim_data,
+            draft_reasoning="; ".join(reasoning) if reasoning else "Policy coverage validated",
+        )
+        details["llm_consistency"] = llm_meta
         return {
             "agent_name": self.name,
             "decision": decision,
             "score": round(score, 2),
-            "reasoning": "; ".join(reasoning) if reasoning else "Policy coverage validated",
+            "reasoning": llm_explanation,
+            "explanation": llm_explanation,
             "details": details,
             "memory_insights": memory_insights,
         }

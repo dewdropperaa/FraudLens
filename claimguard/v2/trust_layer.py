@@ -47,13 +47,18 @@ class FirebaseTrustRecord(BaseModel):
     decision: str
     agent_summary: str
     timestamp: str
+    trust_hash: str = ""
+    dispute_risk: bool = False
+    evidence_cid: str | None = None
 
 
 class TrustLayerResult(BaseModel):
-    cid: str
+    cid: str | None = None
+    evidence_cid: str | None = None
     tx_hash: Optional[str] = None
     firebase_id: str
     status: str
+    trust_hash: str
 
 
 class IPFSClient(Protocol):
@@ -262,23 +267,65 @@ class TrustLayerService:
         digest = hashlib.sha256(cid.encode("utf-8")).hexdigest()
         return f"0x{digest}"
 
-    def process_if_applicable(
+    @staticmethod
+    def _stable_hash_payload(payload: Dict[str, Any]) -> str:
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _build_tier1_hash(
         self,
         *,
         claim_id: str,
         decision: str,
         ts_score: float,
-        claim_request: Dict[str, Any],
-        agent_outputs: List[Dict[str, Any]],
-    ) -> Optional[TrustLayerResult]:
-        if decision != "AUTO_APPROVE":
-            return None
+        timestamp: str,
+        agent_output_summary: str,
+        flags: List[str],
+    ) -> str:
+        return self._stable_hash_payload(
+            {
+                "claim_id": claim_id,
+                "decision": decision,
+                "Ts": round(float(ts_score), 4),
+                "timestamp": timestamp,
+                "agent_output_summary": agent_output_summary,
+                "flags": sorted(str(flag) for flag in flags),
+            }
+        )
+
+    def process_approved_claim(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        claim_id = str(payload.get("claim_id") or "")
+        decision = str(payload.get("decision") or "").upper()
+        ts_score = float(payload.get("ts_score", 0.0))
+        claim_request = payload.get("claim_request") or {}
+        agent_outputs = list(payload.get("agent_outputs") or [])
+        flags = list(payload.get("flags") or [])
+
+        if decision != "APPROVED":
+            return {"status": "SKIPPED"}
+
+        assert decision == "APPROVED", "Approved-only side effects enforced"
+
+        decision = str(decision or "").upper()
+        now = datetime.now(timezone.utc)
+        timestamp_iso = now.isoformat()
+        agent_summary = self._agent_summary(agent_outputs)
+        trust_hash = self._build_tier1_hash(
+            claim_id=claim_id,
+            decision=decision,
+            ts_score=ts_score,
+            timestamp=timestamp_iso,
+            agent_output_summary=agent_summary,
+            flags=flags,
+        )
+
+        cid: str | None = None
+        tx_hash: Optional[str] = None
 
         documents = claim_request.get("documents", [])
         trusted_docs = self._sanitize_documents(documents)
         cid = self.ipfs_client.upload_documents(claim_id, trusted_docs)
 
-        now = datetime.now(timezone.utc)
         onchain_payload = OnChainTrustPayload.model_validate(
             {
                 "cid_hash": self._hash_cid(cid),
@@ -288,8 +335,6 @@ class TrustLayerService:
                 "final_decision": decision,
             }
         )
-
-        tx_hash: Optional[str] = None
         try:
             tx_hash = self.blockchain_client.store_record(onchain_payload)
         except Exception as exc:
@@ -305,12 +350,48 @@ class TrustLayerService:
         firebase_payload = FirebaseTrustRecord.model_validate(
             {
                 "claim_id": claim_id,
-                "cid": cid,
+                "cid": cid or "",
                 "Ts": ts_score,
                 "decision": decision,
-                "agent_summary": self._agent_summary(agent_outputs),
-                "timestamp": now.isoformat(),
+                "agent_summary": agent_summary,
+                "timestamp": timestamp_iso,
+                "trust_hash": trust_hash,
+                "dispute_risk": False,
+                "evidence_cid": None,
             }
         )
         firebase_id = self.firebase_client.store_record(firebase_payload)
-        return TrustLayerResult(cid=cid, tx_hash=tx_hash, firebase_id=firebase_id, status="stored")
+        return {
+            "cid": cid,
+            "evidence_cid": None,
+            "tx_hash": tx_hash,
+            "firebase_id": firebase_id,
+            "status": "stored",
+            "trust_hash": trust_hash,
+        }
+
+    def process_if_applicable(
+        self,
+        *,
+        claim_id: str,
+        decision: str,
+        ts_score: float,
+        claim_request: Dict[str, Any],
+        agent_outputs: List[Dict[str, Any]],
+        flags: List[str] | None = None,
+        score_evolution: List[float] | None = None,
+        dispute_risk: bool = False,
+    ) -> Optional[TrustLayerResult]:
+        result = self.process_approved_claim(
+            {
+                "claim_id": claim_id,
+                "decision": decision,
+                "ts_score": ts_score,
+                "claim_request": claim_request,
+                "agent_outputs": agent_outputs,
+                "flags": list(flags or []),
+            }
+        )
+        if result.get("status") == "SKIPPED":
+            return None
+        return TrustLayerResult.model_validate(result)

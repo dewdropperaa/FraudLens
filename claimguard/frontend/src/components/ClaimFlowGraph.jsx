@@ -2,6 +2,8 @@ import React, { useEffect, useState } from 'react';
 import { Icons } from '../components';
 
 const STREAMING_MESSAGES = {
+  "OCR Extraction": ["Running OCR engine...", "Extracting document text...", "Building structured fields..."],
+  ClaimValidation: ["Validating claim schema...", "Checking required fields...", "Applying hard gate..."],
   IdentityAgent: ["Verifying CIN format...", "Cross-referencing names...", "Checking identity reuse..."],
   DocumentAgent: ["Scanning document metadata...", "Checking for tampering...", "Validating stamps..."],
   PolicyAgent: ["Checking CNSS limits...", "Verifying coverage dates...", "Analyzing threshold gaming..."],
@@ -55,6 +57,8 @@ function StreamingReasoning({ agent }) {
 }
 
 const AGENT_SEQUENCE = [
+  "OCR Extraction",
+  "ClaimValidation",
   "IdentityAgent",
   "DocumentAgent",
   "PolicyAgent",

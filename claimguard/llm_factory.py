@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
-from typing import Final
+from typing import Any, Final
 
 from langchain_community.llms import Ollama
+from claimguard.llm_tracking import TrackedLLMProxy
 
 _MODEL_ROUTES: Final[dict[str, str]] = {
     "simple": "mistral",
@@ -24,11 +25,19 @@ def resolve_model(model_name: str) -> str:
     )
 
 
-def get_llm(model_name: str):
-    return Ollama(
+def get_llm(model_name: str, *, tracked: bool = True) -> Any:
+    base = Ollama(
         model=resolve_model(model_name),
         temperature=0.1,
     )
+    if not tracked:
+        return base
+    return TrackedLLMProxy(base)
+
+
+def get_crewai_llm(model_name: str) -> str:
+    """Return CrewAI-compatible model route string."""
+    return f"ollama/{resolve_model(model_name)}"
 
 
 def assert_ollama_connection() -> None:
@@ -38,7 +47,7 @@ def assert_ollama_connection() -> None:
         return
     if os.getenv("PYTEST_CURRENT_TEST"):
         return
-    llm = get_llm("mistral")
+    llm = get_llm("mistral", tracked=False)
     response = llm.invoke("Say 'Ollama working'")
     if not str(response).strip():
         raise RuntimeError("Ollama connectivity test failed: empty response.")

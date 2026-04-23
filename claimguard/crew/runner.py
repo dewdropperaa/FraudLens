@@ -28,6 +28,7 @@ from claimguard.crew.consensus import enrich_legacy_with_audit, log_agent_decisi
 from claimguard.crew.crew import build_mini_crews
 from claimguard.crew.models import AgentDecisionOutput
 from claimguard.crew.tools import ALL_CLAIM_TOOLS
+from claimguard.llm_tracking import get_llm_tracking_records, tracked_agent_context
 from claimguard.v2.memory import get_memory_layer
 
 logger = logging.getLogger("claimguard.crew.runner")
@@ -94,9 +95,15 @@ def _run_deterministic_sequential(claim_data: Dict[str, Any]) -> List[Dict[str, 
     raw = []
     for key in _AGENT_KEYS:
         agent_name = _AGENT_NAMES[key]
+        print(f"[AGENT EXECUTION] {agent_name}")
         tracker.update(agent_name, "RUNNING")
         try:
-            result = _AGENT_RUNNERS[key](enriched_data)
+            llm_before = len(get_llm_tracking_records())
+            with tracked_agent_context(agent_name):
+                result = _AGENT_RUNNERS[key](enriched_data)
+            llm_after = len(get_llm_tracking_records())
+            if int(llm_after - llm_before) < 1:
+                raise Exception(f"{agent_name} produced output without LLM call")
             tracker.update(agent_name, "COMPLETED")
             raw.append(result)
         except Exception as exc:

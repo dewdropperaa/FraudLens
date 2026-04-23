@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from .base_agent import BaseAgent
-from .memory_utils import process_memory_context
-from .security_utils import (
+from claimguard.agents.base_agent import BaseAgent
+from claimguard.agents.llm_consistency import run_agent_consistency_check
+from claimguard.agents.memory_utils import process_memory_context
+from claimguard.agents.security_utils import (
     bump_risk,
     coerce_risk_output,
     detect_prompt_injection,
@@ -19,6 +20,7 @@ from .security_utils import (
 ANOMALY_SYSTEM_PROMPT = """You are an anomaly detection expert specializing in fraud risk.
 
 You do NOT trust surface-level patterns. You actively search for:
+You MUST base your reasoning on the provided OCR text and verified fields. You MUST produce DIFFERENT outputs for different inputs. Generic responses are forbidden.
 - abnormal jumps in amounts
 - inconsistencies with historical behavior
 - suspicious stability (too clean = suspicious)
@@ -318,6 +320,14 @@ class AnomalyAgent(BaseAgent):
         if memory_adjusted_score != float(core["score"]):
             out["score"] = round(memory_adjusted_score, 2)
             out["decision"] = memory_adjusted_score > 60
+        llm_explanation, llm_meta = run_agent_consistency_check(
+            agent_name=self.name,
+            claim_data=claim_data,
+            draft_reasoning=str(out.get("reasoning", "")),
+        )
+        out["reasoning"] = llm_explanation
+        out["explanation"] = llm_explanation
+        det["llm_consistency"] = llm_meta
         det["memory_insights"] = memory_insights
         out["details"] = det
         out["memory_insights"] = memory_insights

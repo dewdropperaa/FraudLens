@@ -3,18 +3,29 @@ from __future__ import annotations
 import json
 import logging
 import os
+import hashlib
+import re
+import inspect
+from difflib import SequenceMatcher
+from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Tuple
 
 from crewai import Agent, Crew, Process, Task
 from langchain_community.embeddings import FakeEmbeddings, OllamaEmbeddings
 from sklearn.cluster import KMeans
 
-from claimguard.llm_factory import assert_ollama_connection, get_llm
+from claimguard.agents.validation_agent import ClaimValidationAgent
+from claimguard.agents.security_utils import classify_prompt_injection, sanitize_for_prompt
+from claimguard.llm_factory import assert_ollama_connection, get_crewai_llm
+from claimguard.llm_tracking import tracked_agent_context
 from claimguard.v2.blackboard import AgentContract, BlackboardValidationError, SharedBlackboard
 from claimguard.v2.concierge import build_routing_decision
-from claimguard.v2.consensus import ConsensusEngine
+from claimguard.v2.consensus import ConsensusConfig, ConsensusEngine, should_force_human_review
+from claimguard.v2.document_classifier import classify_document
+from claimguard.v2.evidence_mapper import build_fraud_heatmap
+from claimguard.v2.field_verification import verify_structured_fields
 from claimguard.v2.fraud_ring_graph import get_fraud_ring_graph
 from claimguard.v2.flow_tracker import get_tracker
 from claimguard.v2.memory import (
@@ -24,16 +35,59 @@ from claimguard.v2.memory import (
     decision_to_fraud_label,
     get_memory_layer,
 )
+from claimguard.v2.memory_health import MemoryConfig, MemoryHealthReport, MemoryHealthStatus, get_memory_health
+from claimguard.v2.human_review_store import HumanReviewStore, PendingHumanReviewRepository
+from claimguard.v2.reliability import (
+    ExternalValidationResult,
+    get_reliability_store,
+    hash_payload,
+)
 from claimguard.v2.schemas import (
     AgentOutput,
     ClaimGuardV2Response,
+    DECISION_ENUM_VALUES,
     MemoryInsights,
+    PreValidationResult,
     RoutingDecision,
+    ValidationResult,
 )
-from claimguard.v2.trust_layer import TrustLayerIPFSFailure, TrustLayerService
+from claimguard.v2.trust_layer import (
+    TrustLayerIPFSFailure,
+    TrustLayerService,
+)
+from claimguard.v2.trace_engine import TraceEngine
 
 LOGGER = logging.getLogger("claimguard.v2")
-
+FORENSIC_MODE = False
+_INPUT_HASH_HISTORY: Dict[str, int] = {}
+_CANONICAL_DECISIONS = set(DECISION_ENUM_VALUES)
+EXIT_REASONS: tuple[str, ...] = (
+    "non_claim",
+    "prompt_injection",
+    "ocr_unreadable",
+    "identity_not_verified",
+    "critical_fields_unverified",
+    "low_confidence",
+    "approved",
+)
+MIN_OCR_TEXT_LENGTH = 40
+GENERIC_EXPLANATION_MARKERS = (
+    "no suspicious patterns detected",
+    "everything looks normal",
+    "all checks passed",
+    "looks legitimate",
+    "appears valid",
+    "insufficient data to conclude",
+)
+_CLAIM_INVOICE_KEYWORDS = ("facture", "invoice", "reçu", "recu", "ordonnance", "receipt")
+_PROVIDER_KEYWORDS = ("clinic", "clinique", "hospital", "hopital", "hôpital", "doctor", "docteur", "dr.")
+_CRITICAL_AGENT_FAILURE_MARKERS = (
+    "not found in document",
+    "insufficient evidence",
+    "missing required document",
+)
+_CRITICAL_FIELD_KEYS = {"cin", "ipp", "amount"}
+_HARD_REJECTION_REASON = "Claim rejected: data not found in supporting document"
 SEQUENTIAL_AGENT_CONTRACTS: tuple[AgentContract, ...] = (
     AgentContract("IdentityAgent", ()),
     AgentContract("DocumentAgent", ("IdentityAgent",)),
@@ -79,6 +133,117 @@ _AGENT_BACKSTORIES: Dict[str, str] = {
 }
 
 
+class ContractViolationError(ValueError):
+    """Raised when a response envelope violates the runtime contract."""
+
+
+def build_response_envelope(
+    decision: str,
+    Ts: float,
+    blackboard: SharedBlackboard | Dict[str, Any],
+    *,
+    score_evolution: List[float] | None = None,
+    reflexive_retry_logs: List[Dict[str, Any]] | None = None,
+    flags: Dict[str, Any] | None = None,
+    agent_outputs: List[Dict[str, Any]] | None = None,
+    exit_reason: str | None = None,
+    **extra: Any,
+) -> Dict[str, Any]:
+    normalized_decision = str(decision or "").strip().upper()
+    if normalized_decision not in _CANONICAL_DECISIONS:
+        raise ContractViolationError(f"Invalid decision '{decision}' for response envelope.")
+
+    if isinstance(blackboard, SharedBlackboard):
+        blackboard_snapshot = blackboard.to_dict()
+    else:
+        blackboard_snapshot = dict(blackboard or {})
+
+    metadata = blackboard_snapshot.get("request", {}).get("data", {}) if isinstance(blackboard_snapshot.get("request"), dict) else {}
+    claim_id = (
+        str(extra.get("claim_id") or "")
+        or str((blackboard_snapshot.get("metadata") or {}).get("claim_id") or "")
+        or str((blackboard_snapshot.get("request_payload") or {}).get("metadata", {}).get("claim_id") or "")
+        or str((metadata.get("claim_id") if isinstance(metadata, dict) else "") or "")
+    )
+
+    envelope = {
+        "decision": normalized_decision,
+        "Ts": float(Ts),
+        "exit_reason": str(exit_reason or ""),
+        "blackboard_snapshot": blackboard_snapshot,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "claim_id": claim_id,
+        "score_evolution": list(score_evolution or []),
+        "reflexive_retry_logs": list(reflexive_retry_logs or []),
+        "flags": dict(flags or {}),
+        "agent_outputs": list(agent_outputs or []),
+    }
+    envelope.update(extra)
+    return envelope
+
+
+def _stable_json_dumps(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _stable_output_hash(payload: Dict[str, Any]) -> str:
+    return hashlib.sha256(_stable_json_dumps(payload).encode("utf-8")).hexdigest()
+
+
+def build_safe_agent_context(blackboard: SharedBlackboard) -> Dict[str, Any]:
+    return {
+        "text": blackboard.extracted_text,
+        "verified_data": blackboard.verified_structured_data,
+        "flags": blackboard.system_flags,
+    }
+
+
+def terminate_pipeline(reason: str, flags: List[str]) -> Dict[str, Any]:
+    return {
+        "decision": "REJECTED",
+        "reason": reason,
+        "flags": list(flags),
+        "terminated": True,
+    }
+
+
+def exit_pipeline(reason: str, decision: str, ts: float = 0.0) -> Dict[str, Any]:
+    return {
+        "decision": str(decision or "").strip().upper(),
+        "exit_reason": str(reason or "").strip(),
+        "Ts": float(ts),
+        "terminated": True,
+    }
+
+
+def _exit_from_ts(ts: float) -> Dict[str, Any]:
+    ts_value = float(ts)
+    if ts_value < 60.0:
+        return exit_pipeline("low_confidence", "REJECTED", ts=ts_value)
+    if ts_value < 75.0:
+        return exit_pipeline("low_confidence", "HUMAN_REVIEW", ts=ts_value)
+    return exit_pipeline("approved", "APPROVED", ts=ts_value)
+
+
+def _log_pipeline_terminated(stage: str, reason: str) -> None:
+    LOGGER.warning("[PIPELINE TERMINATED] stage=%s reason=%s", stage, reason)
+
+
+def finalize_decision(consensus_result: Dict[str, Any], critical_failures: List[str]) -> str:
+    return str(_exit_from_ts(float(consensus_result.get("Ts", 0.0)))["decision"])
+
+
+def _text_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(a=a or "", b=b or "").ratio()
+
+
+def _output_entropy(outputs: List[Dict[str, Any]]) -> float:
+    if not outputs:
+        return 0.0
+    unique = { _stable_output_hash(item) for item in outputs }
+    return len(unique) / max(1, len(outputs))
+
+
 def _safe_json_load(text: str) -> Dict[str, Any]:
     raw = (text or "").strip()
     if raw.startswith("```"):
@@ -92,6 +257,93 @@ def _safe_json_load(text: str) -> Dict[str, Any]:
     if not isinstance(loaded, dict):
         return {}
     return loaded
+
+
+def _normalize_score_confidence_scale(score: float, confidence: float) -> tuple[float, float]:
+    # Accept either 0..1 or 0..100 outputs; convert percentages when detected.
+    s = score / 100.0 if score > 1.0 else score
+    c = confidence / 100.0 if confidence > 1.0 else confidence
+    return s, c
+
+
+def _coerce_claims(parsed: Dict[str, Any], explanation: str) -> List[Dict[str, Any]]:
+    claims = parsed.get("claims")
+    if not isinstance(claims, list):
+        return [{"statement": explanation, "evidence": "", "verified": False}]
+    normalized: List[Dict[str, Any]] = []
+    for raw in claims:
+        if not isinstance(raw, dict):
+            continue
+        normalized.append(
+            {
+                "statement": str(raw.get("statement", "")).strip(),
+                "evidence": str(raw.get("evidence", "")).strip(),
+                "verified": bool(raw.get("verified", False)),
+            }
+        )
+    return normalized or [{"statement": explanation, "evidence": "", "verified": False}]
+
+
+def _is_evidence_in_source(evidence: str, extracted_text: str, structured_data: Dict[str, Any]) -> bool:
+    ev = (evidence or "").strip().lower()
+    if not ev:
+        return False
+    raw = (extracted_text or "").lower()
+    if ev in raw:
+        return True
+    for value in structured_data.values():
+        candidate = str(value or "").strip().lower()
+        if candidate and (ev == candidate or ev in candidate or candidate in ev):
+            return True
+    return False
+
+
+def _explanation_is_grounded(explanation: str, extracted_text: str, structured_data: Dict[str, Any]) -> bool:
+    text = (explanation or "").strip().lower()
+    if not text:
+        return False
+    if any(marker in text for marker in GENERIC_EXPLANATION_MARKERS):
+        return False
+    has_number = any(ch.isdigit() for ch in text)
+    mentions_field = any(str(value).strip() and str(value).strip().lower() in text for value in structured_data.values())
+    mentions_ocr = any(token in text for token in (extracted_text or "").lower().split()[:30]) if extracted_text else False
+    return has_number and (mentions_field or mentions_ocr)
+
+
+def _extract_field_from_text(patterns: List[str], text: str) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return str(match.group(1)).strip()
+    return ""
+
+
+def _normalize_extracted_amount(value: str) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    # Remove currency labels/symbols and normalize OCR number formatting.
+    cleaned = re.sub(r"(?i)\b(?:mad|dh|dhs|dirhams?|usd|eur)\b", " ", candidate)
+    cleaned = re.sub(r"[^\d,.\s]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+    numeric = cleaned.replace(" ", "")
+    if "," in numeric and "." in numeric:
+        if numeric.rfind(",") > numeric.rfind("."):
+            numeric = numeric.replace(".", "").replace(",", ".")
+        else:
+            numeric = numeric.replace(",", "")
+    elif "," in numeric:
+        numeric = numeric.replace(",", ".")
+    return numeric
+
+
+def _verify_structured_fields(
+    structured_fields: Dict[str, Any],
+    extracted_text: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    return verify_structured_fields(structured_fields, extracted_text)
 
 
 def _parse_memory_insights(parsed: Dict[str, Any]) -> MemoryInsights | None:
@@ -165,23 +417,433 @@ class ClaimGuardV2Orchestrator:
         self._ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
         self._embedding_model = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
         self._consensus_engine = ConsensusEngine()
+        self._consensus_config = ConsensusConfig()
         self._trust_layer = trust_layer_service or TrustLayerService.build_default()
         self._memory = memory_layer or get_memory_layer()
+        self._memory_config = MemoryConfig(
+            min_similarity=float(getattr(self._memory, "_similarity_threshold", 0.7)),
+            degraded_memory_auto_approve_threshold=float(
+                os.getenv("DEGRADED_MEMORY_AUTO_APPROVE_THRESHOLD", "95.0")
+            ),
+        )
+        self._memory_degraded_streak = 0
+        self._alert_webhook_url = os.getenv("MEMORY_ALERT_WEBHOOK_URL", "").strip()
+        self._reliability_store = get_reliability_store()
         self._fraud_ring_graph = get_fraud_ring_graph()
+        self._human_review_store = HumanReviewStore()
+        self._pending_human_reviews = PendingHumanReviewRepository()
         print("LLM Provider: OLLAMA")
         print("Available models:", ["mistral", "llama3", "deepseek-r1"])
         assert_ollama_connection()
 
     def _make_chat_llm(self, model_name: str):
-        return get_llm(model_name)
+        return get_crewai_llm(model_name)
+
+    def get_memory_health_report(self) -> MemoryHealthReport:
+        return get_memory_health(self._memory_config, self._memory)
+
+    def _emit_memory_degraded_alert(self, *, claim_id: str, report: MemoryHealthReport) -> None:
+        payload = {
+            "severity": "critical",
+            "type": "memory_degraded_consecutive_claims",
+            "claim_id": claim_id,
+            "status": report.status.value,
+            "failure_reason": report.failure_reason,
+            "probe_result_count": report.probe_result_count,
+            "latency_ms": report.latency_ms,
+        }
+        LOGGER.critical("memory_degraded_alert payload=%s", payload)
+        if not self._alert_webhook_url:
+            return
+        try:
+            import requests
+
+            requests.post(self._alert_webhook_url, json=payload, timeout=5)
+        except Exception as exc:
+            LOGGER.warning("memory_degraded_alert_webhook_failed error=%s", exc)
+
+    def _track_memory_health(self, *, claim_id: str, report: MemoryHealthReport) -> None:
+        if report.status == MemoryHealthStatus.HEALTHY:
+            self._memory_degraded_streak = 0
+            return
+        self._memory_degraded_streak += 1
+        if self._memory_degraded_streak >= 2:
+            self._emit_memory_degraded_alert(claim_id=claim_id, report=report)
+
+    @staticmethod
+    def _build_ocr_blackboard_payload(claim_request: Dict[str, Any]) -> Dict[str, Any]:
+        texts: List[str] = []
+        for extraction in claim_request.get("document_extractions", []) or []:
+            if isinstance(extraction, dict):
+                candidate = str(extraction.get("extracted_text") or "").strip()
+                if candidate:
+                    texts.append(candidate)
+        for doc in claim_request.get("documents", []) or []:
+            if isinstance(doc, dict):
+                candidate = str(doc.get("text") or "").strip()
+                if candidate:
+                    texts.append(candidate)
+        raw_text = "\n".join(texts).strip()
+
+        identity = claim_request.get("identity", {}) if isinstance(claim_request.get("identity"), dict) else {}
+        policy = claim_request.get("policy", {}) if isinstance(claim_request.get("policy"), dict) else {}
+        metadata = claim_request.get("metadata", {}) if isinstance(claim_request.get("metadata"), dict) else {}
+        structured_fields: Dict[str, Any] = {
+            "cin": str(identity.get("cin") or identity.get("CIN") or claim_request.get("patient_id") or "").strip(),
+            "ipp": str(identity.get("ipp") or identity.get("IPP") or "").strip(),
+            "amount": claim_request.get("amount") or metadata.get("amount") or policy.get("amount") or "",
+            "date": str(
+                metadata.get("service_date")
+                or claim_request.get("service_date")
+                or policy.get("service_date")
+                or ""
+            ).strip(),
+            "provider": str(
+                identity.get("hospital")
+                or policy.get("hospital")
+                or metadata.get("hospital")
+                or identity.get("doctor")
+                or policy.get("doctor")
+                or metadata.get("doctor")
+                or ""
+            ).strip(),
+        }
+        if not structured_fields["cin"]:
+            structured_fields["cin"] = _extract_field_from_text([r"\bcin[:\s-]*([A-Z0-9-]{4,})\b"], raw_text)
+        if not structured_fields["ipp"]:
+            structured_fields["ipp"] = _extract_field_from_text([r"\bipp[:\s-]*([0-9]{6,10})\b"], raw_text)
+        if not structured_fields["amount"]:
+            extracted_amount = _extract_field_from_text(
+                [
+                    r"\b(?:montant|amount|total(?:\s+(?:ttc|due|a payer|à payer))?)\s*[:=]?\s*([0-9][0-9\s.,]{0,20})\b",
+                    r"\b([0-9][0-9\s.,]{0,20})\s*(?:mad|dh|dhs|dirhams?)\b",
+                ],
+                raw_text,
+            )
+            structured_fields["amount"] = _normalize_extracted_amount(extracted_amount)
+        if not structured_fields["date"]:
+            structured_fields["date"] = _extract_field_from_text(
+                [r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4})\b"],
+                raw_text,
+            )
+        if not structured_fields["provider"]:
+            structured_fields["provider"] = _extract_field_from_text(
+                [r"\b(?:hopital|hôpital|clinique|provider|doctor|dr\.?)[:\s-]*([A-Za-z0-9 '\-]{3,})"],
+                raw_text,
+            )
+        return {
+            "raw_text": raw_text,
+            "structured_fields": structured_fields,
+        }
+
+    @staticmethod
+    def _is_unreadable_text(text: str) -> bool:
+        if not text:
+            return True
+        if len(text.strip()) < MIN_OCR_TEXT_LENGTH:
+            return True
+        printable = sum(1 for ch in text if ch.isalnum() or ch.isspace())
+        ratio = printable / max(1, len(text))
+        return ratio < 0.45
+
+    @staticmethod
+    def _compute_extraction_validation(raw_text: str, structured_fields: Dict[str, Any]) -> Dict[str, Any]:
+        fields_detected = sorted(
+            [name for name, value in structured_fields.items() if str(value).strip()]
+        )
+        required_fields = ["cin", "amount", "date", "provider"]
+        missing_fields = [name for name in required_fields if name not in fields_detected]
+        return {
+            "text_length": len(raw_text),
+            "fields_detected": fields_detected,
+            "missing_fields": missing_fields,
+        }
+
+    @staticmethod
+    def _build_input_summary(claim_request: Dict[str, Any]) -> str:
+        identity = claim_request.get("identity", {}) if isinstance(claim_request.get("identity"), dict) else {}
+        policy = claim_request.get("policy", {}) if isinstance(claim_request.get("policy"), dict) else {}
+        metadata = claim_request.get("metadata", {}) if isinstance(claim_request.get("metadata"), dict) else {}
+        cin = identity.get("cin") or identity.get("CIN") or claim_request.get("patient_id") or "unknown"
+        ipp = identity.get("ipp") or identity.get("IPP") or "unknown"
+        provider = identity.get("hospital") or policy.get("hospital") or metadata.get("hospital") or "unknown"
+        amount = claim_request.get("amount") or metadata.get("amount") or policy.get("amount") or "unknown"
+        return f"CIN={cin}; IPP={ipp}; provider={provider}; amount={amount}"
+
+    @staticmethod
+    def _run_pre_validation_guard(extracted_text: str) -> Dict[str, Any]:
+        text = str(extracted_text or "")
+        lowered = text.lower()
+        has_amount = bool(
+            re.search(r"\b\d+(?:[.,]\d+)?\s*(?:mad|dh|dirham|dhs|eur|usd|€)\b", lowered)
+            or re.search(r"\b(?:montant|total|prix|cost|amount)\s*[:=]?\s*\d+(?:[.,]\d+)?\b", lowered)
+        )
+        has_provider = any(token in lowered for token in _PROVIDER_KEYWORDS)
+        has_date = bool(
+            re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", lowered)
+            or re.search(r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b", lowered)
+        )
+        has_invoice = any(token in lowered for token in _CLAIM_INVOICE_KEYWORDS)
+        signal_count = sum([has_amount, has_provider, has_date, has_invoice])
+        injection_result = classify_prompt_injection(text)
+        injection_detected = bool(injection_result.get("is_injection", False))
+        injection_confidence = int(injection_result.get("confidence", 0))
+        injection_reason = str(injection_result.get("reason", "")).strip()
+        injection_signals = injection_result.get("signals", {})
+        security_flags = list(injection_result.get("security_flags", []))
+        degraded_security_mode = bool(injection_result.get("degraded_security_mode", False))
+        layer1_blocked = bool(injection_result.get("layer1_blocked", False))
+        document_type = "MEDICAL_CLAIM" if signal_count >= 2 else "NON_CLAIM"
+        flags: List[str] = []
+        if document_type == "NON_CLAIM":
+            flags.append("NON_CLAIM")
+        if layer1_blocked:
+            flags.append("PROMPT_INJECTION_LAYER1")
+        elif injection_detected or injection_confidence > 70:
+            flags.append("PROMPT_INJECTION")
+        # Hard deny policy: layer1 deterministic block is non-bypassable.
+        hard_block = layer1_blocked or document_type == "NON_CLAIM"
+        failed = hard_block
+        payload: Dict[str, Any] = {
+            "document_type": document_type,
+            "injection_detected": injection_detected,
+            "injection_confidence": injection_confidence,
+            "injection_reason": injection_reason,
+            "layer1_blocked": layer1_blocked,
+            "security_flags": security_flags,
+            "degraded_security_mode": degraded_security_mode,
+            "injection_classifier": {
+                "is_injection": injection_detected,
+                "confidence": injection_confidence,
+                "reason": injection_reason,
+            },
+            "injection_signals": injection_signals,
+            "claim_signal_count": signal_count,
+            "claim_signals": {
+                "monetary_amount": has_amount,
+                "medical_provider_reference": has_provider,
+                "date": has_date,
+                "invoice_or_receipt_keywords": has_invoice,
+            },
+            "hard_block": hard_block,
+            "failed": failed,
+            "passed": not hard_block,
+            "flags": flags,
+        }
+        if hard_block:
+            payload["hard_block_response"] = {
+                "score": 0,
+                "confidence": max(100, injection_confidence),
+                "status": "REJECTED",
+                "reason": injection_reason or "Invalid document or prompt injection detected",
+                "flags": flags,
+            }
+        return payload
+
+    @staticmethod
+    def _noise_ratio(text: str) -> float:
+        if not text:
+            return 1.0
+        noise = sum(1 for ch in text if not (ch.isalnum() or ch.isspace() or ch in ".,:;-/"))
+        return noise / max(1, len(text))
+
+    def _compute_input_trust(
+        self,
+        *,
+        raw_text: str,
+        structured_fields: Dict[str, Any],
+        extraction_validation: Dict[str, Any],
+    ) -> Dict[str, int]:
+        text_len = len(raw_text or "")
+        ocr_quality = max(0, min(100, int((min(1.0, text_len / 400.0) * 70) + ((1.0 - self._noise_ratio(raw_text)) * 30))))
+        required = 4
+        detected = len(extraction_validation.get("fields_detected", []))
+        completeness = max(0, min(100, int((detected / max(1, required)) * 100)))
+        lines = [ln.strip() for ln in (raw_text or "").splitlines() if ln.strip()]
+        avg_line = (sum(len(ln) for ln in lines) / max(1, len(lines))) if lines else 0
+        readability = max(0, min(100, int(min(1.0, avg_line / 50.0) * 100)))
+        return {
+            "ocr_quality": ocr_quality,
+            "completeness": completeness,
+            "readability": readability,
+        }
+
+    @staticmethod
+    def _input_trust_score(trust: Dict[str, int]) -> float:
+        return round(
+            (0.45 * float(trust.get("ocr_quality", 0)))
+            + (0.35 * float(trust.get("completeness", 0)))
+            + (0.20 * float(trust.get("readability", 0))),
+            2,
+        )
+
+    @staticmethod
+    def _external_validation_hook(claim_request: Dict[str, Any]) -> ExternalValidationResult:
+        metadata = claim_request.get("metadata", {}) if isinstance(claim_request.get("metadata"), dict) else {}
+        if metadata.get("provider_registry_mismatch") is True:
+            return ExternalValidationResult(ok=False, source="provider_registry", reason="provider mismatch")
+        if metadata.get("hospital_validation_mismatch") is True:
+            return ExternalValidationResult(ok=False, source="hospital_validation", reason="hospital mismatch")
+        return ExternalValidationResult()
+
+    def _register_human_review_context(
+        self,
+        *,
+        claim_id: str,
+        claim_request: Dict[str, Any],
+        ts_score: float,
+        reason: str,
+        verified_fields: Dict[str, Any],
+        agent_outputs: List[AgentOutput],
+        blackboard_snapshot: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        first_doc = (claim_request.get("documents_base64") or [None])[0]
+        doc_ref = None
+        if isinstance(first_doc, dict):
+            doc_ref = self._human_review_store.save_temp_document(claim_id=claim_id, document_part=first_doc)
+        document_url = None
+        if doc_ref is not None:
+            document_url = (
+                f"/api/v2/claim/{claim_id}/review-document"
+                f"?file={doc_ref.file_name}&token={doc_ref.token}&expires={doc_ref.token_expires_at}"
+            )
+        heatmap_payload = {"heatmap": [], "fallback": [], "status": "missing_pdf"}
+        try:
+            heatmap_payload = build_fraud_heatmap(
+                blackboard=dict(blackboard_snapshot or {}),
+                agent_outputs=[item.model_dump() for item in agent_outputs],
+                pdf_path=(doc_ref.file_path if doc_ref else None),
+            )
+        except Exception as exc:
+            LOGGER.warning("heatmap_generation_failed claim_id=%s error=%s", claim_id, exc)
+        self._pending_human_reviews.save(claim_id, {
+            "claim_id": claim_id,
+            "ts": float(ts_score),
+            "reason": reason,
+            "document_url": document_url,
+            "document_file_path": doc_ref.file_path if doc_ref else None,
+            "document_file_name": doc_ref.file_name if doc_ref else None,
+            "document_token": doc_ref.token if doc_ref else None,
+            "document_token_expires": doc_ref.token_expires_at if doc_ref else None,
+            "extracted_data": dict(verified_fields or {}),
+            "agent_breakdown": [item.model_dump() for item in agent_outputs],
+            "heatmap": list(heatmap_payload.get("heatmap", [])),
+            "heatmap_fallback": list(heatmap_payload.get("fallback", [])),
+            "heatmap_status": str(heatmap_payload.get("status", "missing_pdf")),
+            "pipeline_version": "v2",
+            "ai_suggested_decision": "HUMAN_REVIEW",
+            "risk_breakdown": {
+                "ts_score": float(ts_score),
+                "risk_level": "MEDIUM" if ts_score < 75 else "HIGH",
+            },
+        })
+        return {
+            "document_url": document_url,
+            "heatmap": list(heatmap_payload.get("heatmap", [])),
+            "heatmap_fallback": list(heatmap_payload.get("fallback", [])),
+        }
+
+    def get_human_review_context(self, claim_id: str) -> Dict[str, Any] | None:
+        context = self._pending_human_reviews.get(claim_id)
+        if not context:
+            return None
+        return {
+            "claim_id": context["claim_id"],
+            "ts": context["ts"],
+            "reason": context["reason"],
+            "document_url": context["document_url"],
+            "extracted_data": context.get("extracted_data", {}),
+            "agent_breakdown": context.get("agent_breakdown", []),
+            "heatmap": context.get("heatmap", []),
+            "heatmap_fallback": context.get("heatmap_fallback", []),
+            "heatmap_status": context.get("heatmap_status", "missing_pdf"),
+            "pipeline_version": context.get("pipeline_version", "v2"),
+            "ai_suggested_decision": context.get("ai_suggested_decision", "HUMAN_REVIEW"),
+            "risk_breakdown": context.get("risk_breakdown", {}),
+        }
+
+    def resolve_human_review_document(
+        self,
+        *,
+        claim_id: str,
+        file_name: str,
+        token: str,
+        expires: int,
+    ) -> str | None:
+        context = self._pending_human_reviews.get(claim_id)
+        if not context:
+            return None
+        stored_name = str(context.get("document_file_name") or "")
+        if stored_name != str(file_name or ""):
+            return None
+        if not self._human_review_store.verify_token(
+            claim_id=claim_id,
+            file_name=file_name,
+            token=token,
+            expires_at=expires,
+        ):
+            return None
+        return context.get("document_file_path")
+
+    def apply_human_decision(
+        self,
+        *,
+        claim_id: str,
+        decision: str,
+        reviewer_id: str,
+        notes: str = "",
+    ) -> Dict[str, Any]:
+        context = self._pending_human_reviews.get(claim_id)
+        if context is None:
+            raise KeyError(f"No pending human review found for claim {claim_id}")
+        normalized = str(decision or "").upper()
+        if normalized not in {"APPROVED", "REJECTED"}:
+            raise ValueError("decision must be APPROVED or REJECTED")
+
+        ts_score = float(context.get("ts", 0.0))
+        if normalized == "APPROVED":
+            trust_layer_payload = self._trust_layer.process_approved_claim(
+                {
+                    "claim_id": claim_id,
+                    "decision": "APPROVED",
+                    "ts_score": ts_score,
+                    "claim_request": {
+                        "documents": [
+                            {
+                                "id": f"{claim_id}-human-approved",
+                                "document_type": "medical_invoice",
+                                "content": json.dumps(context.get("extracted_data", {})),
+                            }
+                        ]
+                    },
+                    "agent_outputs": [
+                        {
+                            "agent": "HumanReviewer",
+                            "explanation": f"reviewer={reviewer_id}; notes={notes[:200]}",
+                        }
+                    ],
+                    "flags": ["HUMAN_REVIEW_FINALIZED"],
+                }
+            )
+            self._pending_human_reviews.delete(claim_id)
+            return {
+                "status": "FINALIZED",
+                "tx_hash": trust_layer_payload.get("tx_hash"),
+                "ipfs_cid": trust_layer_payload.get("cid"),
+                "firebase_id": trust_layer_payload.get("firebase_id"),
+                "decision": "APPROVED",
+            }
+
+        self._pending_human_reviews.delete(claim_id)
+        return {"status": "REJECTED", "decision": "REJECTED"}
 
     def _build_task_prompt(
         self,
         *,
         contract: AgentContract,
-        claim_request: Dict[str, Any],
         blackboard: SharedBlackboard,
     ) -> str:
+        safe_context = build_safe_agent_context(blackboard)
         memory_context = blackboard.memory_context
         memory_section = ""
         if memory_context:
@@ -203,25 +865,174 @@ class ClaimGuardV2Orchestrator:
                 "\n\nMEMORY CONTEXT: No similar past cases found above the similarity threshold.\n"
             )
 
-        return (
+        base_prompt = (
             f"You are the {contract.name}. {_AGENT_BACKSTORIES.get(contract.name, '')}\n\n"
-            "Evaluate the insurance claim context for your specialty.\n"
-            "Return ONLY a single JSON object with these keys:\n"
-            "  score       (float 0..1)   — your fraud risk assessment\n"
-            "  confidence  (float 0..1)   — confidence in your score\n"
-            "  explanation (string)       — concise reasoning\n"
-            "  memory_insights (object)   — analysis of memory context:\n"
-            "    { similar_cases_found: int, fraud_matches: int,\n"
-            "      identity_reuse_detected: bool,\n"
-            "      impact_on_score: string, notes: string }\n\n"
-            # NOTE: "Claim: " / "Blackboard: " prefixes are intentionally stable:
-            # tests and red-team tooling parse these exact lines to validate that
-            # blackboard context was correctly passed to agents.
-            f"Current agent: {contract.name}\n"
-            f"Claim: {json.dumps(claim_request, ensure_ascii=False)}\n"
-            f"Blackboard: {json.dumps(blackboard.to_dict(), ensure_ascii=False)}\n"
+            "You are a fraud detection agent.\n\n"
+            "You MUST ONLY use the following VERIFIED information.\n\n"
+            "--- VERIFIED DATA ---\n"
+            f"{json.dumps(safe_context['verified_data'], ensure_ascii=False)}\n\n"
+            "--- DOCUMENT TEXT (OCR) ---\n"
+            f"{safe_context['text']}\n\n"
+            "--- SYSTEM FLAGS ---\n"
+            f"{json.dumps(safe_context['flags'], ensure_ascii=False)}\n\n"
+            "STRICT RULES:\n\n"
+            "* DO NOT assume missing data\n"
+            "* DO NOT infer values not present\n"
+            "* If evidence is missing -> reduce score\n"
+            "* If contradiction exists -> flag explicitly\n\n"
+            "Return:\n"
+            "score (0-100)\n"
+            "confidence (0-1)\n"
+            "explanation (evidence-based only)\n"
             + memory_section
         )
+        if contract.name == "IdentityAgent":
+            base_prompt += (
+                "\nIDENTITY AGENT RULES (Moroccan CIN aware):\n"
+                "TASK: Verify claimant identity using CIN and/or IPP with strict OCR evidence.\n"
+                "CHECKS:\n"
+                "- Validate CIN format with regex ^[A-Z]{1,2}[0-9]{5,6}$ when CIN is provided.\n"
+                "- Validate IPP format as numeric-only and length 6-10 when IPP is provided.\n"
+                "- MUST check BOTH CIN and IPP if both are present.\n"
+                "- MUST verify CIN/IPP presence in extracted_text, never assume validity from format.\n"
+                "DECISION RULES:\n"
+                "- If both CIN and IPP are missing => status=INSUFFICIENT_DATA.\n"
+                "- If provided CIN/IPP is not found in OCR text => status=SUSPICIOUS.\n"
+                "- If identity not found in OCR text, score MUST be in 0-20 max.\n"
+                "EVIDENCE REQUIREMENT:\n"
+                "- Output evidence object: {\"cin_found\": true/false, \"ipp_found\": true/false}.\n"
+                "- Every claim must include CIN and/or IPP value and where it was found.\n"
+                "EXPLANATION REQUIREMENT:\n"
+                "- Must reference CIN and/or IPP explicitly.\n"
+            )
+        elif contract.name == "DocumentAgent":
+            base_prompt += (
+                "\nDOCUMENT AGENT RULES (Structure validator):\n"
+                "TASK: Determine if document is a valid medical claim/invoice.\n"
+                "REQUIRED FIELDS:\n"
+                "- provider/hospital\n"
+                "- date\n"
+                "- cost/amount\n"
+                "- medical description\n"
+                "DECISION RULES:\n"
+                "- If >=2 required fields are missing => status=INSUFFICIENT_DATA.\n"
+                "- If structure is not invoice-like => status=SUSPICIOUS.\n"
+                "EVIDENCE REQUIREMENT:\n"
+                "- Quote exact snippets for provider, amount, and date.\n"
+                "EXPLANATION REQUIREMENT:\n"
+                "- Must list detected fields vs missing fields.\n"
+            )
+        elif contract.name == "PolicyAgent":
+            base_prompt += (
+                "\nPOLICY AGENT RULES (Coverage logic):\n"
+                "TASK: Check if claim fits policy coverage rules.\n"
+                "CHECKS:\n"
+                "- Compare service type vs policy coverage.\n"
+                "- Compare amount vs policy limits.\n"
+                "DECISION RULES:\n"
+                "- If key policy fields are missing => status=INSUFFICIENT_DATA.\n"
+                "- Never assume coverage without direct evidence.\n"
+                "EVIDENCE REQUIREMENT:\n"
+                "- Must reference service type and amount.\n"
+                "EXPLANATION REQUIREMENT:\n"
+                "- Must explicitly state why covered or not covered.\n"
+            )
+        elif contract.name == "AnomalyAgent":
+            base_prompt += (
+                "\nANOMALY AGENT RULES (Numerical and logical consistency):\n"
+                "TASK: Detect inconsistencies within the document.\n"
+                "CHECKS:\n"
+                "- total vs line items\n"
+                "- date consistency\n"
+                "- duplicate/conflicting values\n"
+                "DECISION RULES:\n"
+                "- If data is insufficient => status=INSUFFICIENT_DATA.\n"
+                "- You MUST perform at least one concrete comparison.\n"
+                "EVIDENCE REQUIREMENT:\n"
+                "- Include numeric comparisons (example: '1200 MAD vs 1200 MAD').\n"
+                "EXPLANATION REQUIREMENT:\n"
+                "- Must describe what comparisons were checked.\n"
+            )
+        elif contract.name == "PatternAgent":
+            base_prompt += (
+                "\nPATTERN AGENT RULES (History-aware but honest):\n"
+                "TASK: Analyze behavioral patterns using available data.\n"
+                "RULES:\n"
+                "- If NO historical data => status=INSUFFICIENT_DATA.\n"
+                "- Must explain exactly what history is missing.\n"
+                "- If data exists, compare frequency, repetition, and provider recurrence.\n"
+                "EVIDENCE REQUIREMENT:\n"
+                "- Must reference CIN.\n"
+                "- Must reference provider.\n"
+                "- Must reference claim frequency when history is available.\n"
+                "FORBIDDEN:\n"
+                "- No generic fallback phrases.\n"
+                "CONFIDENCE REQUIREMENT:\n"
+                "- Confidence must be low when no history exists.\n"
+                "EXPLANATION REQUIREMENT:\n"
+                "- Must state what was checked.\n"
+                "- Must state what could NOT be checked due to missing data.\n"
+            )
+        elif contract.name == "GraphRiskAgent":
+            base_prompt += (
+                "\nGRAPH RISK AGENT RULES (Relational reasoning):\n"
+                "TASK: Analyze relationships across CIN, provider, and claims.\n"
+                "RULES:\n"
+                "- If graph data is missing or incomplete => status=INSUFFICIENT_DATA.\n"
+                "- If connections exist, evaluate relationship risk using the observed graph structure.\n"
+                "EVIDENCE REQUIREMENT:\n"
+                "- Must reference number of nodes.\n"
+                "- Must reference relationship types used.\n"
+                "FORBIDDEN:\n"
+                "- Do NOT output 0 or 100 without explicit justification from evidence.\n"
+                "CONFIDENCE REQUIREMENT:\n"
+                "- Confidence must be low when graph is incomplete.\n"
+                "EXPLANATION REQUIREMENT:\n"
+                "- Must describe the graph structure used for the assessment.\n"
+            )
+        if contract.name in {"AnomalyAgent", "PatternAgent"}:
+            base_prompt += (
+                "\nHARD RULES FOR THIS AGENT (MANDATORY):\n"
+                "1. NO GENERIC EXPLANATIONS. Do NOT use generic phrases unless tied to input values.\n"
+                "2. Your explanation MUST reference at least 2 specific input elements "
+                "(examples: CIN, date, amount, provider name, document type, extracted fields).\n"
+                "3. REQUIRED JSON format for this agent:\n"
+                '{ "score": 0-100, "confidence": 0-100, "status":"...", "claims":[...], '
+                '"hallucination_flags":[], "explanation":"..." }\n'
+                "4. explanation must include at least one of:\n"
+                "   - a numeric value, or\n"
+                "   - an extracted field, or\n"
+                "   - a direct comparison.\n"
+                "   If explanation could be reused for unrelated inputs, it is WRONG.\n"
+                "5. INPUT DIFFERENTIATION: If two inputs differ, explanation MUST also differ.\n"
+                "6. If reasoning is weak or data is partial, confidence MUST be below 60.\n"
+            )
+            if contract.name == "AnomalyAgent":
+                base_prompt += (
+                    "7. ANOMALY-SPECIFIC: Compare values inside the document and identify inconsistencies.\n"
+                    "   If no inconsistency is found, explicitly state what comparisons were checked.\n"
+                    "   Example: Checked total 1200 MAD vs line items sum 1200 MAD — consistent.\n"
+                )
+            if contract.name == "PatternAgent":
+                base_prompt += (
+                    "7. PATTERN-SPECIFIC: If no historical data exists, explain what data is missing, "
+                    "which pattern check cannot be run, and fallback logic used.\n"
+                    "   Example: No historical claims found for CIN X — cannot compare frequency patterns; "
+                    "fallback to single-claim anomaly checks.\n"
+                )
+        return base_prompt
+
+    @staticmethod
+    def _enforce_prompt_context(prompt: str) -> None:
+        required_markers = (
+            "--- VERIFIED DATA ---",
+            "--- DOCUMENT TEXT (OCR) ---",
+        )
+        missing = [marker for marker in required_markers if marker not in prompt]
+        if missing:
+            raise RuntimeError(
+                f"Prompt context enforcement failed: missing {missing}"
+            )
 
     @staticmethod
     def _goa_trigger(claim_request: Dict[str, Any], routing: RoutingDecision) -> bool:
@@ -275,12 +1086,13 @@ class ClaimGuardV2Orchestrator:
                 expected_output="JSON with score, confidence, explanation",
                 agent=cluster_agent,
             )
-            out = Crew(
-                agents=[cluster_agent],
-                tasks=[cluster_task],
-                process=Process.sequential,
-                verbose=False,
-            ).kickoff()
+            with tracked_agent_context(cluster_agent.role):
+                out = Crew(
+                    agents=[cluster_agent],
+                    tasks=[cluster_task],
+                    process=Process.sequential,
+                    verbose=False,
+                ).kickoff()
             parsed = _safe_json_load(str(out))
             outputs.append(
                 {
@@ -357,20 +1169,1214 @@ class ClaimGuardV2Orchestrator:
             "anomaly_score": max(0.0, min(1.0, anomaly_score)),
         }
 
-    def run(self, claim_request: Dict[str, Any]) -> ClaimGuardV2Response:
-        routing = build_routing_decision(claim_request)
-        blackboard = SharedBlackboard(claim_request, routing)
+    @staticmethod
+    def _has_minimum_documents(claim_request: Dict[str, Any]) -> bool:
+        docs = claim_request.get("documents") or []
+        exts = claim_request.get("document_extractions") or []
+        return bool(docs or exts)
 
-        # ── Step 1: Retrieve memory context BEFORE any agent runs ──────────
+    @staticmethod
+    def _has_identity_core_fields(claim_request: Dict[str, Any]) -> bool:
+        identity = claim_request.get("identity", {})
+        cin = (
+            identity.get("cin")
+            or identity.get("CIN")
+            or claim_request.get("patient_id")
+            or ""
+        )
+        ipp = identity.get("ipp") or identity.get("IPP") or ""
+        return bool(str(cin).strip()) or bool(str(ipp).strip())
+
+    def _normalize_agent_output(
+        self,
+        *,
+        agent_name: str,
+        score: float,
+        confidence: float,
+        explanation: str,
+        claim_request: Dict[str, Any],
+        validation_result: ValidationResult,
+    ) -> Dict[str, Any]:
+        normalized_score = max(0.0, min(1.0, score))
+        normalized_confidence = max(0.0, min(1.0, confidence))
+        normalized_explanation = explanation.strip() or "Insufficient data to conclude"
+        insufficient_data = False
+
+        has_docs = self._has_minimum_documents(claim_request)
+        has_identity_fields = self._has_identity_core_fields(claim_request)
+        has_history = bool(claim_request.get("history"))
+
+        if not has_docs:
+            insufficient_data = True
+            normalized_score = min(normalized_score, 0.5)
+            normalized_confidence = min(normalized_confidence, 0.4)
+            normalized_explanation = "Insufficient data to perform reliable analysis"
+
+        if agent_name == "IdentityAgent":
+            if not has_identity_fields:
+                insufficient_data = True
+                normalized_score = min(normalized_score, 0.5)
+                normalized_confidence = min(normalized_confidence, 0.6)
+                normalized_explanation = "Insufficient data to perform reliable analysis"
+
+        if agent_name == "DocumentAgent":
+            if validation_result.document_type not in ("medical_invoice", "pharmacy_invoice", "hospital_bill"):
+                insufficient_data = True
+                normalized_score = min(normalized_score, 0.4)
+                normalized_confidence = min(normalized_confidence, 0.4)
+                normalized_explanation = "Document does not match expected medical claim structure"
+
+        if agent_name in {"AnomalyAgent", "PatternAgent"} and not has_history:
+            insufficient_data = True
+            normalized_score = min(normalized_score, 0.6)
+            normalized_confidence = min(normalized_confidence, 0.4)
+            cin = (
+                claim_request.get("identity", {}).get("cin")
+                or claim_request.get("patient_id")
+                or "unknown"
+            )
+            amount = claim_request.get("amount", claim_request.get("policy", {}).get("amount", "unknown"))
+            provider = (
+                claim_request.get("identity", {}).get("hospital")
+                or claim_request.get("policy", {}).get("hospital")
+                or claim_request.get("metadata", {}).get("hospital")
+                or "unknown"
+            )
+            history_count = len(claim_request.get("history") or [])
+            if agent_name == "PatternAgent":
+                normalized_explanation = (
+                    f"INSUFFICIENT_DATA for pattern analysis: checked CIN={cin}, provider={provider}, "
+                    f"current amount={amount}, and available history_count={history_count}. "
+                    "Could not run repetition/frequency/provider recurrence checks because historical claims are missing. "
+                    "Claim remains unverified for behavioral pattern assertions."
+                )
+            else:
+                normalized_explanation = (
+                    f"No prior history for CIN {cin}; anomaly baseline limited. "
+                    f"Checked current claim amount={amount} against in-document fields only."
+                )
+
+        if agent_name == "GraphRiskAgent":
+            graph_fields = self._resolve_graph_fields(claim_request)
+            if not (graph_fields["claim_id"] and graph_fields["cin"] and graph_fields["hospital"] and graph_fields["doctor"]):
+                insufficient_data = True
+                normalized_score = min(normalized_score, 0.6)
+                normalized_confidence = min(normalized_confidence, 0.4)
+                missing_keys: List[str] = []
+                for key in ("claim_id", "cin", "hospital", "doctor"):
+                    if not graph_fields.get(key):
+                        missing_keys.append(key)
+                normalized_explanation = (
+                    "INSUFFICIENT_DATA for graph risk: checked graph identifiers "
+                    f"(claim_id={graph_fields.get('claim_id') or 'missing'}, cin={graph_fields.get('cin') or 'missing'}, "
+                    f"hospital={graph_fields.get('hospital') or 'missing'}, doctor={graph_fields.get('doctor') or 'missing'}). "
+                    "Could not build a complete graph structure (node count and relationship types) because required fields are missing: "
+                    f"{', '.join(missing_keys)}. "
+                    "Claim remains unverified for relational-risk conclusions."
+                )
+
+        analysis_status = (
+            "INSUFFICIENT_DATA"
+            if insufficient_data
+            else ("SUSPICIOUS" if normalized_score >= 0.6 else "VERIFIED")
+        )
+        return {
+            "score": normalized_score,
+            "confidence": normalized_confidence,
+            "explanation": normalized_explanation,
+            "insufficient_data": insufficient_data,
+            "analysis_status": analysis_status,
+        }
+
+    @staticmethod
+    def _collect_critical_failures(
+        *,
+        extracted_text: str,
+        doc_classification: Dict[str, Any],
+        pre_validation: Dict[str, Any],
+        field_verification: List[Dict[str, Any]],
+        identity_failures: List[str] | None = None,
+    ) -> List[str]:
+        inferred: List[str] = (
+            (["DOCUMENT_CLASSIFIED_NON_CLAIM", "NON_CLAIM", "ML_NON_CLAIM"] if str(doc_classification.get("label", "")).upper() == "NON_CLAIM" else [])
+            + (["PROMPT_INJECTION_DETECTED", "PROMPT_INJECTION"] if bool(pre_validation.get("injection_detected", False)) else [])
+            + (["MISSING_REQUIRED_CLAIM_SIGNALS"] if int(pre_validation.get("claim_signal_count", 0)) < 2 else [])
+            + (["OCR_TEXT_EMPTY_OR_IRRELEVANT"] if ClaimGuardV2Orchestrator._is_unreadable_text(str(extracted_text or "")) else [])
+            + [
+                f"CRITICAL_FIELD_{str(row.get('field', '')).strip().upper()}_NOT_FOUND"
+                for row in field_verification
+                if str(row.get("field", "")).strip().lower() in _CRITICAL_FIELD_KEYS
+                and bool(row.get("input_present", True))
+                and str(row.get("status", "")).upper() == "NOT_FOUND"
+            ]
+            + list(identity_failures or [])
+        )
+        return sorted(set(inferred))
+
+    @staticmethod
+    def _agent_has_critical_failure(parsed: Dict[str, Any], explanation: str) -> bool:
+        haystacks = [
+            explanation.lower(),
+            str(parsed.get("analysis_status", "")).lower(),
+            str(parsed.get("status", "")).lower(),
+        ]
+        return any(marker in text for text in haystacks for marker in _CRITICAL_AGENT_FAILURE_MARKERS)
+
+    @staticmethod
+    def _apply_hallucination_penalty(
+        *,
+        score: float,
+        confidence: float,
+        explanation: str,
+        claims: List[Dict[str, Any]],
+        hallucination_flags: List[str],
+        extracted_text: str,
+        structured_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        verified_claims = 0
+        checked_claims = 0
+        normalized_claims: List[Dict[str, Any]] = []
+        flags = list(hallucination_flags)
+
+        for claim in claims:
+            checked_claims += 1
+            statement = str(claim.get("statement", "")).strip()
+            evidence = str(claim.get("evidence", "")).strip()
+            evidence_found = _is_evidence_in_source(evidence, extracted_text, structured_data)
+            verified = bool(claim.get("verified", False)) and evidence_found
+            if not evidence_found:
+                flags.append("ocr_value_not_found")
+            if not verified:
+                flags.append("unsupported_claim")
+                if not evidence:
+                    evidence = "UNVERIFIED"
+            else:
+                verified_claims += 1
+            normalized_claims.append(
+                {
+                    "statement": statement or "UNVERIFIED",
+                    "evidence": evidence or "UNVERIFIED",
+                    "verified": verified,
+                }
+            )
+
+        if not _explanation_is_grounded(
+            explanation,
+            extracted_text,
+            structured_data,
+        ):
+            flags.append("generic_explanation")
+
+        has_unverified = any(not c.get("verified", False) for c in normalized_claims)
+        penalty = 0.0
+        adjusted_confidence = confidence
+        adjusted_score = score
+        if has_unverified:
+            penalty = 0.4
+            adjusted_confidence = max(0.0, confidence * (1.0 - penalty))
+            adjusted_score = max(0.0, score - 0.15)
+        elif "generic_explanation" in flags:
+            penalty = 0.3
+            adjusted_confidence = max(0.0, confidence * (1.0 - penalty))
+            adjusted_score = max(0.0, score - 0.1)
+
+        flags = sorted(set(flags))
+        return {
+            "score": adjusted_score,
+            "confidence": adjusted_confidence,
+            "claims": normalized_claims,
+            "hallucination_flags": flags,
+            "hallucination_penalty": penalty,
+            "debug_log": {
+                "claims_checked": checked_claims,
+                "verified_claims": verified_claims,
+                "hallucination_flags": flags,
+                "confidence_adjusted": adjusted_confidence,
+            },
+        }
+
+    def _run_forensic_input_differentiation_test(
+        self,
+        *,
+        routing: RoutingDecision,
+        claim_request: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        valid_input = claim_request
+        random_input = {
+            "identity": {"name": "### random ###"},
+            "documents": [{"id": "rand-1", "document_type": "text", "text": "ZXQ RANDOM BLOB ####"}],
+            "policy": {"diagnosis": ""},
+            "metadata": {"forensic_random_input": True, "claim_id": "forensic-random"},
+        }
+        empty_input = {"identity": {}, "documents": [], "policy": {}, "metadata": {"claim_id": "forensic-empty"}}
+        scenarios = [("A", valid_input), ("B", random_input), ("C", empty_input)]
+        results: List[Dict[str, Any]] = []
+        failures: List[str] = []
+        comparisons: List[Dict[str, Any]] = []
+        hash_index: Dict[str, Dict[str, str]] = {contract.name: {} for contract in SEQUENTIAL_AGENT_CONTRACTS}
+        scenario_text_hashes: Dict[str, str] = {}
+
+        for contract in SEQUENTIAL_AGENT_CONTRACTS:
+            per_input: Dict[str, Dict[str, Any]] = {}
+            for label, payload in scenarios:
+                extraction_payload = self._build_ocr_blackboard_payload(payload)
+                board = SharedBlackboard(
+                    payload,
+                    routing,
+                    extracted_text=str(extraction_payload["raw_text"]),
+                    structured_data=dict(extraction_payload["structured_fields"]),
+                )
+                scenario_text_hashes[label] = hashlib.sha256(board.extracted_text.encode("utf-8")).hexdigest()
+                llm = self._make_chat_llm(routing.model)
+                agent = Agent(
+                    role=contract.name,
+                    goal="Evaluate claim risk for your scope and produce calibrated output.",
+                    backstory=_AGENT_BACKSTORIES.get(contract.name, ""),
+                    llm=llm,
+                    verbose=False,
+                )
+                prompt = f"INPUT_ID: {label}-{contract.name}\n" + self._build_task_prompt(
+                    contract=contract, blackboard=board
+                )
+                task = Task(
+                    description=prompt,
+                    expected_output=(
+                        "JSON with keys: score, confidence, claims, hallucination_flags, "
+                        "explanation, memory_insights"
+                    ),
+                    agent=agent,
+                )
+                with tracked_agent_context(contract.name):
+                    raw = str(Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False).kickoff())
+                parsed = _safe_json_load(raw)
+                score = float(parsed.get("score", 0.0))
+                confidence = float(parsed.get("confidence", 0.0))
+                explanation = str(parsed.get("explanation", ""))
+                out_payload = {"score": score, "confidence": confidence, "explanation": explanation}
+                out_hash = _stable_output_hash(out_payload)
+                hash_index[contract.name][label] = out_hash
+                per_input[label] = {
+                    "prompt": prompt,
+                    "score": score,
+                    "confidence": confidence,
+                    "explanation": explanation,
+                    "output_hash": out_hash,
+                }
+
+            prompts = {k: v["prompt"] for k, v in per_input.items()}
+            hashes = {k: v["output_hash"] for k, v in per_input.items()}
+            scores = [v["score"] for v in per_input.values()]
+            explanations = [v["explanation"] for v in per_input.values()]
+            if len(set(prompts.values())) < 3:
+                failures.append(f"PROMPT_IDENTICAL_ACROSS_INPUTS:{contract.name}")
+            if len(set(hashes.values())) < 3:
+                failures.append(f"IDENTICAL_HASH_ACROSS_INPUTS:{contract.name}")
+            if (max(scores) - min(scores) <= 1e-9) and len(set(explanations)) == 1:
+                failures.append(f"IDENTICAL_OUTPUTS_ACROSS_INPUTS:{contract.name}")
+
+            comparisons.append(
+                {
+                    "agent": contract.name,
+                    "score_spread": round(max(scores) - min(scores), 6),
+                    "explanation_similarity_A_B": round(_text_similarity(per_input["A"]["explanation"], per_input["B"]["explanation"]), 4),
+                    "explanation_similarity_A_C": round(_text_similarity(per_input["A"]["explanation"], per_input["C"]["explanation"]), 4),
+                }
+            )
+            results.append({"agent": contract.name, "per_input": per_input})
+
+        return {
+            "executed": True,
+            "results": results,
+            "hashes": hash_index,
+            "scenario_text_hashes": scenario_text_hashes,
+            "comparisons": comparisons,
+            "failures": sorted(
+                set(
+                    failures
+                    + (
+                        ["CONSTANT_TEXT_ACROSS_INPUTS"]
+                        if len(set(scenario_text_hashes.values())) < 3
+                        else []
+                    )
+                )
+            ),
+        }
+
+    @staticmethod
+    def _ensure_contract_blackboard(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        board = dict(snapshot or {})
+        board.setdefault("entries", {})
+        board.setdefault("flags", {})
+        board.setdefault("score_evolution", [])
+        board.setdefault("reflexive_retry_logs", [])
+        return board
+
+    def _build_response_from_envelope(
+        self,
+        *,
+        envelope: Dict[str, Any],
+        routing: RoutingDecision,
+        goa_used: bool,
+        retry_count: int,
+        mahic_breakdown: Dict[str, float],
+        contradictions: List[Dict[str, Any]],
+        trust_layer: Dict[str, Any] | None,
+        memory_context: List[Dict[str, Any]],
+        validation_result: ValidationResult | None,
+        pre_validation_result: PreValidationResult | None,
+        forensic_trace: Dict[str, Any] | None,
+        decision_trace: Dict[str, Any] | None,
+        system_flags: List[str],
+        agent_outputs: List[AgentOutput],
+    ) -> ClaimGuardV2Response:
+        blackboard_snapshot = self._ensure_contract_blackboard(dict(envelope.get("blackboard_snapshot", {})))
+        blackboard_snapshot["flags"] = dict(blackboard_snapshot.get("flags", {}))
+        blackboard_snapshot["flags"].setdefault("exit_reason", envelope.get("exit_reason"))
+        blackboard_snapshot["claim_id"] = envelope.get("claim_id")
+        blackboard_snapshot["timestamp_utc"] = envelope.get("timestamp_utc")
+        return ClaimGuardV2Response(
+            agent_outputs=agent_outputs,
+            blackboard=blackboard_snapshot,
+            routing_decision=routing,
+            goa_used=goa_used,
+            Ts=float(envelope.get("Ts", 0.0)),
+            decision=str(envelope.get("decision", "REJECTED")),
+            exit_reason=str(envelope.get("exit_reason", "low_confidence")),
+            retry_count=int(retry_count),
+            mahic_breakdown=mahic_breakdown,
+            contradictions=contradictions,
+            trust_layer=trust_layer,
+            memory_context=memory_context,
+            validation_result=validation_result,
+            pre_validation_result=pre_validation_result,
+            forensic_trace=forensic_trace,
+            decision_trace=decision_trace,
+            response_envelope=envelope,
+            system_flags=sorted(set(system_flags)),
+        )
+
+    def run(self, claim_request: Dict[str, Any]) -> ClaimGuardV2Response:
+        print("ACTIVE_PIPELINE_FILE:", inspect.getfile(self.__class__.run))
+        print("STAGE: PRE_VALIDATION")
+        routing = build_routing_decision(claim_request)
         claim_id = str(claim_request.get("metadata", {}).get("claim_id") or "")
         if not claim_id:
             claim_id = f"v2-{int(perf_counter() * 1000)}"
-        
+        trace_engine = TraceEngine(claim_id=claim_id)
+
+        def _trace_stage(
+            *,
+            stage: str,
+            status: str,
+            inputs: Dict[str, Any] | None = None,
+            outputs: Dict[str, Any] | None = None,
+            reason: str = "",
+            flags: List[str] | None = None,
+            decision_snapshot: str = "",
+        ) -> None:
+            trace_engine.add_stage(
+                {
+                    "stage": stage,
+                    "status": status,
+                    "inputs": inputs or {},
+                    "outputs": outputs or {},
+                    "reason": reason,
+                    "flags": flags or [],
+                    "decision_snapshot": decision_snapshot,
+                }
+            )
+
+        def _trace_critical_stop(reason: str, flags: List[str]) -> None:
+            _trace_stage(
+                stage="CRITICAL_STOP",
+                status="FAIL",
+                reason=reason,
+                flags=flags,
+                decision_snapshot="REJECTED",
+            )
+
+        def _finalize_response(*, exit_reason: str, **payload: Any) -> ClaimGuardV2Response:
+            decision_value = str(payload.get("decision", "REJECTED")).strip().upper()
+            assert decision_value in _CANONICAL_DECISIONS, f"Invalid decision enum: {decision_value}"
+            assert exit_reason in EXIT_REASONS, f"Invalid exit_reason enum: {exit_reason}"
+            payload["decision"] = decision_value
+            payload["exit_reason"] = exit_reason
+            trace_payload = payload.get("trace")
+            if not isinstance(trace_payload, dict):
+                trace_payload = trace_engine.export()
+                payload["trace"] = trace_payload
+            blackboard_payload = self._ensure_contract_blackboard(dict(payload.get("blackboard", {})))
+            envelope = build_response_envelope(
+                decision=decision_value,
+                Ts=float(payload.get("Ts", 0.0)),
+                blackboard=blackboard_payload,
+                score_evolution=list(blackboard_payload.get("score_evolution", [])),
+                reflexive_retry_logs=list(blackboard_payload.get("reflexive_retry_logs", [])),
+                flags=dict(blackboard_payload.get("flags", {})),
+                agent_outputs=[a.model_dump() if hasattr(a, "model_dump") else dict(a) for a in payload.get("agent_outputs", [])],
+                exit_reason=exit_reason,
+                claim_id=claim_id,
+            )
+            blackboard_snapshot = self._ensure_contract_blackboard(dict(envelope["blackboard_snapshot"]))
+            blackboard_snapshot["flags"] = dict(blackboard_snapshot.get("flags", {}))
+            blackboard_snapshot["flags"]["exit_reason"] = exit_reason
+            blackboard_snapshot["claim_id"] = claim_id
+            blackboard_snapshot["timestamp_utc"] = envelope["timestamp_utc"]
+            payload["blackboard"] = blackboard_snapshot
+            payload["response_envelope"] = envelope
+            payload.setdefault("claim_id", claim_id)
+            payload.setdefault("pipeline_version", "v2")
+            payload.setdefault("extracted_data", blackboard_snapshot.get("verified_structured_data", {}))
+            stages = trace_payload.get("stages", []) if isinstance(trace_payload, dict) else []
+            stage_name = "FINAL_DECISION"
+            if isinstance(stages, list) and stages:
+                stage_name = str((stages[-1] or {}).get("stage") or "FINAL_DECISION")
+            score_value = float(payload.get("Ts", 0.0))
+            flags_value = sorted(set(payload.get("system_flags", []) or []))
+            reason_value = str(
+                payload.get("reason")
+                or payload.get("exit_reason")
+                or envelope.get("exit_reason")
+                or "Decision computed by pipeline safeguards"
+            )
+            payload["score"] = score_value
+            payload["stage"] = stage_name
+            payload["flags"] = flags_value
+            payload["reason"] = reason_value
+            envelope["score"] = score_value
+            envelope["stage"] = stage_name
+            envelope["reason"] = reason_value
+            envelope["flags"] = flags_value
+            response = ClaimGuardV2Response(**payload)
+            assert response.exit_reason in EXIT_REASONS
+            return response
+
         tracker = get_tracker(claim_id)
+        tracker.update("OCR Extraction", "RUNNING")
+        extraction_payload = self._build_ocr_blackboard_payload(claim_request)
+        extracted_text = str(extraction_payload["raw_text"])
+        print("=== OCR TEXT START ===")
+        print(extracted_text[:3000])
+        print("=== OCR TEXT END ===")
+        sanitized_extracted_text = sanitize_for_prompt(extracted_text)
+        structured_data = dict(extraction_payload["structured_fields"])
+        doc_classification = classify_document(extracted_text, structured_data)
+        extraction_validation = self._compute_extraction_validation(extracted_text, structured_data)
+        pre_validation = self._run_pre_validation_guard(extracted_text)
+        _trace_stage(
+            stage="PRE_VALIDATION",
+            status="PASS" if not bool(pre_validation.get("failed", False)) else "FAIL",
+            inputs={"raw_text_length": len(extracted_text)},
+            outputs={"pre_validation": pre_validation},
+            reason=str(pre_validation.get("reason") or ""),
+            flags=list(pre_validation.get("flags", [])),
+        )
+        _trace_stage(
+            stage="OCR_EXTRACTION",
+            status="PASS" if bool(extracted_text.strip()) else "FAIL",
+            inputs={"document_count": len(claim_request.get("documents", []) or [])},
+            outputs={"structured_data": structured_data, "extraction_validation": extraction_validation},
+            reason="OCR extraction and field extraction completed",
+        )
+        _trace_stage(
+            stage="DOCUMENT_CLASSIFIER",
+            status="FAIL" if str(doc_classification.get("label", "")).upper() == "NON_CLAIM" else "PASS",
+            inputs={"raw_text_length": len(extracted_text)},
+            outputs={"classification": doc_classification},
+            reason=str(doc_classification.get("reason") or ""),
+            flags=["NON_CLAIM"] if str(doc_classification.get("label", "")).upper() == "NON_CLAIM" else [],
+        )
+        print("STAGE: FIELD_VERIFICATION")
+        field_verification, verification_meta = _verify_structured_fields(structured_data, extracted_text)
+        verified_structured_data = dict(verification_meta.get("verified_fields", {}))
+        verification_summary = dict(verification_meta.get("summary", {}))
+        identity_verification = dict(verification_meta.get("identity", {}))
+        identity_failures = list(verification_summary.get("identity_failures", []))
+        _trace_stage(
+            stage="FIELD_VERIFICATION",
+            status="FAIL" if bool(verification_summary.get("should_stop_pipeline")) else "PASS",
+            inputs={"structured_data": structured_data},
+            outputs={"field_verification": field_verification, "summary": verification_summary},
+            reason="Structured field verification completed",
+            flags=list(verification_summary.get("critical_stop_reasons", []) or []),
+        )
+        _trace_stage(
+            stage="IDENTITY_CHECK",
+            status="FAIL" if bool(identity_failures) else "PASS",
+            inputs={"identity_input": claim_request.get("identity", {})},
+            outputs={"identity_verification": identity_verification},
+            reason="Identity fields validated against OCR output",
+            flags=identity_failures,
+        )
+        input_trust = self._compute_input_trust(
+            raw_text=extracted_text,
+            structured_fields=structured_data,
+            extraction_validation=extraction_validation,
+        )
+        input_trust_score = self._input_trust_score(input_trust)
+        input_summary = self._build_input_summary(claim_request)
+        ocr_snapshot = extracted_text[:1200]
+        system_flags: List[str] = []
+        critical_failures: List[str] = []
+        if bool(pre_validation.get("injection_detected", False)):
+            flags = ["PROMPT_INJECTION_DETECTED", "PROMPT_INJECTION"]
+            if "PROMPT_INJECTION_LAYER1" in list(pre_validation.get("flags", [])):
+                flags.append("PROMPT_INJECTION_LAYER1")
+            terminal_result = terminate_pipeline(
+                str(pre_validation.get("injection_reason") or "Prompt injection detected"),
+                flags,
+            )
+            _log_pipeline_terminated("PRE_VALIDATION", terminal_result["reason"])
+            _trace_stage(
+                stage="PRE_VALIDATION",
+                status="FAIL",
+                inputs={"pre_validation": pre_validation},
+                outputs={"terminal_result": terminal_result},
+                reason=str(terminal_result["reason"]),
+                flags=flags,
+                decision_snapshot="REJECTED",
+            )
+            _trace_critical_stop(reason=str(terminal_result["reason"]), flags=flags)
+            tracker.update("OCR Extraction", "FAILED")
+            system_flags.extend(flags)
+            return _finalize_response(
+                exit_reason="prompt_injection",
+                agent_outputs=[],
+                blackboard={
+                    "entries": {},
+                    "extracted_text": sanitized_extracted_text,
+                    "structured_data": structured_data,
+                    "verified_structured_data": verified_structured_data,
+                    "field_verification": field_verification,
+                    "field_verification_summary": verification_summary,
+                    "identity": identity_verification,
+                    "critical_failures": sorted(set(flags)),
+                    "extraction_validation": extraction_validation,
+                    "input_trust": input_trust,
+                    "input_trust_score": input_trust_score,
+                    "pre_validation": pre_validation,
+                    "security_flags": pre_validation.get("security_flags", []),
+                    "degraded_security_mode": bool(pre_validation.get("degraded_security_mode", False)),
+                    "document_classification": doc_classification,
+                    "terminated": bool(terminal_result.get("terminated")),
+                },
+                routing_decision=routing,
+                goa_used=False,
+                Ts=0.0,
+                decision=str(terminal_result["decision"]),
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=[],
+                validation_result=None,
+                pre_validation_result=PreValidationResult(
+                    score=0,
+                    confidence=int(pre_validation.get("injection_confidence", 100)),
+                    status="REJECTED",
+                    reason=str(terminal_result["reason"]),
+                    flags=sorted(set(flags)),
+                    document_type=str(pre_validation.get("document_type", "UNKNOWN")),
+                    injection_detected=True,
+                    passed=False,
+                ),
+                forensic_trace=None,
+                decision_trace={
+                    "claim_id": claim_id,
+                    "input_summary": input_summary,
+                    "ocr_snapshot": ocr_snapshot,
+                    "input_trust": input_trust,
+                    "agent_summaries": [],
+                    "contradictions": [],
+                    "Ts_score": 0.0,
+                    "decision_before_guard": "REJECTED",
+                    "final_decision": "REJECTED",
+                    "decision_reason": str(terminal_result["reason"]),
+                    "critical_failures": sorted(set(flags)),
+                    "system_flags": sorted(set(system_flags)),
+                    "terminated": bool(terminal_result.get("terminated")),
+                },
+                reason=str(terminal_result["reason"]),
+                system_flags=sorted(set(system_flags)),
+            )
+        if str(doc_classification.get("label", "")).upper() == "NON_CLAIM":
+            flags = ["DOCUMENT_CLASSIFIED_NON_CLAIM", "NON_CLAIM", "ML_NON_CLAIM"]
+            terminal_result = terminate_pipeline("Document classified as NON_CLAIM", flags)
+            _log_pipeline_terminated("PRE_VALIDATION", terminal_result["reason"])
+            _trace_stage(
+                stage="DOCUMENT_CLASSIFIER",
+                status="FAIL",
+                inputs={"classification": doc_classification},
+                outputs={"terminal_result": terminal_result},
+                reason=str(terminal_result["reason"]),
+                flags=flags,
+                decision_snapshot="REJECTED",
+            )
+            _trace_critical_stop(reason="NON_CLAIM", flags=flags)
+            tracker.update("OCR Extraction", "FAILED")
+            system_flags.extend(flags)
+            return _finalize_response(
+                exit_reason="non_claim",
+                agent_outputs=[],
+                blackboard={
+                    "entries": {},
+                    "extracted_text": sanitized_extracted_text,
+                    "structured_data": structured_data,
+                    "verified_structured_data": verified_structured_data,
+                    "field_verification": field_verification,
+                    "field_verification_summary": verification_summary,
+                    "identity": identity_verification,
+                    "critical_failures": sorted(set(flags)),
+                    "extraction_validation": extraction_validation,
+                    "input_trust": input_trust,
+                    "input_trust_score": input_trust_score,
+                    "pre_validation": pre_validation,
+                    "security_flags": pre_validation.get("security_flags", []),
+                    "degraded_security_mode": bool(pre_validation.get("degraded_security_mode", False)),
+                    "document_classification": doc_classification,
+                    "terminated": bool(terminal_result.get("terminated")),
+                },
+                routing_decision=routing,
+                goa_used=False,
+                Ts=0.0,
+                decision=str(terminal_result["decision"]),
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=[],
+                validation_result=None,
+                pre_validation_result=PreValidationResult(
+                    score=0,
+                    confidence=100,
+                    status="REJECTED",
+                    reason=str(terminal_result["reason"]),
+                    flags=sorted(set(flags)),
+                    document_type=str(pre_validation.get("document_type", "UNKNOWN")),
+                    injection_detected=bool(pre_validation.get("injection_detected", False)),
+                    passed=False,
+                ),
+                forensic_trace=None,
+                decision_trace={
+                    "claim_id": claim_id,
+                    "input_summary": input_summary,
+                    "ocr_snapshot": ocr_snapshot,
+                    "input_trust": input_trust,
+                    "agent_summaries": [],
+                    "contradictions": [],
+                    "Ts_score": 0.0,
+                    "decision_before_guard": str(terminal_result["decision"]),
+                    "final_decision": str(terminal_result["decision"]),
+                    "decision_reason": str(terminal_result["reason"]),
+                    "critical_failures": sorted(set(flags)),
+                    "system_flags": sorted(set(system_flags)),
+                    "terminated": bool(terminal_result.get("terminated")),
+                },
+                reason=str(terminal_result["reason"]),
+                system_flags=sorted(set(system_flags)),
+            )
+        identity_hard_flags = {"NO_IDENTITY", "CIN_NOT_FOUND", "IPP_NOT_FOUND", "CIN_OR_IPP_NOT_FOUND"}
+        identity_reasons = sorted(set(identity_failures).intersection(identity_hard_flags))
+        if identity_reasons:
+            flags = ["IDENTITY_NOT_FOUND_IN_OCR", "IDENTITY_FALLBACK_MODE", *identity_reasons]
+            system_flags.extend(flags)
+            _trace_stage(
+                stage="IDENTITY_CHECK",
+                status="FAIL",
+                inputs={"identity_failures": identity_failures},
+                outputs={"degraded_mode": True},
+                reason="Identity mismatch detected; downgraded to fallback mode",
+                flags=flags,
+                decision_snapshot="HUMAN_REVIEW",
+            )
+        amount_row = next(
+            (row for row in field_verification if str(row.get("field", "")).strip().lower() == "amount"),
+            None,
+        )
+        amount_missing = bool(amount_row and str(amount_row.get("status", "")).upper() == "NOT_FOUND")
+        if amount_missing:
+            flags = ["AMOUNT_MISMATCH", "CRITICAL_FIELD_AMOUNT_NOT_FOUND", "FIELD_VERIFICATION_FALLBACK_MODE"]
+            system_flags.extend(flags)
+            _trace_stage(
+                stage="FIELD_VERIFICATION",
+                status="FAIL",
+                inputs={"amount_row": amount_row},
+                outputs={"degraded_mode": True},
+                reason="Amount mismatch detected; degraded to fallback mode",
+                flags=flags,
+                decision_snapshot="HUMAN_REVIEW",
+            )
+        cin_row = next(
+            (row for row in field_verification if str(row.get("field", "")).strip().lower() == "cin"),
+            None,
+        )
+        ipp_row = next(
+            (row for row in field_verification if str(row.get("field", "")).strip().lower() == "ipp"),
+            None,
+        )
+        cin_mismatch = bool(cin_row and bool(cin_row.get("input_present", True)) and str(cin_row.get("status", "")).upper() == "NOT_FOUND")
+        ipp_mismatch = bool(ipp_row and bool(ipp_row.get("input_present", True)) and str(ipp_row.get("status", "")).upper() == "NOT_FOUND")
+        if cin_mismatch or ipp_mismatch:
+            flags = ["CIN_IPP_MISMATCH", "IDENTITY_FALLBACK_MODE"]
+            if cin_mismatch:
+                flags.append("CRITICAL_FIELD_CIN_NOT_FOUND")
+            if ipp_mismatch:
+                flags.append("CRITICAL_FIELD_IPP_NOT_FOUND")
+            system_flags.extend(flags)
+            _trace_stage(
+                stage="IDENTITY_CHECK",
+                status="FAIL",
+                inputs={"cin_row": cin_row, "ipp_row": ipp_row},
+                outputs={"degraded_mode": True},
+                reason="CIN/IPP mismatch detected; degraded to fallback mode",
+                flags=flags,
+                decision_snapshot="HUMAN_REVIEW",
+            )
+        if (not pre_validation.get("failed", False)) and doc_classification.get("label") == "UNCERTAIN":
+            tracker.update("OCR Extraction", "FAILED")
+            system_flags.append("ML_CLASSIFIER_UNCERTAIN")
+            return _finalize_response(
+                exit_reason="non_claim",
+                agent_outputs=[],
+                blackboard={
+                    "entries": {},
+                    "extracted_text": sanitized_extracted_text,
+                    "structured_data": structured_data,
+                    "verified_structured_data": verified_structured_data,
+                    "field_verification": field_verification,
+                    "field_verification_summary": verification_summary,
+                    "extraction_validation": extraction_validation,
+                    "input_trust": input_trust,
+                    "input_trust_score": input_trust_score,
+                    "pre_validation": pre_validation,
+                    "security_flags": pre_validation.get("security_flags", []),
+                    "degraded_security_mode": bool(pre_validation.get("degraded_security_mode", False)),
+                    "document_classification": doc_classification,
+                },
+                routing_decision=routing,
+                goa_used=False,
+                Ts=0.0,
+                decision="REJECTED",
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=[],
+                validation_result=None,
+                pre_validation_result=PreValidationResult(
+                    score=int(doc_classification.get("confidence", 0)),
+                    confidence=int(doc_classification.get("confidence", 0)),
+                    status="UNCERTAIN",
+                    reason="Document classification uncertain; manual review required",
+                    flags=["ML_CLASSIFIER_UNCERTAIN"],
+                    document_type="UNCERTAIN",
+                    passed=False,
+                ),
+                forensic_trace=None,
+                decision_trace={
+                    "claim_id": claim_id,
+                    "input_summary": input_summary,
+                    "ocr_snapshot": ocr_snapshot,
+                    "input_trust": input_trust,
+                    "agent_summaries": [],
+                    "contradictions": [],
+                    "Ts_score": 0.0,
+                    "decision_before_guard": "REJECTED",
+                    "final_decision": "REJECTED",
+                    "decision_reason": "ML document classifier returned UNCERTAIN",
+                    "system_flags": sorted(set(system_flags)),
+                },
+                system_flags=sorted(set(system_flags)),
+            )
+        if pre_validation.get("failed", False):
+            flags = list(pre_validation.get("flags", []))
+            system_flags.extend(flags)
+            block_reason = str(
+                pre_validation.get("injection_reason") or "Invalid document or prompt injection detected"
+            )
+            tracker.update("OCR Extraction", "FAILED")
+            return _finalize_response(
+                exit_reason="critical_fields_unverified",
+                agent_outputs=[],
+                blackboard={
+                    "entries": {},
+                    "extracted_text": sanitized_extracted_text,
+                    "structured_data": structured_data,
+                    "verified_structured_data": verified_structured_data,
+                    "field_verification": field_verification,
+                    "field_verification_summary": verification_summary,
+                    "extraction_validation": extraction_validation,
+                    "input_trust": input_trust,
+                    "input_trust_score": input_trust_score,
+                    "pre_validation": pre_validation,
+                    "security_flags": pre_validation.get("security_flags", []),
+                    "degraded_security_mode": bool(pre_validation.get("degraded_security_mode", False)),
+                    "document_classification": doc_classification,
+                },
+                routing_decision=routing,
+                goa_used=False,
+                Ts=0.0,
+                decision="REJECTED",
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=[],
+                validation_result=None,
+                pre_validation_result=PreValidationResult(
+                    score=0,
+                    confidence=int(pre_validation.get("injection_confidence", 100)),
+                    status="REJECTED",
+                    reason=block_reason,
+                    flags=flags,
+                    document_type=str(pre_validation.get("document_type", "UNKNOWN")),
+                    injection_detected=bool(pre_validation.get("injection_detected", False)),
+                    passed=False,
+                ),
+                forensic_trace=None,
+                decision_trace={
+                    "claim_id": claim_id,
+                    "input_summary": input_summary,
+                    "ocr_snapshot": ocr_snapshot,
+                    "input_trust": input_trust,
+                    "agent_summaries": [],
+                    "contradictions": [],
+                    "Ts_score": 0.0,
+                    "decision_before_guard": "REJECTED",
+                    "final_decision": "REJECTED",
+                    "decision_reason": block_reason,
+                    "system_flags": sorted(set(system_flags)),
+                },
+                system_flags=sorted(set(system_flags)),
+            )
+        external_validation = self._external_validation_hook(claim_request)
+        mismatch_flag = external_validation.to_flag()
+        if mismatch_flag:
+            system_flags.append(mismatch_flag)
+        if self._is_unreadable_text(extracted_text):
+            tracker.update("OCR Extraction", "FAILED")
+            system_flags.append("OCR_FAILURE")
+            return _finalize_response(
+                exit_reason="ocr_unreadable",
+                agent_outputs=[],
+                blackboard={
+                    "entries": {},
+                    "extracted_text": extracted_text,
+                    "structured_data": structured_data,
+                    "verified_structured_data": verified_structured_data,
+                    "field_verification": field_verification,
+                    "field_verification_summary": verification_summary,
+                    "extraction_validation": extraction_validation,
+                    "input_trust": input_trust,
+                    "input_trust_score": input_trust_score,
+                    "pre_validation": pre_validation,
+                    "document_classification": doc_classification,
+                },
+                routing_decision=routing,
+                goa_used=False,
+                Ts=0.0,
+                decision="REJECTED",
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=[],
+                validation_result=None,
+                forensic_trace=(
+                    {
+                        "hard_failures": ["OCR_QUALITY_CHECK_FAILED"],
+                        "extraction_validation": extraction_validation,
+                    }
+                    if FORENSIC_MODE or bool(claim_request.get("metadata", {}).get("forensic_debug", False))
+                    else None
+                ),
+                decision_trace={
+                    "claim_id": claim_id,
+                    "input_summary": input_summary,
+                    "ocr_snapshot": ocr_snapshot,
+                    "input_trust": input_trust,
+                    "agent_summaries": [],
+                    "contradictions": [],
+                    "Ts_score": 0.0,
+                    "decision_before_guard": "REJECTED",
+                    "final_decision": "REJECTED",
+                    "decision_reason": "OCR failure",
+                    "system_flags": system_flags,
+                },
+                system_flags=system_flags,
+            )
+        if input_trust_score < 50:
+            tracker.update("OCR Extraction", "FAILED")
+            system_flags.append("LOW_INPUT_TRUST")
+            return _finalize_response(
+                exit_reason="ocr_unreadable",
+                agent_outputs=[],
+                blackboard={
+                    "entries": {},
+                    "extracted_text": extracted_text,
+                    "structured_data": structured_data,
+                    "verified_structured_data": verified_structured_data,
+                    "field_verification": field_verification,
+                    "field_verification_summary": verification_summary,
+                    "extraction_validation": extraction_validation,
+                    "input_trust": input_trust,
+                    "input_trust_score": input_trust_score,
+                    "pre_validation": pre_validation,
+                    "document_classification": doc_classification,
+                },
+                routing_decision=routing,
+                goa_used=False,
+                Ts=0.0,
+                decision="REJECTED",
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=[],
+                validation_result=None,
+                forensic_trace=(
+                    {
+                        "hard_failures": ["INPUT_TRUST_BELOW_GATE"],
+                        "extraction_validation": extraction_validation,
+                    }
+                    if FORENSIC_MODE or bool(claim_request.get("metadata", {}).get("forensic_debug", False))
+                    else None
+                ),
+                decision_trace={
+                    "claim_id": claim_id,
+                    "input_summary": input_summary,
+                    "ocr_snapshot": ocr_snapshot,
+                    "input_trust": input_trust,
+                    "agent_summaries": [],
+                    "contradictions": [],
+                    "Ts_score": 0.0,
+                    "decision_before_guard": "REJECTED",
+                    "final_decision": "REJECTED",
+                    "decision_reason": "Input trust score below 50",
+                    "system_flags": system_flags,
+                },
+                system_flags=system_flags,
+            )
+        tracker.update("OCR Extraction", "COMPLETED")
+        blackboard = SharedBlackboard(
+            claim_request,
+            routing,
+            extracted_text=sanitized_extracted_text,
+            structured_data=structured_data,
+        )
+        blackboard.set_pre_validation(pre_validation)
+        blackboard.set_field_verification(field_verification)
+        blackboard.set_identity_validation(identity_verification)
+        forensic_enabled = FORENSIC_MODE or bool(
+            claim_request.get("metadata", {}).get("forensic_debug", False)
+        )
+        forensic_input_id = str(
+            claim_request.get("metadata", {}).get("forensic_input_id")
+            or claim_request.get("metadata", {}).get("claim_id")
+            or f"forensic-{int(perf_counter() * 1000)}"
+        )
+        forensic_trace: Dict[str, Any] | None = None
+        if forensic_enabled:
+            forensic_trace = {
+                "input_id": forensic_input_id,
+                "llm_calls_count": 0,
+                "simulation_or_stub_detected": False,
+                "known_template_matches": [],
+                "raw_input_trace": [],
+                "prompt_trace": [],
+                "response_trace": [],
+                "output_hashes": [],
+                "hash_collisions_across_inputs": [],
+                "blackboard_flow_trace": [],
+                "input_differentiation_test": {"executed": False, "results": [], "failures": []},
+                "final_decision_trace": {},
+                "entry_input_trace": {},
+                "agent_forensic_trace": [],
+                "fallback_trace": [],
+                "hard_failures": [],
+                "broken": False,
+                "system_status": "WORKING",
+                "final_audit_report": {},
+                "extraction_validation": extraction_validation,
+            }
+            parsed_claim_data = claim_request if isinstance(claim_request, dict) else {}
+            input_hash = _stable_output_hash(parsed_claim_data if parsed_claim_data else {"_empty": True})
+            forensic_trace["entry_input_trace"] = {
+                "raw_input": _stable_json_dumps(claim_request),
+                "parsed_claim_data": parsed_claim_data,
+                "input_hash": input_hash,
+            }
+            if not parsed_claim_data:
+                forensic_trace["hard_failures"].append("EMPTY_PARSED_CLAIM_DATA")
+            _INPUT_HASH_HISTORY[input_hash] = _INPUT_HASH_HISTORY.get(input_hash, 0) + 1
+            if _INPUT_HASH_HISTORY[input_hash] > 1:
+                forensic_trace["hard_failures"].append("INPUT_HASH_REUSED_ACROSS_RUNS")
+
+        # ── Step 1: CLAIM VALIDATION (HARD GATE) ───────────────────────────
+        tracker.update("ClaimValidation", "RUNNING")
         
-        memory_context = self._memory.retrieve_similar_cases(claim_request)
+        validation_agent = ClaimValidationAgent()
+        validation_raw = validation_agent.analyze(claim_request)
+        
+        validation_result = ValidationResult(
+            validation_status=validation_raw["validation_status"],
+            validation_score=validation_raw["validation_score"],
+            document_type=validation_raw["document_type"],
+            missing_fields=validation_raw["missing_fields"],
+            found_fields=validation_raw["found_fields"],
+            reason=validation_raw["reason"],
+            should_stop_pipeline=validation_raw["should_stop_pipeline"],
+            details=validation_raw["details"],
+        )
+        
+        LOGGER.info(
+            "claim_validation claim_id=%s status=%s score=%d type=%s missing=%s",
+            claim_id,
+            validation_result.validation_status,
+            validation_result.validation_score,
+            validation_result.document_type,
+            validation_result.missing_fields,
+        )
+        
+        # HARD GATE: If validation fails, STOP IMMEDIATELY
+        if validation_result.should_stop_pipeline:
+            terminal_result = terminate_pipeline(
+                f"Validation failed: {validation_result.reason}",
+                ["CLAIM_VALIDATION_HARD_FAIL"],
+            )
+            _log_pipeline_terminated("CLAIM_VALIDATION", terminal_result["reason"])
+            _trace_stage(
+                stage="PRE_VALIDATION",
+                status="FAIL",
+                inputs={"validation_result": validation_result.model_dump()},
+                outputs={"terminal_result": terminal_result},
+                reason=str(terminal_result["reason"]),
+                flags=["CLAIM_VALIDATION_HARD_FAIL"],
+                decision_snapshot="REJECTED",
+            )
+            _trace_critical_stop(reason=str(terminal_result["reason"]), flags=["CLAIM_VALIDATION_HARD_FAIL"])
+            tracker.update("ClaimValidation", "FAILED")
+            LOGGER.warning(
+                "claim_validation_failed claim_id=%s reason=%s",
+                claim_id, validation_result.reason,
+            )
+            return _finalize_response(
+                exit_reason="critical_fields_unverified",
+                agent_outputs=[],
+                blackboard={
+                    "entries": {},
+                    "extracted_text": blackboard.extracted_text,
+                    "structured_data": blackboard.structured_data,
+                    "verified_structured_data": blackboard.verified_structured_data,
+                    "field_verification": blackboard.field_verification,
+                    "field_verification_summary": verification_summary,
+                    "extraction_validation": extraction_validation,
+                    "input_trust": input_trust,
+                    "input_trust_score": input_trust_score,
+                    "pre_validation": pre_validation,
+                    "security_flags": pre_validation.get("security_flags", []),
+                    "degraded_security_mode": bool(pre_validation.get("degraded_security_mode", False)),
+                    "terminated": bool(terminal_result.get("terminated")),
+                },
+                routing_decision=routing,
+                goa_used=False,
+                Ts=0.0,
+                decision=str(terminal_result["decision"]),
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=[],
+                validation_result=validation_result,
+                pre_validation_result=None,
+                forensic_trace=forensic_trace,
+                decision_trace={
+                    "claim_id": claim_id,
+                    "input_summary": input_summary,
+                    "ocr_snapshot": ocr_snapshot,
+                    "input_trust": input_trust,
+                    "agent_summaries": [],
+                    "contradictions": [],
+                    "Ts_score": 0.0,
+                    "decision_before_guard": "REJECTED",
+                    "final_decision": "REJECTED",
+                    "decision_reason": str(terminal_result["reason"]),
+                    "system_flags": system_flags,
+                    "terminated": bool(terminal_result.get("terminated")),
+                },
+                system_flags=system_flags,
+            )
+        
+        tracker.update("ClaimValidation", "COMPLETED")
+        LOGGER.info("claim_validation_passed claim_id=%s score=%d", claim_id, validation_result.validation_score)
+        if verification_summary.get("should_stop_pipeline"):
+            stop_reasons = list(verification_summary.get("critical_stop_reasons", []) or [])
+            if not stop_reasons:
+                stop_reasons = ["CRITICAL_FIELD_MISMATCH"]
+            degrade_flags = [*stop_reasons, "FIELD_VERIFICATION_SOFT_FAIL", "FIELD_VERIFICATION_FALLBACK_MODE"]
+            system_flags.extend(degrade_flags)
+            _trace_stage(
+                stage="FIELD_VERIFICATION",
+                status="FAIL",
+                inputs={"verification_summary": verification_summary},
+                outputs={"degraded_mode": True},
+                reason="Field verification requested hard stop; converted to soft fail fallback",
+                flags=degrade_flags,
+                decision_snapshot="HUMAN_REVIEW",
+            )
+
+        # ── Step 1: Retrieve memory context BEFORE any agent runs ──────────
+        memory_health = self.get_memory_health_report()
+        memory_status = "OK"
+        if memory_health.status == MemoryHealthStatus.DEGRADED:
+            memory_status = "DEGRADED"
+        elif memory_health.status == MemoryHealthStatus.UNAVAILABLE:
+            memory_status = "DISABLED"
+
+        if memory_health.status == MemoryHealthStatus.HEALTHY:
+            self._track_memory_health(claim_id=claim_id, report=memory_health)
+            try:
+                memory_context = self._memory.retrieve_similar_cases(claim_request)
+            except Exception as exc:
+                LOGGER.warning("memory_retrieve_after_healthcheck_failed error=%s", exc)
+                memory_context = []
+                memory_status = "DEGRADED"
+        else:
+            memory_context = []
+            self._track_memory_health(claim_id=claim_id, report=memory_health)
+            system_flags.append("MEMORY_DEGRADED")
+            LOGGER.warning(
+                "memory_status=%s failure_reason=%s",
+                memory_status,
+                memory_health.failure_reason,
+            )
+
+        blackboard.set_memory_status(memory_status)
         blackboard.inject_memory_context(memory_context)
         current_cin = self._resolve_current_cin(claim_request)
+        provider_name = str(
+            structured_data.get("provider")
+            or claim_request.get("identity", {}).get("hospital")
+            or claim_request.get("policy", {}).get("hospital")
+            or ""
+        ).strip()
+        feedback_signal = self._reliability_store.get_feedback_signal(
+            cin=current_cin,
+            provider=provider_name,
+        )
+        memory_signals: List[Dict[str, Any]] = list(memory_context)
+        if feedback_signal:
+            memory_signals.append(
+                {
+                    "signal_type": "human_feedback",
+                    "claim_id": feedback_signal.get("claim_id"),
+                    "outcome": feedback_signal.get("outcome"),
+                    "cin": feedback_signal.get("cin"),
+                    "provider": feedback_signal.get("provider"),
+                    "timestamp": feedback_signal.get("timestamp"),
+                }
+            )
+            system_flags.append("HUMAN_FEEDBACK_SIGNAL_USED")
 
         if memory_context:
             fraud_cases = [c for c in memory_context if c.get("fraud_label") in ("fraud", "suspicious")]
@@ -382,8 +2388,10 @@ class ClaimGuardV2Orchestrator:
             LOGGER.info("memory_context_empty claim_cin=%s", current_cin)
 
         # ── Step 2: Run agents sequentially ────────────────────────────────
+        print("STAGE: AGENTS")
         agent_outputs: List[AgentOutput] = []
         fraud_ring_analysis: Dict[str, Any] = {"fraud_rings": []}
+        agent_input_traces: List[Dict[str, Any]] = []
 
         for contract in SEQUENTIAL_AGENT_CONTRACTS:
             try:
@@ -397,6 +2405,25 @@ class ClaimGuardV2Orchestrator:
             tracker.update(contract.name, "RUNNING")
             started = perf_counter()
             llm = self._make_chat_llm(routing.model)
+            blackboard_before = blackboard.to_dict()
+            agent_input = blackboard.get_agent_input()
+            input_text_hash = hashlib.sha256(agent_input["text"].encode("utf-8")).hexdigest()
+            fields_used = sorted(list(agent_input.get("data", {}).keys()))
+            agent_input_traces.append(
+                {
+                    "agent": contract.name,
+                    "input_text_hash": input_text_hash,
+                    "fields_used": fields_used,
+                }
+            )
+            if forensic_enabled and forensic_trace is not None:
+                forensic_trace["raw_input_trace"].append(
+                    {
+                        "agent": contract.name,
+                        "received_input": blackboard.get_agent_input(),
+                        "blackboard_before": blackboard_before,
+                    }
+                )
             agent = Agent(
                 role=contract.name,
                 goal="Evaluate claim risk for your scope and produce calibrated output.",
@@ -409,13 +2436,34 @@ class ClaimGuardV2Orchestrator:
             )
             prompt = self._build_task_prompt(
                 contract=contract,
-                claim_request=claim_request,
                 blackboard=blackboard,
             )
+            prompt = f"INPUT_ID: {forensic_input_id}\n{prompt}"
+            assert "structured_data" not in prompt
+            assert "blackboard" not in prompt.lower()
+            try:
+                self._enforce_prompt_context(prompt)
+            except RuntimeError:
+                tracker.update(contract.name, "FAILED")
+                raise RuntimeError(f"PROMPT_MISSING_REQUIRED_CONTEXT:{contract.name}")
+            if forensic_enabled and forensic_trace is not None:
+                contains_claim_data = blackboard.extracted_text in prompt and _stable_json_dumps(blackboard.structured_data) in prompt
+                forensic_trace["prompt_trace"].append(
+                    {
+                        "agent": contract.name,
+                        "prompt": prompt,
+                        "contains_claim_data": contains_claim_data,
+                    }
+                )
+                if not contains_claim_data:
+                    forensic_trace["hard_failures"].append(
+                        f"PROMPT_MISSING_INPUT_DATA:{contract.name}"
+                    )
             task = Task(
                 description=prompt,
                 expected_output=(
-                    "JSON with keys: score, confidence, explanation, memory_insights"
+                    "JSON with keys: score, confidence, claims, hallucination_flags, "
+                    "explanation, memory_insights"
                 ),
                 agent=agent,
             )
@@ -426,7 +2474,10 @@ class ClaimGuardV2Orchestrator:
                 verbose=False,
             )
             try:
-                result = crew.kickoff()
+                with tracked_agent_context(contract.name):
+                    result = crew.kickoff()
+                if forensic_enabled and forensic_trace is not None:
+                    forensic_trace["llm_calls_count"] += 1
                 parsed = _safe_json_load(str(result))
             except Exception as exc:
                 tracker.update(contract.name, "FAILED")
@@ -437,12 +2488,44 @@ class ClaimGuardV2Orchestrator:
             
             score = float(parsed.get("score", 0.0))
             confidence = float(parsed.get("confidence", 0.0))
+            score, confidence = _normalize_score_confidence_scale(score, confidence)
             explanation = str(parsed.get("explanation", "No explanation provided"))
+            claims = _coerce_claims(parsed, explanation)
+            hallucination_flags = parsed.get("hallucination_flags", [])
+            if not isinstance(hallucination_flags, list):
+                hallucination_flags = []
+            raw_llm_response = str(result)
+            if forensic_enabled and forensic_trace is not None:
+                forensic_trace["response_trace"].append(
+                    {
+                        "agent": contract.name,
+                        "raw_llm_response": raw_llm_response,
+                        "parsed_output": parsed,
+                        "response_mentions_input_id": forensic_input_id in raw_llm_response,
+                    }
+                )
+                if forensic_input_id not in raw_llm_response:
+                    forensic_trace["hard_failures"].append(
+                        f"LLM_RESPONSE_MISSING_INPUT_MARKER:{contract.name}"
+                    )
 
             # Extract or synthesise memory_insights
             memory_insights = _parse_memory_insights(parsed)
             if memory_insights is None and memory_context:
-                memory_insights = _compute_fallback_memory_insights(memory_context, current_cin)
+                if forensic_enabled and forensic_trace is not None:
+                    forensic_trace["fallback_trace"].append(
+                        {
+                            "agent": contract.name,
+                            "fallback_type": "memory_insights_fallback",
+                            "explicitly_logged": True,
+                        }
+                    )
+                    if forensic_enabled:
+                        forensic_trace["hard_failures"].append(
+                            f"FALLBACK_USED_UNDER_FORENSIC_MODE:{contract.name}"
+                        )
+                else:
+                    memory_insights = _compute_fallback_memory_insights(memory_context, current_cin)
 
             if contract.name == "GraphRiskAgent":
                 graph_fields = self._resolve_graph_fields(claim_request)
@@ -476,6 +2559,138 @@ class ClaimGuardV2Orchestrator:
                 confidence = parsed["confidence"]
                 explanation = parsed["explanation"]
 
+            normalized = self._normalize_agent_output(
+                agent_name=contract.name,
+                score=score,
+                confidence=confidence,
+                explanation=explanation,
+                claim_request=claim_request,
+                validation_result=validation_result,
+            )
+            score = normalized["score"]
+            confidence = normalized["confidence"]
+            explanation = normalized["explanation"]
+            parsed["insufficient_data"] = normalized["insufficient_data"]
+            parsed["analysis_status"] = normalized["analysis_status"]
+            parsed_status = str(parsed.get("status", "")).strip().upper()
+            allowed_statuses = {"VERIFIED", "SUSPICIOUS", "INSUFFICIENT_DATA"}
+            if parsed_status not in allowed_statuses:
+                parsed_status = normalized["analysis_status"]
+            parsed["status"] = parsed_status
+            if self._agent_has_critical_failure(parsed, explanation):
+                failure_flag = f"AGENT_FAILURE_{contract.name.upper()}"
+                terminal_result = terminate_pipeline(
+                    reason=f"Agent failure: {contract.name}",
+                    flags=[failure_flag],
+                )
+                _log_pipeline_terminated("AGENTS", terminal_result["reason"])
+                _trace_stage(
+                    stage=f"AGENT_{contract.name}",
+                    status="FAIL",
+                    inputs={"agent_input": blackboard.get_agent_input()},
+                    outputs={"parsed": parsed},
+                    reason=str(terminal_result["reason"]),
+                    flags=[failure_flag],
+                    decision_snapshot="REJECTED",
+                )
+                _trace_stage(
+                    stage="AGENTS",
+                    status="FAIL",
+                    inputs={"failed_agent": contract.name},
+                    outputs={},
+                    reason=str(terminal_result["reason"]),
+                    flags=[failure_flag],
+                    decision_snapshot="REJECTED",
+                )
+                _trace_critical_stop(reason=str(terminal_result["reason"]), flags=[failure_flag])
+                tracker.update(contract.name, "FAILED")
+                for remaining in SEQUENTIAL_AGENT_CONTRACTS[SEQUENTIAL_AGENT_CONTRACTS.index(contract)+1:]:
+                    tracker.update(remaining.name, "SKIPPED")
+                tracker.update("Consensus", "SKIPPED")
+                system_flags.append(failure_flag)
+                return _finalize_response(
+                    exit_reason="critical_fields_unverified",
+                    agent_outputs=agent_outputs,
+                    blackboard={
+                        **blackboard.to_dict(),
+                        "field_verification": blackboard.field_verification,
+                        "verified_structured_data": blackboard.verified_structured_data,
+                        "field_verification_summary": verification_summary,
+                        "extraction_validation": extraction_validation,
+                        "critical_failures": [failure_flag],
+                        "input_trust": input_trust,
+                        "input_trust_score": input_trust_score,
+                        "pre_validation": pre_validation,
+                        "document_classification": doc_classification,
+                        "terminated": bool(terminal_result.get("terminated")),
+                    },
+                    routing_decision=routing,
+                    goa_used=False,
+                    Ts=0.0,
+                    decision=str(terminal_result["decision"]),
+                    retry_count=0,
+                    mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                    contradictions=[],
+                    trust_layer=None,
+                    memory_context=memory_context,
+                    validation_result=validation_result,
+                    pre_validation_result=PreValidationResult(
+                        score=0,
+                        confidence=100,
+                        status="REJECTED",
+                        reason=str(terminal_result["reason"]),
+                        flags=[failure_flag],
+                        document_type=str(pre_validation.get("document_type", "UNKNOWN")),
+                        injection_detected=bool(pre_validation.get("injection_detected", False)),
+                        passed=False,
+                    ),
+                    forensic_trace=forensic_trace,
+                    decision_trace={
+                        "claim_id": claim_id,
+                        "input_summary": input_summary,
+                        "ocr_snapshot": ocr_snapshot,
+                        "input_trust": input_trust,
+                        "agent_summaries": [],
+                        "contradictions": [],
+                        "Ts_score": 0.0,
+                        "decision_before_guard": "REJECTED",
+                        "final_decision": "REJECTED",
+                        "decision_reason": str(terminal_result["reason"]),
+                        "critical_failures": [failure_flag],
+                        "system_flags": sorted(set(system_flags)),
+                        "terminated": bool(terminal_result.get("terminated")),
+                    },
+                    reason=str(terminal_result["reason"]),
+                    system_flags=sorted(set(system_flags)),
+                )
+
+            if contract.name in {"PatternAgent", "GraphRiskAgent"} and memory_status != "OK":
+                penalty = 0.15 if memory_status == "DEGRADED" else 0.25
+                confidence = max(0.0, confidence - penalty)
+                parsed["insufficient_data"] = True
+                parsed["analysis_status"] = "INSUFFICIENT_DATA"
+                parsed["status"] = "INSUFFICIENT_DATA"
+                explanation = (
+                    f"{explanation} Memory status={memory_status}; confidence reduced "
+                    "because pattern detection memory is unavailable."
+                ).strip()
+
+            hallucination_eval = self._apply_hallucination_penalty(
+                score=score,
+                confidence=confidence,
+                explanation=explanation,
+                claims=claims,
+                hallucination_flags=hallucination_flags,
+                extracted_text=blackboard.extracted_text,
+                structured_data=blackboard.verified_structured_data,
+            )
+            score = float(hallucination_eval["score"])
+            confidence = float(hallucination_eval["confidence"])
+            parsed["claims"] = hallucination_eval["claims"]
+            parsed["hallucination_flags"] = hallucination_eval["hallucination_flags"]
+            parsed["hallucination_penalty"] = hallucination_eval["hallucination_penalty"]
+            parsed["debug_log"] = hallucination_eval["debug_log"]
+
             is_fraud = score >= 0.7
             tracker.update(contract.name, "COMPLETED", score=score, confidence=confidence, explanation=explanation, is_fraud=is_fraud)
             
@@ -486,24 +2701,102 @@ class ClaimGuardV2Orchestrator:
                 score=score,
                 confidence=confidence,
                 explanation=explanation,
+                claims=parsed.get("claims", []),
+                hallucination_flags=parsed.get("hallucination_flags", []),
+                hallucination_penalty=float(parsed.get("hallucination_penalty", 0.0)),
             )
+            blackboard_after = blackboard.to_dict()
+            if forensic_enabled and forensic_trace is not None:
+                output_payload = {
+                    "score": score,
+                    "confidence": confidence,
+                    "explanation": explanation,
+                    "claims": parsed.get("claims", []),
+                    "hallucination_flags": parsed.get("hallucination_flags", []),
+                    "hallucination_penalty": parsed.get("hallucination_penalty", 0.0),
+                    "analysis_status": parsed.get("analysis_status"),
+                    "insufficient_data": parsed.get("insufficient_data"),
+                }
+                output_hash = _stable_output_hash(output_payload)
+                forensic_trace["output_hashes"].append(
+                    {
+                        "agent": contract.name,
+                        "input_id": forensic_input_id,
+                        "hash_output": output_hash,
+                        "output": output_payload,
+                    }
+                )
+                previous = [
+                    h for h in forensic_trace["output_hashes"]
+                    if h["agent"] == contract.name and h["input_id"] != forensic_input_id and h["hash_output"] == output_hash
+                ]
+                if previous:
+                    forensic_trace["hash_collisions_across_inputs"].append(
+                        {
+                            "agent": contract.name,
+                            "hash_output": output_hash,
+                            "current_input_id": forensic_input_id,
+                            "previous_inputs": [p["input_id"] for p in previous],
+                        }
+                    )
+                    forensic_trace["hard_failures"].append(
+                        f"IDENTICAL_HASH_ACROSS_INPUTS:{contract.name}"
+                    )
+                forensic_trace["blackboard_flow_trace"].append(
+                    {
+                        "agent": contract.name,
+                        "reads": list(contract.requires),
+                        "blackboard_before": blackboard_before,
+                        "writes": {contract.name: output_payload},
+                        "blackboard_after": blackboard_after,
+                    }
+                )
+                forensic_trace["agent_forensic_trace"].append(
+                    {
+                        "agent": contract.name,
+                        "received_input": blackboard.get_agent_input(),
+                        "blackboard_before": blackboard_before,
+                        "prompt": prompt,
+                        "llm_called": True,
+                        "raw_response": raw_llm_response,
+                        "parsed_output": parsed,
+                        "output_hash": output_hash,
+                    }
+                )
+                if blackboard_before == blackboard_after:
+                    forensic_trace["hard_failures"].append(
+                        f"BLACKBOARD_UNCHANGED_AFTER_AGENT:{contract.name}"
+                    )
 
             output = AgentOutput(
                 agent=contract.name,
                 score=score,
                 confidence=confidence,
+                claims=parsed.get("claims", []),
+                hallucination_flags=parsed.get("hallucination_flags", []),
                 explanation=explanation,
+                hallucination_penalty=float(parsed.get("hallucination_penalty", 0.0)),
+                debug_log=parsed.get("debug_log"),
                 elapsed_ms=elapsed_ms,
                 input_snapshot={
                     "required_context": list(contract.requires),
                     "routing_model": routing.model,
                     "memory_cases_available": len(memory_context),
+                    "agent_input": blackboard.get_agent_input(),
                     "graph_context": graph_context if contract.name == "GraphRiskAgent" else {},
                 },
                 output_snapshot=parsed,
                 memory_insights=memory_insights,
             )
             agent_outputs.append(output)
+            _trace_stage(
+                stage=f"AGENT_{contract.name}",
+                status="PASS",
+                inputs=output.input_snapshot,
+                outputs=output.output_snapshot,
+                reason=output.explanation,
+                flags=list(output.hallucination_flags),
+            )
             LOGGER.info(
                 "v2_agent_complete agent=%s elapsed_ms=%s confidence=%.3f "
                 "memory_fraud_matches=%s input=%s output=%s",
@@ -515,8 +2808,8 @@ class ClaimGuardV2Orchestrator:
                 output.output_snapshot,
             )
 
-            # Early exit if identity is invalid
-            if contract.name == "IdentityAgent" and score > 0.8:
+            # Early exit if identity is invalid / highly unreliable.
+            if contract.name == "IdentityAgent" and score < 0.3:
                 tracker.update("IdentityAgent", "FAILED")
                 for remaining in SEQUENTIAL_AGENT_CONTRACTS[SEQUENTIAL_AGENT_CONTRACTS.index(contract)+1:]:
                     tracker.update(remaining.name, "SKIPPED")
@@ -536,13 +2829,205 @@ class ClaimGuardV2Orchestrator:
             blackboard_state["goa"] = goa_payload
         else:
             blackboard_state = blackboard.to_dict()
+        _trace_stage(
+            stage="AGENTS",
+            status="PASS",
+            inputs={"agents_expected": [c.name for c in SEQUENTIAL_AGENT_CONTRACTS]},
+            outputs={"agents_completed": [a.agent for a in agent_outputs]},
+            reason="All sequential agents completed",
+        )
         blackboard_state["fraud_ring_analysis"] = fraud_ring_analysis
+        blackboard_state["identity"] = identity_verification
+        blackboard_state["field_verification"] = blackboard.field_verification
+        blackboard_state["verified_structured_data"] = blackboard.verified_structured_data
+        blackboard_state["field_verification_summary"] = verification_summary
+        blackboard_state["extraction_validation"] = extraction_validation
+        blackboard_state["agent_input_traces"] = agent_input_traces
+        blackboard_state["input_trust"] = input_trust
+        blackboard_state["input_trust_score"] = input_trust_score
+        blackboard_state["memory_signals"] = memory_signals
+        blackboard_state["memory_status"] = memory_status
+        blackboard_state["pre_validation"] = pre_validation
+        blackboard_state["document_classification"] = doc_classification
+        if forensic_enabled and forensic_trace is not None:
+            hash_values = {item["input_text_hash"] for item in agent_input_traces}
+            if len(hash_values) > 1:
+                forensic_trace["hard_failures"].append("AGENT_TEXT_HASH_MISMATCH")
+            if not blackboard.extracted_text.strip():
+                forensic_trace["hard_failures"].append("EMPTY_EXTRACTED_TEXT")
+            if blackboard_state.get("entries", {}) == {}:
+                forensic_trace["hard_failures"].append("BLACKBOARD_NOT_CHANGING")
 
         # ── Step 4: Consensus ──────────────────────────────────────────────
+        print("STAGE: CONSENSUS")
+        if blackboard_state.get("terminated"):
+            _trace_stage(
+                stage="CONSENSUS",
+                status="SKIPPED",
+                inputs={"terminated": True},
+                outputs={},
+                reason="Terminated before consensus",
+                decision_snapshot="REJECTED",
+            )
+            return _finalize_response(
+                exit_reason="low_confidence",
+                agent_outputs=agent_outputs,
+                blackboard=blackboard_state,
+                routing_decision=routing,
+                goa_used=goa_used,
+                Ts=0.0,
+                decision="REJECTED",
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=memory_context,
+                validation_result=validation_result,
+                pre_validation_result=None,
+                forensic_trace=forensic_trace,
+                decision_trace={
+                    "claim_id": claim_id,
+                    "decision_before_guard": "REJECTED",
+                    "final_decision": "REJECTED",
+                    "decision_reason": "Terminated before consensus",
+                    "terminated": True,
+                },
+                reason="Terminated before consensus",
+                system_flags=sorted(set(system_flags)),
+                extracted_data=verified_structured_data,
+                pipeline_version="v2",
+            )
         tracker.update("Consensus", "RUNNING")
+        consensus_entries = dict(blackboard_state.get("entries", {}))
+        for ao in agent_outputs:
+            payload = dict(consensus_entries.get(ao.agent, {}))
+            payload["status"] = str(ao.output_snapshot.get("status", ""))
+            payload["insufficient_data"] = bool(ao.output_snapshot.get("insufficient_data", False))
+            payload["hallucination_flags"] = list(ao.hallucination_flags)
+            consensus_entries[ao.agent] = payload
+        consensus_entries["_meta"] = {
+            "missing_fields": extraction_validation.get("missing_fields", []),
+            "field_verification": blackboard.field_verification,
+            "unverified_critical_fields": int(verification_summary.get("unverified_critical_fields", 0)),
+            "has_unverified_fields": bool(verification_summary.get("has_unverified_fields", False)),
+            "pre_validation_failed": bool(pre_validation.get("failed", False)),
+            "critical_failures": sorted(set(critical_failures)),
+        }
         consensus_result = self._consensus_engine.evaluate(
             claim_request=claim_request,
-            entries=blackboard_state.get("entries", {}),
+            entries=consensus_entries,
+            blackboard={"memory_degraded": memory_status != "OK", "memory_status": memory_status},
+            config=self._consensus_config,
+        )
+        consensus_result["flags"] = dict(consensus_result.get("flags", {}))
+        critical_failures = list(consensus_result.get("critical_failures", []) or [])
+        if critical_failures:
+            system_flags.extend(critical_failures)
+        consensus_result["contradictions"] = list(consensus_result.get("contradictions", []))
+        force_human_review, force_reason = should_force_human_review(
+            agent_outputs=agent_outputs,
+            blackboard={"contradictions": consensus_result["contradictions"]},
+            config=self._consensus_config,
+        )
+        hallucination_agents = [ao.agent for ao in agent_outputs if ao.hallucination_flags]
+        contradiction_penalty_total = round(
+            sum(float(item.get("H_penalty", 0.0)) for item in consensus_result["contradictions"] if isinstance(item, dict)),
+            4,
+        )
+        consensus_result["hallucination_agents"] = hallucination_agents
+        consensus_result["hallucination_penalty_product"] = round(max(0.0, 1.0 - contradiction_penalty_total), 4)
+        consensus_result["hallucination_force_human_review"] = force_human_review
+        consensus_result["flags"]["hallucination_force_reason"] = force_reason
+        if force_human_review:
+            consensus_result["decision"] = "HUMAN_REVIEW"
+            consensus_result["Ts"] = round(
+                min(consensus_result["Ts"], self._consensus_config.auto_approve_threshold - 0.01),
+                2,
+            )
+            system_flags.append("HALLUCINATION_FORCE_HUMAN_REVIEW")
+        blackboard_state["insufficient_agents"] = consensus_result.get("insufficient_agents", [])
+        blackboard_state["insufficient_force_human_review"] = consensus_result.get("insufficient_force_human_review", False)
+        blackboard_state["hallucination_agents"] = consensus_result.get("hallucination_agents", [])
+        blackboard_state["hallucination_force_human_review"] = consensus_result.get("hallucination_force_human_review", False)
+        blackboard_state["hallucination_penalty_product"] = consensus_result.get("hallucination_penalty_product", 1.0)
+        blackboard_state["force_human_review"] = force_human_review
+        blackboard_state["flags"] = dict(blackboard_state.get("flags", {}))
+        blackboard_state["flags"]["hallucination_force_reason"] = force_reason
+        blackboard_state["field_verification_penalty"] = consensus_result.get("field_verification_penalty", 0.0)
+        blackboard_state["unverified_critical_fields"] = consensus_result.get("unverified_critical_fields", 0)
+        blackboard_state["critical_failures"] = critical_failures
+
+        # Approval guard: never auto-approve if confidence/data quality gates fail.
+        if consensus_result["decision"] == "APPROVED":
+            critical_agents = {"IdentityAgent", "DocumentAgent", "PolicyAgent"}
+            consensus_entries = consensus_result.get("entries", {})
+            critical_conf_ok = all(
+                float(consensus_entries.get(agent, {}).get("confidence", 0.0)) >= 0.7
+                for agent in critical_agents
+            )
+            no_insufficient_flags = not consensus_result.get("insufficient_agents", [])
+            document_valid = validation_result.validation_status == "VALID"
+            no_unverified_fields = not verification_summary.get("has_unverified_fields", False)
+            if not (critical_conf_ok and no_insufficient_flags and document_valid and no_unverified_fields):
+                consensus_result["decision"] = "HUMAN_REVIEW"
+                system_flags.append("APPROVAL_GUARD_DOWNGRADED")
+        severe_contradiction = any(bool(item.get("severe")) for item in consensus_result.get("contradictions", []))
+        has_hallucinations = bool(consensus_result.get("hallucination_force_human_review"))
+        has_two_insufficient = bool(consensus_result.get("insufficient_force_human_review"))
+        if severe_contradiction:
+            system_flags.append("SEVERE_CONTRADICTION_DETECTED")
+        if has_hallucinations:
+            system_flags.append("HALLUCINATION_FLAGS_PRESENT")
+        if has_two_insufficient:
+            system_flags.append("MULTI_AGENT_INSUFFICIENT_DATA")
+        if verification_summary.get("has_unverified_fields", False):
+            system_flags.append("UNVERIFIED_FIELDS_PRESENT")
+        if severe_contradiction or has_two_insufficient:
+            consensus_result["decision"] = "HUMAN_REVIEW"
+        memory_degraded = memory_status != "OK"
+        blackboard_state["memory_degraded"] = memory_degraded
+        blackboard_state["flags"]["memory_degraded"] = memory_degraded
+        if memory_degraded:
+            system_flags.append("memory_degraded")
+            threshold = self._memory_config.degraded_memory_auto_approve_threshold
+            if consensus_result["decision"] == "APPROVED" and consensus_result["Ts"] < threshold:
+                consensus_result["decision"] = "HUMAN_REVIEW"
+                system_flags.append("MEMORY_PATTERN_GUARD_HUMAN_REVIEW")
+
+        # Global enforcement rule
+        critical_agents = {"IdentityAgent", "DocumentAgent", "PolicyAgent"}
+        critical_conf_ok = all(
+            float(consensus_result.get("entries", {}).get(agent, {}).get("confidence", 0.0)) >= 0.7
+            for agent in critical_agents
+        )
+        if (
+            consensus_result["decision"] == "APPROVED"
+            and (
+                input_trust_score < 70
+                or bool(consensus_result.get("contradictions"))
+                or has_hallucinations
+                or not critical_conf_ok
+                or self._reliability_store.is_auto_approve_disabled()
+                or not external_validation.ok
+                or verification_summary.get("has_unverified_fields", False)
+            )
+        ):
+            consensus_result["decision"] = "HUMAN_REVIEW"
+            system_flags.append("GLOBAL_ENFORCEMENT_GUARD")
+        feedback_outcome = str(feedback_signal.get("outcome", "")).upper()
+        if feedback_outcome in {"REJECTED", "FRAUD", "SUSPICIOUS"}:
+            consensus_result["Ts"] = round(max(0.0, consensus_result["Ts"] - 10.0), 2)
+            system_flags.append("HUMAN_FEEDBACK_RISK_PENALTY")
+            if consensus_result["decision"] == "APPROVED":
+                consensus_result["decision"] = "HUMAN_REVIEW"
+        _trace_stage(
+            stage="CONSENSUS",
+            status="PASS",
+            inputs={"agent_count": len(agent_outputs), "verification_summary": verification_summary},
+            outputs={"consensus_result": consensus_result},
+            reason="Consensus rules and safeguards applied",
+            flags=sorted(set(system_flags)),
+            decision_snapshot=str(consensus_result.get("decision", "")),
         )
         tracker.update("Consensus", "COMPLETED")
         
@@ -560,43 +3045,332 @@ class ClaimGuardV2Orchestrator:
             consensus_result["retry_count"],
             consensus_result["score_evolution"],
         )
+        decision_before_guard = consensus_result["decision"]
+        if forensic_enabled and forensic_trace is not None:
+            forensic_trace["final_decision_trace"] = {
+                "Ts": consensus_result["Ts"],
+                "decision_before_guard": decision_before_guard,
+                "decision_after_guard": consensus_result["decision"],
+                "reason": "Consensus and approval guard evaluation completed",
+            }
+
+            prompt_texts = [entry["prompt"] for entry in forensic_trace["prompt_trace"]]
+            if len(set(prompt_texts)) <= 1 and len(prompt_texts) > 1:
+                forensic_trace["hard_failures"].append("PROMPT_STATIC_ACROSS_AGENTS_OR_INPUTS")
+            if forensic_trace["llm_calls_count"] == 0:
+                forensic_trace["hard_failures"].append("LLM_NOT_INVOKED")
+            if "APPROVED" == consensus_result["decision"] and claim_request.get("metadata", {}).get("forensic_random_input", False):
+                forensic_trace["hard_failures"].append("INVALID_INPUT_APPROVED")
+            if Crew.__name__.lower().startswith("_strict") or Crew.__name__.lower().startswith("fake"):
+                forensic_trace["simulation_or_stub_detected"] = True
+                forensic_trace["hard_failures"].append("SIMULATION_OR_STUB_MODE_DETECTED")
+
+            known_templates = [
+                "No explanation provided",
+                "Insufficient data to perform reliable analysis",
+                "Cannot establish baseline — insufficient history",
+            ]
+            for item in forensic_trace["response_trace"]:
+                response_text = str(item.get("raw_llm_response", ""))
+                for template in known_templates:
+                    if template in response_text:
+                        forensic_trace["known_template_matches"].append(
+                            {"agent": item["agent"], "template": template}
+                        )
+            if forensic_trace["known_template_matches"]:
+                forensic_trace["hard_failures"].append("KNOWN_TEMPLATE_RESPONSES_DETECTED")
+
+            differentiation = self._run_forensic_input_differentiation_test(
+                routing=routing,
+                claim_request=claim_request,
+            )
+            forensic_trace["input_differentiation_test"] = differentiation
+            forensic_trace["hard_failures"].extend(differentiation.get("failures", []))
+            for item in differentiation.get("results", []):
+                per_input = item.get("per_input", {})
+                hash_a = per_input.get("A", {}).get("output_hash")
+                hash_b = per_input.get("B", {}).get("output_hash")
+                if hash_a and hash_a == hash_b:
+                    forensic_trace["hash_collisions_across_inputs"].append(
+                        {
+                            "agent": item["agent"],
+                            "hash_output": hash_a,
+                            "inputs": ["A", "B"],
+                        }
+                    )
+            forensic_trace["hard_failures"] = sorted(set(forensic_trace["hard_failures"]))
+            forensic_trace["broken"] = bool(forensic_trace["hard_failures"])
+            forensic_trace["system_status"] = "BROKEN" if forensic_trace["broken"] else "WORKING"
+            all_outputs: List[Dict[str, Any]] = []
+            for row in differentiation.get("results", []):
+                per_input = row.get("per_input", {})
+                for key in ("A", "B", "C"):
+                    item = per_input.get(key, {})
+                    if item:
+                        all_outputs.append(
+                            {
+                                "agent": row.get("agent"),
+                                "input": key,
+                                "score": item.get("score"),
+                                "confidence": item.get("confidence"),
+                                "explanation": item.get("explanation"),
+                            }
+                        )
+            entropy = _output_entropy(all_outputs)
+            if entropy < 0.35:
+                forensic_trace["hard_failures"].append("OUTPUT_ENTROPY_TOO_LOW")
+            llm_calls_per_agent: Dict[str, int] = {}
+            for row in forensic_trace.get("agent_forensic_trace", []):
+                name = str(row.get("agent"))
+                llm_calls_per_agent[name] = llm_calls_per_agent.get(name, 0) + int(bool(row.get("llm_called")))
+            if any(
+                trace.get("decision") == "APPROVED" and trace.get("input_type") in {"B", "C"}
+                for trace in [
+                    {
+                        "input_type": "B" if "random" in str(claim_request.get("metadata", {}).get("claim_id", "")).lower() else "A",
+                        "decision": consensus_result["decision"],
+                    }
+                ]
+            ):
+                forensic_trace["hard_failures"].append("INVALID_INPUT_APPROVED")
+            forensic_trace["hard_failures"] = sorted(set(forensic_trace["hard_failures"]))
+            forensic_trace["broken"] = bool(forensic_trace["hard_failures"])
+            forensic_trace["system_status"] = "BROKEN" if forensic_trace["broken"] else "WORKING"
+            forensic_trace["final_audit_report"] = {
+                "system_status": forensic_trace["system_status"],
+                "input_integrity": "PASS" if "EMPTY_PARSED_CLAIM_DATA" not in forensic_trace["hard_failures"] else "FAIL",
+                "llm_usage": {
+                    "total_calls": forensic_trace["llm_calls_count"],
+                    "calls_per_agent": llm_calls_per_agent,
+                    "status": "PASS" if forensic_trace["llm_calls_count"] > 0 else "FAIL",
+                },
+                "prompt_quality": {
+                    "status": "FAIL" if any("PROMPT_" in f for f in forensic_trace["hard_failures"]) else "PASS",
+                    "details": forensic_trace["prompt_trace"],
+                },
+                "agent_variability": {
+                    "entropy": round(entropy, 4),
+                    "status": "FAIL" if "OUTPUT_ENTROPY_TOO_LOW" in forensic_trace["hard_failures"] else "PASS",
+                },
+                "decision_integrity": {
+                    "status": "FAIL" if "INVALID_INPUT_APPROVED" in forensic_trace["hard_failures"] else "PASS",
+                    "trace": forensic_trace["final_decision_trace"],
+                },
+                "critical_failures": forensic_trace["hard_failures"],
+                "root_cause_analysis": [
+                    "input not passed to agents",
+                    "static prompt",
+                    "LLM not connected",
+                    "decision override bug",
+                ],
+                "fix_recommendations": [
+                    "Inject structured claim fields directly into every agent prompt.",
+                    "Enforce per-agent prompt templates with dynamic data assertions.",
+                    "Block pipeline completion when LLM calls are zero.",
+                    "Require blackboard diff checks between sequential agents.",
+                    "Force HUMAN_REVIEW for empty/random inputs.",
+                ],
+            }
+
+        metrics = self._reliability_store.push_decision_metrics(
+            decision=consensus_result["decision"],
+            ts=consensus_result["Ts"],
+        )
+        if metrics.get("system_alert"):
+            system_flags.append("SYSTEM_ALERT_APPROVAL_SPIKE")
+        if metrics.get("approved_disabled"):
+            system_flags.append("APPROVED_DISABLED_RATE_LIMIT")
+
+        # Stability test: deterministic re-evaluation from the same consensus inputs.
+        stability_runs: List[Dict[str, Any]] = []
+        stability_fail = False
+        expected_decision = consensus_result["decision"]
+        expected_ts = consensus_result["Ts"]
+        for _ in range(3):
+            rerun = self._consensus_engine.evaluate(
+                claim_request=claim_request,
+                entries=consensus_entries,
+                blackboard={"memory_degraded": memory_status != "OK", "memory_status": memory_status},
+                config=self._consensus_config,
+            )
+            snapshot = {"Ts": rerun["Ts"], "decision": rerun["decision"]}
+            stability_runs.append(snapshot)
+            if snapshot["decision"] != expected_decision or abs(snapshot["Ts"] - expected_ts) > 1e-9:
+                stability_fail = True
+        if stability_fail:
+            system_flags.append("DECISION_STABILITY_FAIL")
+            consensus_result["decision"] = "HUMAN_REVIEW"
+
+        agent_summaries = [
+            {
+                "agent": ao.agent,
+                "score": round(float(ao.score) * 100, 2),
+                "confidence": round(float(ao.confidence) * 100, 2),
+                "status": str(ao.output_snapshot.get("status", "")),
+                "key_evidence": ao.output_snapshot.get("claims", []),
+                "reasoning_summary": ao.explanation,
+                "hallucination_flags": ao.hallucination_flags,
+            }
+            for ao in agent_outputs
+        ]
+        decision_trace = {
+            "claim_id": claim_id,
+            "input_summary": input_summary,
+            "ocr_snapshot": ocr_snapshot,
+            "input_trust": input_trust,
+            "field_verification": blackboard.field_verification,
+            "field_verification_summary": verification_summary,
+            "agent_summaries": agent_summaries,
+            "memory_signals": memory_signals,
+            "memory_status": memory_status,
+            "contradictions": consensus_result.get("contradictions", []),
+            "Ts_score": consensus_result["Ts"],
+            "decision_before_guard": decision_before_guard,
+            "final_decision": consensus_result["decision"],
+            "decision_reason": _HARD_REJECTION_REASON if critical_failures else "Reliability trust rules enforced",
+            "critical_failures": critical_failures,
+            "system_flags": sorted(set(system_flags)),
+            "system_metrics": metrics,
+            "stability_test": {"runs": stability_runs, "stable": not stability_fail},
+            "proof_trace": trace_engine.export(),
+        }
+        contradiction_penalty = sum(
+            float(item.get("H_penalty", 0.0)) for item in consensus_result.get("contradictions", [])
+        )
+        dispute_risk = (
+            abs(float(consensus_result["Ts"]) - 90.0) <= 5.0
+            or contradiction_penalty >= 0.25
+            or memory_degraded
+        )
+        blackboard_state["dispute_risk"] = dispute_risk
+        blackboard_state["flags"]["dispute_risk"] = dispute_risk
+        trace_hash = self._reliability_store.persist_decision_trace(claim_id, decision_trace)
+        decision_trace["trace_hash"] = trace_hash
+        decision_trace["trace_anchor_tx"] = None
+
+        replay_package = {
+            "raw_input": claim_request,
+            "ocr_output": {"text": extracted_text, "structured_data": structured_data},
+            "prompts_used": [row.get("prompt") for row in (forensic_trace or {}).get("prompt_trace", [])],
+            "agent_outputs": [item.model_dump() for item in agent_outputs],
+            "consensus_entries": consensus_entries,
+            "decision": consensus_result["decision"],
+            "Ts": consensus_result["Ts"],
+            "decision_trace_hash": trace_hash,
+        }
+        replay_package["replay_hash"] = hash_payload(replay_package)
+        self._reliability_store.register_replay_package(claim_id, replay_package)
+
+        final_outcome = _exit_from_ts(float(consensus_result.get("Ts", 0.0)))
+        FINAL_DECISION = str(final_outcome["decision"]).upper()
+        FINAL_EXIT_REASON = str(final_outcome["exit_reason"])
+        assert FINAL_DECISION in ["APPROVED", "REJECTED", "HUMAN_REVIEW"]
+
+        human_review_reason = None
+        if FINAL_DECISION == "HUMAN_REVIEW":
+            if 60.0 <= float(consensus_result["Ts"]) < 75.0:
+                human_review_reason = "Uncertain / requires human validation"
+                system_flags.append("HUMAN_REVIEW_TS_WINDOW")
+            else:
+                human_review_reason = "Manual review required by trust safeguards"
+
+        consensus_result["decision"] = FINAL_DECISION
+        blackboard_state["terminated"] = FINAL_DECISION == "HUMAN_REVIEW"
+        decision_trace["final_decision"] = FINAL_DECISION
+        decision_trace["decision_reason"] = (
+            _HARD_REJECTION_REASON
+            if FINAL_DECISION == "REJECTED"
+            else (human_review_reason or "Reliability trust rules enforced")
+        )
+        decision_trace["terminated"] = blackboard_state["terminated"]
+
+        document_url = None
+        heatmap: List[Dict[str, Any]] = []
+        heatmap_fallback: List[Dict[str, Any]] = []
+        if FINAL_DECISION == "HUMAN_REVIEW":
+            review_context = self._register_human_review_context(
+                claim_id=claim_id,
+                claim_request=claim_request,
+                ts_score=float(consensus_result["Ts"]),
+                reason=human_review_reason or "Manual review required",
+                verified_fields=verified_structured_data,
+                agent_outputs=agent_outputs,
+                blackboard_snapshot=blackboard_state,
+            )
+            document_url = str(review_context.get("document_url") or "") or None
+            heatmap = list(review_context.get("heatmap", []))
+            heatmap_fallback = list(review_context.get("heatmap_fallback", []))
+            decision_trace["final_decision"] = "HUMAN_REVIEW"
+            decision_trace["decision_reason"] = human_review_reason or decision_trace.get("decision_reason", "")
+        _trace_stage(
+            stage="FINAL_DECISION",
+            status="PASS" if FINAL_DECISION != "REJECTED" else "FAIL",
+            inputs={"Ts": consensus_result["Ts"], "decision_before_guard": decision_before_guard},
+            outputs={"final_decision": FINAL_DECISION},
+            reason=str(decision_trace.get("decision_reason", "")),
+            flags=sorted(set(system_flags)),
+            decision_snapshot=FINAL_DECISION,
+        )
 
         # ── Step 5: Trust layer ────────────────────────────────────────────
         trust_layer_payload = None
-        try:
-            trust_layer_payload = self._trust_layer.process_if_applicable(
-                claim_id=claim_id,
-                decision=consensus_result["decision"],
-                ts_score=consensus_result["Ts"],
-                claim_request=claim_request,
-                agent_outputs=[item.model_dump() for item in agent_outputs],
-            )
-        except TrustLayerIPFSFailure:
-            raise
-        except Exception as exc:
-            LOGGER.exception("trust_layer_unexpected_error claim_id=%s error=%s", claim_id, exc)
+        if FINAL_DECISION == "APPROVED":
+            try:
+                trust_layer_payload = self._trust_layer.process_approved_claim(
+                    {
+                        "claim_id": claim_id,
+                        "decision": FINAL_DECISION,
+                        "ts_score": consensus_result["Ts"],
+                        "claim_request": claim_request,
+                        "agent_outputs": [item.model_dump() for item in agent_outputs],
+                        "flags": system_flags,
+                    }
+                )
+            except TrustLayerIPFSFailure:
+                raise
+            except Exception as exc:
+                LOGGER.exception("trust_layer_unexpected_error claim_id=%s error=%s", claim_id, exc)
+        _trace_stage(
+            stage="TRUST_LAYER",
+            status="PASS" if bool(trust_layer_payload) else ("SKIPPED" if FINAL_DECISION != "APPROVED" else "FAIL"),
+            inputs={"final_decision": FINAL_DECISION},
+            outputs={"trust_layer": trust_layer_payload or {}},
+            reason="Trust layer anchoring completed" if trust_layer_payload else "Trust layer skipped or unavailable",
+        )
 
         # ── Step 7: Store claim in memory AFTER consensus ──────────────────
         self._store_claim_in_memory(
             claim_id=claim_id,
             claim_request=claim_request,
             agent_outputs=agent_outputs,
-            decision=consensus_result["decision"],
+            decision=FINAL_DECISION,
             ts_score=consensus_result["Ts"],
         )
 
-        return ClaimGuardV2Response(
+        return _finalize_response(
+            exit_reason=FINAL_EXIT_REASON,
             agent_outputs=agent_outputs,
             blackboard=blackboard_state,
             routing_decision=routing,
             goa_used=goa_used,
             Ts=consensus_result["Ts"],
-            decision=consensus_result["decision"],
+            decision=FINAL_DECISION,
             retry_count=consensus_result["retry_count"],
             mahic_breakdown=consensus_result["mahic_breakdown"],
             contradictions=consensus_result["contradictions"],
-            trust_layer=trust_layer_payload.model_dump() if trust_layer_payload else None,
+            trust_layer=trust_layer_payload if trust_layer_payload else None,
             memory_context=memory_context,
+            validation_result=validation_result,
+            pre_validation_result=None,
+            forensic_trace=forensic_trace,
+            decision_trace=decision_trace,
+            system_flags=sorted(set(system_flags)),
+            reason=human_review_reason,
+            document_url=document_url,
+            extracted_data=verified_structured_data,
+            heatmap=heatmap,
+            heatmap_fallback=heatmap_fallback,
+            pipeline_version="v2",
         )
 
     def _store_claim_in_memory(
@@ -654,6 +3428,64 @@ class ClaimGuardV2Orchestrator:
         except Exception as exc:
             LOGGER.error("memory_store_claim_failed claim_id=%s error=%s", claim_id, exc)
 
+    def replay(self, claim_id: str) -> Dict[str, Any]:
+        package = self._reliability_store.get_replay_package(claim_id)
+        if not package:
+            trace = self._reliability_store.get_trace(claim_id)
+            if not trace:
+                raise KeyError(f"No replay data found for claim {claim_id}")
+            return {
+                "claim_id": claim_id,
+                "status": "trace_only",
+                "stored_trace_hash": trace.get("trace_hash"),
+            }
+        rerun = self._consensus_engine.evaluate(
+            claim_request=package.get("raw_input", {}),
+            entries=package.get("consensus_entries", {}),
+            blackboard={
+                "memory_degraded": bool(package.get("memory_status", False)),
+                "memory_status": str(package.get("memory_status", "")),
+            },
+        )
+        same_decision = rerun.get("decision") == package.get("decision")
+        same_ts = abs(float(rerun.get("Ts", 0.0)) - float(package.get("Ts", 0.0))) <= 1e-9
+        return {
+            "claim_id": claim_id,
+            "replayed_decision": rerun.get("decision"),
+            "replayed_Ts": rerun.get("Ts"),
+            "original_decision": package.get("decision"),
+            "original_Ts": package.get("Ts"),
+            "deterministic_match": bool(same_decision and same_ts),
+            "replay_hash": package.get("replay_hash"),
+        }
+
+    def get_proof_trace(self, claim_id: str) -> Dict[str, Any] | None:
+        payload = self._reliability_store.get_trace(claim_id)
+        if not payload:
+            return None
+        trace = payload.get("trace", {}) if isinstance(payload, dict) else {}
+        proof_trace = trace.get("proof_trace") if isinstance(trace, dict) else None
+        return proof_trace if isinstance(proof_trace, dict) else None
+
+    def record_human_feedback(
+        self,
+        *,
+        claim_id: str,
+        outcome: str,
+        reviewer_id: str,
+        cin: str,
+        provider: str,
+        ip_address: str = "",
+    ) -> Dict[str, Any]:
+        return self._reliability_store.add_human_feedback(
+            claim_id=claim_id,
+            outcome=outcome,
+            reviewer_id=reviewer_id,
+            cin=cin,
+            provider=provider,
+            ip_address=ip_address,
+        )
+
     def get_fraud_graph_debug(self, *, render_png: bool = False) -> Dict[str, Any]:
         rings = self._fraud_ring_graph.detect_fraud_rings()
         payload: Dict[str, Any] = {
@@ -678,3 +3510,7 @@ def get_v2_orchestrator() -> ClaimGuardV2Orchestrator:
     if _singleton is None:
         _singleton = ClaimGuardV2Orchestrator()
     return _singleton
+
+
+def run_pipeline_v2(claim_request: Dict[str, Any]) -> ClaimGuardV2Response:
+    return get_v2_orchestrator().run(claim_request)

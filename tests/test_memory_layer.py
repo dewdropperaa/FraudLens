@@ -1089,7 +1089,7 @@ def test_case_memory_entry_embedding_text_includes_all_fields() -> None:
 
 def test_decision_to_fraud_label_mapping() -> None:
     """decision_to_fraud_label must correctly map all decision types."""
-    assert decision_to_fraud_label("AUTO_APPROVE", 95.0) == "clean"
+    assert decision_to_fraud_label("APPROVED", 95.0) == "clean"
     assert decision_to_fraud_label("REJECTED", 20.0) == "fraud"
     assert decision_to_fraud_label("REFLEXIVE_TRIGGER", 30.0) == "fraud"
     assert decision_to_fraud_label("HUMAN_REVIEW", 75.0) == "suspicious"
@@ -1142,7 +1142,12 @@ def test_blackboard_memory_context_injection() -> None:
     routing = RoutingDecision(
         intent="general_claim", complexity="simple", model="mistral", reason="test"
     )
-    bb = SharedBlackboard({}, routing)
+    bb = SharedBlackboard(
+        {},
+        routing,
+        extracted_text="memory test text",
+        structured_data={"cin": "", "amount": "", "date": "", "provider": ""},
+    )
     assert bb.memory_context == []
 
     cases = [

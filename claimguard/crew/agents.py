@@ -20,7 +20,7 @@ from claimguard.crew.tools import (
     PatternClaimTool,
     PolicyClaimTool,
 )
-from claimguard.llm_factory import get_llm
+from claimguard.llm_factory import get_crewai_llm
 
 
 def build_fraud_agents(model_name: str) -> list[Agent]:
@@ -85,7 +85,7 @@ def build_fraud_agents(model_name: str) -> list[Agent]:
                 goal=goal,
                 backstory=backstory,
                 tools=[tool_instance],
-                llm=get_llm(model_name),
+                llm=get_crewai_llm(model_name),
                 verbose=False,
                 allow_delegation=False,
             )
