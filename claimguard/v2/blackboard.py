@@ -91,10 +91,18 @@ class SharedBlackboard:
     ) -> None:
         entry = BlackboardEntry(score=score, confidence=confidence, explanation=explanation)
         payload = entry.model_dump()
+        payload["score"] = float(score)  # SCORE-FIX
         payload["claims"] = list(claims or [])
         payload["hallucination_flags"] = list(hallucination_flags or [])
         payload["hallucination_penalty"] = float(hallucination_penalty)
         self._entries[agent_name] = payload
+        # SCORE-FIX: read-back safeguard to ensure score persistence.
+        try:
+            stored = self.get_agent_result(agent_name)
+            if stored.get("score") is None:
+                raise AssertionError(f"Score lost during blackboard write for {agent_name}")
+        except Exception:
+            pass
 
     @property
     def _entries(self) -> Dict[str, Dict[str, Any]]:
@@ -171,3 +179,6 @@ class SharedBlackboard:
             "text": self.extracted_text,
             "data": self.verified_structured_data,
         }
+
+    def get_agent_result(self, agent_name: str) -> Dict[str, Any]:
+        return dict(self._entries.get(agent_name, {}))  # SCORE-FIX

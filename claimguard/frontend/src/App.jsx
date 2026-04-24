@@ -229,7 +229,14 @@ export default function App() {
       console.log('FINAL DECISION FROM BACKEND:', body?.decision)
       setLastResult(body?.data != null ? body.data : body)
       const normalizedResult = body?.data != null ? body.data : body
-      if (normalizedResult?.decision === 'HUMAN_REVIEW' && normalizedResult?.claim_id) {
+      // PROD-FIX: route directly to investigator when backend requests it.
+      if (normalizedResult?.routed_to === 'INVESTIGATOR' && normalizedResult?.claim_id && canInvestigate) {
+        setInvestigationClaimId(normalizedResult.claim_id)
+        setActivePage('investigation-claim')
+        if (typeof window !== 'undefined') {
+          window.history.replaceState({ result: normalizedResult, source: 'auto_route' }, '', `/investigation/${normalizedResult.claim_id}`)
+        }
+      } else if (normalizedResult?.decision === 'HUMAN_REVIEW' && normalizedResult?.claim_id && canInvestigate) {
         setInvestigationClaimId(normalizedResult.claim_id)
         setActivePage('investigation-claim')
         if (typeof window !== 'undefined') {

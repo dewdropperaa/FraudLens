@@ -43,7 +43,7 @@ def test_memory_health_healthy_path() -> None:
     assert report.failure_reason == ""
 
 
-def test_memory_health_degraded_applies_confidence_penalty() -> None:
+def test_memory_health_degraded_is_informational_no_confidence_penalty() -> None:
     engine = ConsensusEngine()
     entries = {
         "PatternAgent": {"score": 0.7, "confidence": 0.9, "explanation": "p"},
@@ -55,8 +55,8 @@ def test_memory_health_degraded_applies_confidence_penalty() -> None:
         blackboard={"memory_degraded": True, "memory_status": "DEGRADED"},
         config=ConsensusConfig(degraded_memory_penalty=0.15, unavailable_memory_penalty=0.25),
     )
-    assert result["entries"]["PatternAgent"]["confidence"] == 0.75
-    assert result["entries"]["GraphRiskAgent"]["confidence"] == 0.75
+    assert result["entries"]["PatternAgent"]["confidence"] == 0.9
+    assert result["entries"]["GraphRiskAgent"]["confidence"] == 0.9
 
 
 def test_memory_degraded_blocks_auto_approve_below_threshold(monkeypatch) -> None:

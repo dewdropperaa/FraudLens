@@ -65,12 +65,38 @@ class GraphAgent(BaseAgent):
             },
         )
         graph_out = self.analyze_graph_risk(claim_data)
-        fraud_probability = float(graph_out.get("fraud_probability", 0.5))
-        score = max(0.0, min(100.0, round((1.0 - fraud_probability) * 100.0, 2)))
-        reasoning = (
-            f"Graph risk uses structured graph features and tool signals; "
-            f"fraud_probability={fraud_probability:.4f}"
-        )
+        memory_status = str(claim_data.get("memory_status") or "").upper()
+        if memory_status == "DISABLED":  # SCORE-FIX
+            score = 75.0
+            reasoning = "Graphe de risque non disponible — analyse réseau ignorée"
+            payload = {
+                "agent_name": self.name,
+                "decision": True,
+                "score": score,
+                "confidence": 0.75,
+                "reasoning": reasoning,
+                "explanation": reasoning,
+                "details": {"graph_output": graph_out, "tool_results": tool_results},
+            }
+            return self._build_result(status="DONE", score=score, reason=reasoning, output=payload, flags=["GRAPH_UNAVAILABLE"])
+        score = 100.0
+        flags: list[str] = []  # SCORE-FIX
+        if bool(graph_out.get("in_fraud_ring")):
+            score -= 50
+            flags.append("IN_FRAUD_RING")
+        if bool(graph_out.get("connected_flagged_provider")):
+            score -= 30
+            flags.append("CONNECTED_FLAGGED_PROVIDER")
+        if bool(graph_out.get("connected_flagged_patient")):
+            score -= 25
+            flags.append("CONNECTED_FLAGGED_PATIENT")
+        if bool(graph_out.get("suspicious_network_density")):
+            score -= 15
+            flags.append("SUSPICIOUS_DENSITY")
+        if not flags:
+            score += 5
+        score = max(0.0, min(100.0, round(score, 2)))
+        reasoning = "Analyse graphe realisee selon les connexions reseau detectees"
         llm_fallback = self.should_use_llm_fallback(tool_results)
         if llm_fallback:
             print("[LLM FALLBACK USED] True")
@@ -82,6 +108,7 @@ class GraphAgent(BaseAgent):
         else:
             print("[LLM FALLBACK USED] False")
 
+        fraud_probability = float(graph_out.get("fraud_probability") or 0.0)
         payload = {
             "agent_name": self.name,
             "decision": score > 60 and fraud_probability < 0.5,
@@ -92,10 +119,10 @@ class GraphAgent(BaseAgent):
             "details": {"graph_output": graph_out, "tool_results": tool_results},
         }
         self.enforce_tool_trace(tool_results, llm_fallback)
-        return self.build_agent_result(
-            output=payload,
+        return self._build_result(  # SCORE-FIX
+            status="DONE",
             score=float(payload["score"]),
             reason=reasoning,
-            tools_used=list(tool_results.keys()),
-            llm_fallback_used=llm_fallback,
+            output=payload,
+            flags=flags,
         )

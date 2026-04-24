@@ -158,63 +158,45 @@ class DocumentAgent(BaseAgent):
     ) -> Dict[str, Any]:
         score = 100.0
         reasoning: List[str] = []
+        flags: List[str] = []  # SCORE-FIX
         details: Dict[str, Any] = {}
 
         extractions = list(ocr_output.get("extractions") or [])
         effective_count = max(len(documents), int(ocr_output.get("extraction_count") or 0))
         total_text_len = int(ocr_output.get("total_text_len") or 0)
 
-        if effective_count == 0:
-            score -= 40
-            reasoning.append("No documents submitted")
-            details["doc_count"] = 0
-        elif effective_count < 2:
-            score -= 10
-            reasoning.append("Insufficient documentation — only one document provided")
-            details["doc_count"] = effective_count
-        else:
-            details["doc_count"] = effective_count
+        details["doc_count"] = effective_count
 
         missing_docs = list(doc_classification.get("missing_docs") or [])
         found_docs = list(doc_classification.get("found_docs") or [])
 
         if missing_docs:
-            penalty_per_doc = 5
-            score -= penalty_per_doc * len(missing_docs)
-            reasoning.append(f"Missing required documents: {', '.join(missing_docs)}")
+            score -= 15 * len(missing_docs)  # SCORE-FIX
+            flags.append("MISSING_REQUIRED_DOC")
+            reasoning.append(f"Documents requis manquants: {', '.join(missing_docs)}")
             details["missing_docs"] = missing_docs
         details["found_docs"] = found_docs
 
         is_insurance_only = bool(doc_classification.get("insurance_doc_only"))
-        if is_insurance_only and len(missing_docs) < len(_REQUIRED):
-            score -= 15
-            reasoning.append(
-                "Only insurance/attestation document detected — "
-                "medical report, invoice, and prescription still required"
-            )
+        if is_insurance_only:
+            score -= 25  # SCORE-FIX
+            flags.append("INSURANCE_DOC_ONLY")
+            reasoning.append("Seulement un document d'assurance detecte")
             details["insurance_doc_only"] = True
 
-        if total_text_len > 0 and total_text_len < 50:
-            score -= 10
-            reasoning.append("Extracted text is too short to constitute meaningful documentation")
+        if total_text_len < 500:
+            score -= 20  # SCORE-FIX
+            flags.append("SHORT_TEXT")
+            reasoning.append("Texte OCR trop court et potentiellement suspect")
             details["extracted_text_too_short"] = True
-
-        text_hits = list(fraud_output.get("fraud_text_signals") or [])
-        if text_hits:
-            score -= 70
-            reasoning.append("Suspicious fraud indicators detected in document content")
-            details["fraud_text_signals"] = text_hits
-
-        if bool(fraud_output.get("high_amount_doc_requirement")) or (amount > 20000 and effective_count < 3):
-            score -= 25
-            reasoning.append("High amount claim requires additional documentation")
-            details["high_amount_doc_requirement"] = True
-
-        suspicious_names = list(fraud_output.get("suspicious_doc_names") or [])
-        if suspicious_names:
-            score -= 30
-            reasoning.append(f"Suspicious document name detected: {suspicious_names[0]}")
-            details["suspicious_doc"] = suspicious_names[0]
+        if str(doc_classification.get("classification_status", "")).lower() == "unknown":
+            score -= 30  # SCORE-FIX
+            flags.append("DOC_TYPE_UNKNOWN")
+            reasoning.append("Type de document non classe")
+        if str(ocr_output.get("extraction_method", "")).lower() == "fallback":
+            score -= 10  # SCORE-FIX
+            flags.append("EXTRACTION_FALLBACK")
+            reasoning.append("Extraction en mode fallback")
 
         failed_ext = [ex for ex in extractions if (ex.get("extracted_text") or "").strip() == ""]
         if extractions and len(failed_ext) == len(extractions):
@@ -225,7 +207,7 @@ class DocumentAgent(BaseAgent):
             score -= 2 * len(failed_ext)
             details["extraction_partial_failures"] = len(failed_ext)
 
-        score = max(0.0, score)
+        score = max(0.0, min(100.0, score))
         decision = score > 60
 
         return {
@@ -234,6 +216,7 @@ class DocumentAgent(BaseAgent):
             "score": round(score, 2),
             "reasoning": "; ".join(reasoning) if reasoning else "Documents verified successfully",
             "details": details,
+            "flags": flags,  # SCORE-FIX
         }
 
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -388,10 +371,10 @@ class DocumentAgent(BaseAgent):
         out["details"] = det
         out["memory_insights"] = memory_insights
         self.enforce_tool_trace(tool_results, use_llm_fallback)
-        return self.build_agent_result(
-            output=out,
+        return self._build_result(  # SCORE-FIX
+            status="DONE",
             score=float(out.get("score", 0.0)),
-            reason=str(out.get("reasoning") or out.get("explanation") or "Completed"),
-            tools_used=list(tool_results.keys()),
-            llm_fallback_used=use_llm_fallback,
+            reason=str(out.get("reasoning") or out.get("explanation") or "Analyse documentaire completee"),
+            output=out,
+            flags=list(out.get("flags") or []),
         )

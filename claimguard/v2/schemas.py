@@ -129,12 +129,16 @@ class ClaimGuardV2Response(BaseModel):
     forensic_trace: Dict[str, Any] | None = None
     trace: Dict[str, Any] | None = None
     decision_trace: Dict[str, Any] | None = None
+    explanation: Dict[str, Any] | None = None
     response_envelope: Dict[str, Any] | None = None
     system_flags: List[str] = Field(default_factory=list)
     claim_id: str | None = None
     score: float = Field(default=0.0)
     stage: str = Field(default="FINAL_DECISION")
-    flags: List[str] = Field(default_factory=list)
+    # PROD-FIX: structured flags by severity tier.
+    flags: Dict[str, List[str]] = Field(
+        default_factory=lambda: {"blocking": [], "warnings": [], "informational": []}
+    )
     reason: str | None = None
     document_url: str | None = None
     extracted_data: Dict[str, Any] = Field(default_factory=dict)
@@ -144,3 +148,18 @@ class ClaimGuardV2Response(BaseModel):
     pipeline_trace: List[str] = Field(
         default_factory=lambda: ["PRE_VALIDATION", "FIELD_VERIFICATION", "AGENTS", "CONSENSUS"]
     )
+    agent_results: List[Dict[str, Any]] = Field(default_factory=list)
+    # PROD-FIX: production response contract fields.
+    confidence: str = "LOW"
+    stage_reached: str = "FINAL_DECISION"
+    agents: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    field_verification: Dict[str, Any] = Field(default_factory=dict)
+    memory_status: str = "DISABLED"
+    audit_trail: List[Dict[str, Any]] = Field(default_factory=list)
+    processing_time_ms: int = 0
+    routed_to: str | None = None
+    # BLOCKCHAIN-FIX: always expose trust fingerprint fields to frontend.
+    blockchain_tx: str | None = None
+    ipfs_document: str | None = None
+    tx_hash: str | None = None
+    ipfs_hash: str | None = None

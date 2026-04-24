@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
+from queue import Empty, Queue
 from typing import Any, Dict
 
 from claimguard.llm_factory import get_llm
@@ -39,7 +42,36 @@ class HybridExtractor:
             f"TEXT:\n{text}"
         )
         llm = get_llm("deepseek-r1", tracked=False)
-        result = safe_tracked_llm_call("HybridExtractor", prompt, llm.invoke)
+        timeout_s = float(os.getenv("CLAIMGUARD_HYBRID_LLM_TIMEOUT_S", "12"))
+        result_queue: Queue[Dict[str, Any]] = Queue(maxsize=1)
+
+        def _worker() -> None:
+            try:
+                result = safe_tracked_llm_call("HybridExtractor", prompt, llm.invoke)
+                result_queue.put(result)
+            except Exception as exc:
+                result_queue.put({"error": "LLM_CALL_FAILED", "reason": str(exc)})
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        worker.join(timeout=timeout_s)
+        if worker.is_alive():
+            LOGGER.warning("[LLM TIMEOUT] HybridExtractor timed out after %ss", timeout_s)
+            return {
+                "status": "ERROR",
+                "reason": f"Hybrid extraction LLM timeout after {int(timeout_s)}s",
+                "stage": "llm",
+            }
+        try:
+            result = result_queue.get_nowait()
+        except Empty:
+            return {"status": "ERROR", "reason": "LLM returned no result", "stage": "llm"}
+        if result.get("error"):
+            return {
+                "status": "ERROR",
+                "reason": str(result.get("reason") or result.get("error")),
+                "stage": "llm",
+            }
         parsed = result.get("parsed")
         if not isinstance(parsed, dict):
             return {"status": "ERROR", "reason": "LLM output is not JSON object", "stage": "llm"}

@@ -16,9 +16,17 @@ import math
 import os
 import pickle
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 LOGGER = logging.getLogger("claimguard.v2.memory")
+
+
+class MemoryStatus(str, Enum):
+    # PROD-FIX: memory runtime modes for graceful degradation.
+    FULL = "FULL"
+    DEGRADED = "DEGRADED"
+    DISABLED = "DISABLED"
 
 # ── Runtime configuration (env-overridable) ────────────────────────────────
 SIMILARITY_THRESHOLD: float = float(os.getenv("MEMORY_SIMILARITY_THRESHOLD", "0.7"))
@@ -180,6 +188,27 @@ class CaseMemoryLayer:
         self._using_fake_embeddings = False
         self._embedder = self._init_embedder()
         self._load_store()
+        self._status = self._detect_status()
+        self._log_status()
+
+    def _detect_status(self) -> MemoryStatus:
+        # PROD-FIX: disabled = no embeddings; degraded = no faiss.
+        if self._using_fake_embeddings:
+            return MemoryStatus.DISABLED
+        if not self._use_faiss:
+            return MemoryStatus.DEGRADED
+        return MemoryStatus.FULL
+
+    def _log_status(self) -> None:
+        # PROD-FIX: startup diagnostics with enablement guidance.
+        if self._status == MemoryStatus.FULL:
+            LOGGER.info("[MEMORY] Status=FULL reason=faiss_and_embeddings_available")
+            return
+        if self._status == MemoryStatus.DEGRADED:
+            LOGGER.warning("[MEMORY] Status=DEGRADED reason=faiss_unavailable using=cosine_fallback")
+        else:
+            LOGGER.warning("[MEMORY] Status=DISABLED reason=embedding_model_unavailable")
+        LOGGER.info("[MEMORY] To enable full memory: run `ollama pull nomic-embed-text` and `pip install faiss-cpu`")
 
     # ── Embedder setup ─────────────────────────────────────────────────────
 
@@ -371,6 +400,10 @@ class CaseMemoryLayer:
     @property
     def entry_count(self) -> int:
         return len(self._entries)
+
+    @property
+    def status(self) -> MemoryStatus:
+        return self._status
 
 
 # ── Module-level helpers ───────────────────────────────────────────────────

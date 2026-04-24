@@ -484,21 +484,41 @@ class IdentityAgent(BaseAgent):
         if not cin_raw and extracted.get("cin"):
             cin_raw = str(extracted.get("cin") or "").upper().strip()
 
+        # SCORE-FIX: deterministic scoring contract for IdentityAgent.
         score = 100.0
         reasons: List[str] = []
-        contradictions: List[str] = []
+        flags: List[str] = []
+        ocr_upper = corpus.upper()
+        cin_found_in_ocr = bool(cin_raw) and cin_raw in ocr_upper
+        ipp_found_in_ocr = bool(ipp_raw) and ipp_raw in ocr_upper
+        if not cin_found_in_ocr:
+            score -= 40
+            flags.append("CIN_NOT_FOUND")
+            reasons.append("CIN introuvable dans le texte OCR")
+        if not ipp_found_in_ocr:
+            score -= 20
+            flags.append("IPP_NOT_FOUND")
+            reasons.append("IPP introuvable dans le texte OCR")
+        claim_name = _extract_name_from_claim(claim_data) or ""
+        ocr_name = _extract_name_from_ocr(corpus) or ""
+        if claim_name and ocr_name:
+            similarity = _name_similarity(claim_name, ocr_name)
+            if similarity < 0.80:
+                score -= 15
+                flags.append("NAME_FUZZY_MISMATCH")
+                reasons.append("Similarite nom faible entre declaration et OCR")
         structure = _validate_cin_structure(cin_raw) if cin_raw else CINStructureResult(False, ["CIN missing"])
-        if not structure.valid:
-            score -= 45
-            reasons.extend(structure.reasons)
-        if extracted.get("cin") and cin_raw and str(extracted.get("cin")).upper() != cin_raw:
+        if not _CIN_PATTERN.match(cin_raw or ""):
             score -= 20
-            contradictions.append("claim_cin_mismatch_with_extraction")
-        if tool_results["fraud_detector"].get("output", {}).get("risk_indicators", 0) > 0:
-            score -= 20
-            reasons.append("identity_related fraud indicators detected")
-        score = max(0.0, score)
-        decision = score > 60
+            flags.append("CIN_FORMAT_INVALID")
+            reasons.append("Format CIN invalide")
+        fraud_indicators = int(tool_results["fraud_detector"].get("output", {}).get("risk_indicators", 0) or 0)
+        if fraud_indicators > 0:
+            score -= min(30, fraud_indicators * 10)
+            flags.append("IDENTITY_FRAUD_INDICATORS")
+            reasons.append("Indicateurs de risque identitaire detectes")
+        score = max(0.0, min(100.0, score))
+        decision = score > 60.0
 
         llm_fallback = self.should_use_llm_fallback(tool_results)
         reasoning = "; ".join(reasons) if reasons else "Identity signals look consistent"
@@ -523,16 +543,18 @@ class IdentityAgent(BaseAgent):
                 "cin": cin_raw or None,
                 "ipp": ipp_raw or None,
                 "cin_structure_valid": structure.valid,
-                "contradictions": contradictions,
+                "contradictions": [],
                 "identity_extraction": extracted,
                 "tool_results": tool_results,
+                "cin_found_in_ocr": cin_found_in_ocr,
+                "ipp_found_in_ocr": ipp_found_in_ocr,
             },
         }
         self.enforce_tool_trace(tool_results, llm_fallback)
-        return self.build_agent_result(
-            output=payload,
+        return self._build_result(  # SCORE-FIX
+            status="DONE",
             score=float(payload["score"]),
             reason=reasoning,
-            tools_used=list(tool_results.keys()),
-            llm_fallback_used=llm_fallback,
+            output=payload,
+            flags=flags,
         )

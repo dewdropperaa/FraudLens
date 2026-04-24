@@ -135,21 +135,25 @@ def regex_identity_extractor_tool(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if not text:
         return _tool_result("identity_extractor", "ERROR", {}, 0.0, "Input text is empty")
 
-    name_match = re.search(r"Nom complet\s*[:\-]\s*([^\n\r]+)", text, flags=re.IGNORECASE)
-    cin_match = re.search(r"\bCIN\s*[:\-]?\s*([A-Z0-9]{6,12})\b", text, flags=re.IGNORECASE)
-    dob_match = re.search(
-        r"Date de naissance\s*[:\-]\s*([0-3]?\d[/-][0-1]?\d[/-](?:\d{4}|\d{2}))",
-        text,
-        flags=re.IGNORECASE,
-    )
+    def extract_field(pattern: str, source: str) -> str | None:
+        match = re.search(pattern, source, re.IGNORECASE)
+        return match.group(1).strip() if match else None
+
+    name = extract_field(r"Nom complet\s*:\s*([A-Za-zÀ-ÖØ-öø-ÿ\s'-]+)", text)
+    cin = extract_field(r"CIN\s*:\s*([A-Z0-9]+)", text)
+    ipp = extract_field(r"(IPP[-\w]+)", text)
+    dob = extract_field(r"Date de naissance\s*:\s*([0-9/]+)", text)
+    provider = extract_field(r"(Clinique\s+[A-Za-zÀ-ÖØ-öø-ÿ\s'-]+)", text)
 
     output = {
-        "name": name_match.group(1).strip() if name_match else None,
-        "cin": cin_match.group(1).strip().upper() if cin_match else None,
-        "dob": dob_match.group(1).strip() if dob_match else None,
+        "name": name,
+        "cin": cin.upper() if cin else None,
+        "ipp": ipp,
+        "dob": dob,
+        "provider": provider,
     }
     detected = sum(1 for v in output.values() if v)
-    confidence = detected / 3.0
+    confidence = detected / 5.0
     return _tool_result("identity_extractor", "DONE", output, confidence)
 
 

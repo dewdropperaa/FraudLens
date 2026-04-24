@@ -12,6 +12,13 @@ class MemoryHealthStatus(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+class MemoryStatus(str, Enum):
+    # PROD-FIX: explicit runtime memory capability for scoring guards.
+    FULL = "FULL"
+    DEGRADED = "DEGRADED"
+    DISABLED = "DISABLED"
+
+
 @dataclass(frozen=True)
 class MemoryConfig:
     min_similarity: float = 0.7
@@ -121,4 +128,14 @@ def get_memory_health(config: MemoryConfig, memory_layer: Any) -> MemoryHealthRe
         probe_result_count=len(results),
         failure_reason="",
     )
+
+
+def get_memory_status(config: MemoryConfig, memory_layer: Any) -> MemoryStatus:
+    # PROD-FIX: public status helper consumed by consensus/orchestrator.
+    health = get_memory_health(config, memory_layer)
+    if health.status == MemoryHealthStatus.HEALTHY:
+        return MemoryStatus.FULL
+    if health.status == MemoryHealthStatus.DEGRADED:
+        return MemoryStatus.DEGRADED
+    return MemoryStatus.DISABLED
 

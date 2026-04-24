@@ -82,11 +82,47 @@ class PolicyAgent(BaseAgent):
         )
         classifier_out = tool_results["document_classifier"].get("output") or {}
         fraud_out = tool_results["fraud_detector"].get("output") or {}
-        missing_docs = len(classifier_out.get("missing_docs") or [])
-        risk_indicators = int(fraud_out.get("risk_indicators") or 0)
-        score = max(0.0, 100.0 - (missing_docs * 18.0) - (risk_indicators * 12.0))
+        # SCORE-FIX: deterministic policy scoring rules.
+        score = 100.0
+        flags: List[str] = []
+        policy = claim_data.get("policy", {}) if isinstance(claim_data.get("policy"), dict) else {}
+        amount = float(claim_data.get("amount") or policy.get("amount") or 0.0)
+        policy_limit = float(policy.get("limit_amount") or policy.get("coverage_limit") or 0.0)
+        if policy_limit > 0 and amount > policy_limit:
+            score -= 35
+            flags.append("AMOUNT_EXCEEDS_POLICY")
+        allowed_codes = policy.get("allowed_procedure_codes") or []
+        procedure_code = str(claim_data.get("procedure_code") or policy.get("procedure_code") or "")
+        if allowed_codes and procedure_code and procedure_code not in allowed_codes:
+            score -= 25
+            flags.append("PROCEDURE_NOT_ALLOWED")
+        expected_cov = str(policy.get("coverage_type") or "").strip().lower()
+        actual_cov = str(claim_data.get("coverage_type") or "").strip().lower()
+        if expected_cov and actual_cov and expected_cov != actual_cov:
+            score -= 30
+            flags.append("COVERAGE_TYPE_MISMATCH")
+        service_date = str(claim_data.get("service_date") or "")
+        valid_from = str(policy.get("valid_from") or "")
+        valid_to = str(policy.get("valid_to") or "")
+        if service_date and valid_from and valid_to and not (valid_from <= service_date <= valid_to):
+            score -= 20
+            flags.append("DATE_OUTSIDE_COVERAGE")
+        if not policy:
+            score = 70.0
+            reasoning = "Données de politique non disponibles — vérification partielle"
+            decision = True
+            payload = {
+                "agent_name": self.name,
+                "decision": decision,
+                "score": round(score, 2),
+                "reasoning": reasoning,
+                "explanation": reasoning,
+                "details": {"tool_results": tool_results},
+            }
+            return self._build_result(status="DONE", score=score, reason=reasoning, output=payload, flags=["POLICY_DATA_MISSING"])  # SCORE-FIX
+        score = max(0.0, min(100.0, score))
         decision = score > 60
-        reasoning = "Policy decision based on rule and classification tools"
+        reasoning = "Vérification de politique effectuée selon les règles de couverture"
 
         llm_fallback = self.should_use_llm_fallback(tool_results)
         if llm_fallback:
@@ -107,15 +143,15 @@ class PolicyAgent(BaseAgent):
             "explanation": reasoning,
             "details": {
                 "missing_docs": classifier_out.get("missing_docs") or [],
-                "risk_indicators": risk_indicators,
+                "risk_indicators": int(fraud_out.get("risk_indicators") or 0),
                 "tool_results": tool_results,
             },
         }
         self.enforce_tool_trace(tool_results, llm_fallback)
-        return self.build_agent_result(
-            output=payload,
+        return self._build_result(  # SCORE-FIX
+            status="DONE",
             score=float(payload["score"]),
             reason=reasoning,
-            tools_used=list(tool_results.keys()),
-            llm_fallback_used=llm_fallback,
+            output=payload,
+            flags=flags,
         )

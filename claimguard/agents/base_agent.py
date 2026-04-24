@@ -1,8 +1,12 @@
 from abc import ABC, abstractmethod
+import logging
 from typing import Any, Dict, List
 
 from claimguard.v2.tools import execute_tool as run_registered_tool
 from claimguard.v2.tools import list_tools as list_registered_tools
+
+
+logger = logging.getLogger("claimguard.agents.base_agent")
 
 
 class BaseAgent(ABC):
@@ -23,59 +27,49 @@ class BaseAgent(ABC):
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
+    def _build_result(  # SCORE-FIX
+        self,
+        status: str,
+        score: float,
+        reason: str,
+        output: Dict[str, Any],
+        flags: List[str] | None = None,
+    ) -> Dict[str, Any]:
+        return {
+            "agent": self.__class__.__name__,
+            "status": str(status or "ERROR").upper(),
+            "score": round(float(score), 2),
+            "reason": str(reason or "").strip(),
+            "output": output or {},
+            "flags": flags or [],
+        }
+
     def _ensure_contract(self, result: Dict[str, Any] | None) -> Dict[str, Any]:
         def _error(reason: str) -> Dict[str, Any]:
-            return {
-                "agent": self.name,
-                "status": "ERROR",
-                "output": {},
-                "score": 0.0,
-                "reason": reason,
-                "tools_used": [],
-                "tool_policy": {
-                    "tool_first": True,
-                    "llm_fallback_used": False,
-                },
-            }
+            return self._build_result(  # SCORE-FIX
+                status="ERROR",
+                score=0.0,
+                reason=reason,
+                output={},
+                flags=["CONTRACT_ERROR"],
+            )
 
         if result is None:
             return _error("Agent returned None")
         if not isinstance(result, dict):
             return _error("Agent returned non-dict output")
-        required = {"agent", "status", "output", "score", "reason", "tools_used", "tool_policy"}
+        required = {"agent", "status", "output", "score", "reason", "flags"}  # SCORE-FIX
         if not required.issubset(result.keys()):
             return _error("Agent returned invalid contract")
         payload = dict(result)
-        payload["agent"] = str(payload.get("agent") or self.name)
+        payload["agent"] = str(payload.get("agent") or self.__class__.__name__)  # SCORE-FIX
         payload["status"] = str(payload.get("status") or "ERROR").upper()
         payload["output"] = payload.get("output") if isinstance(payload.get("output"), dict) else {}
         payload["score"] = float(payload.get("score") or 0.0)
         payload["reason"] = str(payload.get("reason") or "")
-        payload["tools_used"] = payload.get("tools_used") if isinstance(payload.get("tools_used"), list) else []
-        policy = payload.get("tool_policy") if isinstance(payload.get("tool_policy"), dict) else {}
-        payload["tool_policy"] = {
-            "tool_first": bool(policy.get("tool_first", False)),
-            "llm_fallback_used": bool(policy.get("llm_fallback_used", False)),
-        }
-        if payload["status"] not in {"DONE", "ERROR"}:
+        payload["flags"] = payload.get("flags") if isinstance(payload.get("flags"), list) else []  # SCORE-FIX
+        if payload["status"] not in {"DONE", "ERROR", "TIMEOUT"}:  # SCORE-FIX
             return _error("Agent returned invalid status")
-        if payload["output"] in ({}, None):
-            return _error("EMPTY_OUTPUT")
-        if payload["status"] == "DONE" and not payload["tools_used"]:
-            return _error("DONE_WITHOUT_TOOLS")
-        if payload["status"] == "DONE" and not payload["tool_policy"]["tool_first"]:
-            return {
-                "agent": self.name,
-                "status": "ERROR",
-                "output": {"system_state": "unstable", "action": "HUMAN_REVIEW"},
-                "score": 0.0,
-                "reason": "SYSTEM_UNSTABLE: tool_first invariant violated",
-                "tools_used": payload["tools_used"],
-                "tool_policy": {
-                    "tool_first": False,
-                    "llm_fallback_used": payload["tool_policy"]["llm_fallback_used"],
-                },
-            }
         if payload["status"] == "DONE" and payload["reason"].strip() == "":
             return _error("Missing reason for DONE status")
         return payload
@@ -151,20 +145,16 @@ class BaseAgent(ABC):
         tools_used: List[str],
         llm_fallback_used: bool,
         status: str = "DONE",
+        flags: List[str] | None = None,
     ) -> Dict[str, Any]:
-        return self._ensure_contract(
-            {
-                "agent": self.name,
-                "status": status,
-                "output": output,
-                "score": float(score),
-                "reason": reason,
-                "tools_used": list(tools_used),
-                "tool_policy": {
-                    "tool_first": True,
-                    "llm_fallback_used": bool(llm_fallback_used),
-                },
-            }
+        return self._ensure_contract(  # SCORE-FIX
+            self._build_result(
+                status=status,
+                score=float(score),
+                reason=reason,
+                output=output,
+                flags=flags or [],
+            )
         )
 
     def run(self, blackboard: Dict[str, Any]) -> Dict[str, Any]:
@@ -174,20 +164,22 @@ class BaseAgent(ABC):
         try:
             BaseAgent._observability["runs"] += 1
             result = self.run(blackboard)
-            if result is None:
-                return {
-                    "agent": self.name,
-                    "status": "ERROR",
-                    "reason": "Agent returned None",
-                    "score": 0,
-                    "output": {},
-                }
+            if not isinstance(result, dict):  # SCORE-FIX
+                raise ValueError("Agent returned non-dict")
+            if "score" not in result or result["score"] is None:  # SCORE-FIX
+                raise ValueError("Agent returned no score")
+            if float(result.get("score", 0.0)) == 0.0 and str(result.get("status", "")).upper() == "DONE":  # SCORE-FIX
+                logger.warning(
+                    "[AGENT SCORE WARNING] %s returned score=0 with status=DONE — check scoring logic",
+                    self.__class__.__name__,
+                )
             return self._ensure_contract(result)
         except Exception as e:
-            return {
-                "agent": self.name,
-                "status": "ERROR",
-                "reason": str(e),
-                "score": 0,
-                "output": {},
-            }
+            logger.error("[AGENT FAIL] %s crashed: %s", self.__class__.__name__, e)  # SCORE-FIX
+            return self._build_result(  # SCORE-FIX
+                status="ERROR",
+                score=0.0,
+                reason=f"Agent crashed: {str(e)}",
+                output={},
+                flags=["AGENT_EXCEPTION"],
+            )

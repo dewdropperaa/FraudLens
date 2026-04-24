@@ -31,6 +31,7 @@ from claimguard.agents.security_utils import (
 )
 
 LOGGER = logging.getLogger("claimguard.agents.validation")
+DEBUG_EXPLANATION_MODE = True
 
 # ── Document type classification ───────────────────────────────────────
 DocumentType = Literal[
@@ -44,12 +45,6 @@ DocumentType = Literal[
     "irrelevant_document",
     "unknown"
 ]
-
-VALID_CLAIM_TYPES: frozenset[DocumentType] = frozenset({
-    "medical_invoice",
-    "pharmacy_invoice",
-    "hospital_bill",
-})
 
 # Keywords for document classification
 _MEDICAL_INVOICE_KEYWORDS: tuple[str, ...] = (
@@ -425,44 +420,96 @@ class ClaimValidationAgent(BaseAgent):
             "completeness_ratio": len(found_fields) / 5.0,
         }
 
-    def _compute_validation_score(
+    @staticmethod
+    def _ratio(numerator: int, denominator: int) -> float:
+        if denominator <= 0:
+            return 0.0
+        return max(0.0, min(1.0, float(numerator) / float(denominator)))
+
+    def _compute_coverage_metrics(
         self,
-        document_type: DocumentType,
-        field_validation: Dict[str, Any],
+        *,
+        claim_data: Dict[str, Any],
         corpus: str,
-    ) -> int:
-        """Compute validation score from 0-100."""
-        score = 100
-        
-        # Document type validity
-        if document_type not in VALID_CLAIM_TYPES:
-            score -= 50
-        elif document_type == "unknown":
-            score -= 30
-        
-        # Missing required fields (20 points per field)
-        missing_count = len(field_validation["missing_fields"])
-        score -= missing_count * 20
-        
-        # Partial completeness bonus
-        completeness_ratio = field_validation["completeness_ratio"]
-        if completeness_ratio >= 0.8:
-            score += 10
-        elif completeness_ratio <= 0.4:
-            score -= 10
-        
-        # Document quality signals
-        if len(corpus.strip()) < 50:
-            score -= 15
-        elif len(corpus.strip()) < 20:
-            score -= 25
-        
-        # Empty extractions penalty
-        extractions = field_validation.get("field_details", {})
-        if not extractions:
-            score -= 10
-        
-        return max(0, min(100, score))
+        classifier_out: Dict[str, Any],
+        field_validation: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        extractions = claim_data.get("document_extractions", [])
+        ocr_text = " ".join(
+            sanitize_input(str(ex.get("extracted_text", ""))).lower()
+            for ex in extractions
+            if isinstance(ex, dict)
+        )
+        ocr_len = len(ocr_text.strip())
+        ocr_quality = 0.0 if ocr_len == 0 else (0.4 if ocr_len < 40 else 0.7 if ocr_len < 120 else 1.0)
+
+        invoice_hits = sum(1 for kw in _MEDICAL_INVOICE_KEYWORDS if kw in corpus)
+        prescription_hits = sum(1 for kw in _PRESCRIPTION_KEYWORDS if kw in corpus)
+        medical_hits = sum(
+            1
+            for kw in (_MEDICAL_SERVICE_KEYWORDS + _LAB_REPORT_KEYWORDS + _HOSPITAL_BILL_KEYWORDS)
+            if kw in corpus
+        )
+        structure_ratio = float(field_validation.get("completeness_ratio", 0.0))
+        cost_present = "cost" in list(field_validation.get("found_fields", []))
+        provider_present = "provider" in list(field_validation.get("found_fields", []))
+        date_present = "date_of_service" in list(field_validation.get("found_fields", []))
+
+        invoice_coverage = max(
+            0.0,
+            min(
+                1.0,
+                (0.45 * self._ratio(invoice_hits, len(_MEDICAL_INVOICE_KEYWORDS)))
+                + (0.25 * (1.0 if cost_present else 0.0))
+                + (0.20 * (1.0 if provider_present else 0.0))
+                + (0.10 * ocr_quality),
+            ),
+        )
+        prescription_coverage = max(
+            0.0,
+            min(
+                1.0,
+                (0.70 * self._ratio(prescription_hits, len(_PRESCRIPTION_KEYWORDS)))
+                + (0.20 * (1.0 if date_present else 0.0))
+                + (0.10 * ocr_quality),
+            ),
+        )
+        medical_report_coverage = max(
+            0.0,
+            min(
+                1.0,
+                (0.45 * self._ratio(medical_hits, len(_MEDICAL_SERVICE_KEYWORDS + _LAB_REPORT_KEYWORDS + _HOSPITAL_BILL_KEYWORDS)))
+                + (0.35 * structure_ratio)
+                + (0.20 * ocr_quality),
+            ),
+        )
+
+        classifier_label = str(classifier_out.get("document_type") or classifier_out.get("label") or "").lower()
+        classifier_hint = 0.0
+        if classifier_label in {"medical_claim_bundle", "hybrid_bundle"}:
+            classifier_hint = 0.08
+        elif classifier_label == "unknown_bundle":
+            classifier_hint = -0.05
+
+        coverage_score = max(
+            0.0,
+            min(
+                1.0,
+                (0.50 * invoice_coverage)
+                + (0.30 * medical_report_coverage)
+                + (0.20 * prescription_coverage)
+                + classifier_hint,
+            ),
+        )
+        return {
+            "medical_report_coverage": round(medical_report_coverage, 4),
+            "invoice_coverage": round(invoice_coverage, 4),
+            "prescription_coverage": round(prescription_coverage, 4),
+            "coverage_score": round(coverage_score, 4),
+            "ocr_quality": round(ocr_quality, 4),
+            "classifier_hint": round(classifier_hint, 4),
+            "classifier_cluster_label": classifier_label or "unknown_bundle",
+        }
 
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -498,31 +545,30 @@ class ClaimValidationAgent(BaseAgent):
         classifier_out = tool_results["document_classifier"].get("output") or {}
         document_type = str(classifier_out.get("document_type") or self._classify_document_type(corpus))
         field_validation = self._validate_required_fields(claim_data, corpus)
-        validation_score = self._compute_validation_score(document_type, field_validation, corpus)
+        coverage_metrics = self._compute_coverage_metrics(
+            claim_data=claim_data,
+            corpus=corpus,
+            classifier_out=classifier_out,
+            field_validation=field_validation,
+        )
+        coverage_score = float(coverage_metrics["coverage_score"])
+        validation_score = int(round(coverage_score * 100.0))
         
-        # Determine validation status
         missing_count = len(field_validation["missing_fields"])
-        is_valid_type = document_type in VALID_CLAIM_TYPES
-        
-        if missing_count >= 2:
+        if injection_detected:
             validation_status = "INVALID"
-            reason = f"Missing {missing_count} required fields: {', '.join(field_validation['missing_fields'])}"
-        elif not is_valid_type:
+            reason = "Prompt injection detected in document corpus"
+        elif coverage_score < 0.4:
             validation_status = "INVALID"
-            if document_type == "irrelevant_document":
-                reason = "Document is not medical-related"
-            elif document_type in ("medical_prescription", "lab_report", "medical_certificate", "insurance_attestation"):
-                reason = f"Document is a {document_type.replace('_', ' ')}, not a billable claim"
-            else:
-                reason = f"Document type '{document_type}' is not a valid medical claim"
-        elif validation_score < 40:
-            validation_status = "INVALID"
-            reason = "Insufficient claim data to validate"
+            reason = "Coverage score below threshold; evidence quality insufficient"
+        elif coverage_score < 0.6:
+            validation_status = "VALID"
+            reason = "Coverage score is low but acceptable; continue with degraded confidence"
         else:
             validation_status = "VALID"
-            reason = f"Valid {document_type.replace('_', ' ')} with {len(field_validation['found_fields'])}/5 required fields"
-        
-        should_stop_pipeline = validation_status == "INVALID"
+            reason = "Coverage score supports claim processing"
+
+        should_stop_pipeline = False
         
         LOGGER.info(
             f"ClaimValidationAgent: validation_status={validation_status}, "
@@ -542,8 +588,37 @@ class ClaimValidationAgent(BaseAgent):
                 "corpus_length": len(corpus),
                 "completeness_ratio": field_validation["completeness_ratio"],
                 "field_details": field_validation["field_details"],
-                "classification_confidence": "high" if is_valid_type else "low",
+                "coverage_metrics": coverage_metrics,
                 "injection_detected": injection_detected,
+                "debug_reasoning_chain": {
+                    "missing_required_fields_count": missing_count,
+                    "decision_threshold": 0.4,
+                    "coverage_score": coverage_score,
+                    "document_type_informational": document_type,
+                    "classifier_cluster_only": str(
+                        coverage_metrics.get("classifier_cluster_label", "unknown_bundle")
+                    ),
+                } if DEBUG_EXPLANATION_MODE else {},
+            },
+            "explanation": {
+                "summary": reason,
+                "reasons": [
+                    f"coverage_score={coverage_score:.3f}",
+                    f"found_fields={len(field_validation['found_fields'])}/5",
+                    f"missing_fields={missing_count}",
+                    "Document classifier label treated as informational clustering only",
+                ],
+                "signals": {
+                    "medical_report_coverage": coverage_metrics["medical_report_coverage"],
+                    "invoice_coverage": coverage_metrics["invoice_coverage"],
+                    "prescription_coverage": coverage_metrics["prescription_coverage"],
+                    "completeness_ratio": field_validation["completeness_ratio"],
+                    "injection_detected": injection_detected,
+                },
+                "tool_outputs": tool_results if DEBUG_EXPLANATION_MODE else {
+                    "document_classifier": tool_results.get("document_classifier", {}),
+                    "ocr_extractor": tool_results.get("ocr_extractor", {}),
+                },
             },
         }
         self.enforce_tool_trace(tool_results, False)

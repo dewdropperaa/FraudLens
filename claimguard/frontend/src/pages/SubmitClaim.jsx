@@ -1,6 +1,16 @@
 import { Icons } from '../components'
 
 export default function SubmitClaim({ form, handleInputChange, handleFileChange, handleSubmit, isSubmitting, submitError, selectedFiles, lastResult, hasValidTxHash, safeText, shortHex, toIpfsUrl, scorePercent, currentClaimId }) {
+  const getAgentBadge = (agent) => {
+    // UI-FIX
+    const status = String(agent?.status || '').toUpperCase()
+    const score = Number(agent?.score || 0)
+    if (status === 'ERROR' || status === 'TIMEOUT') return { label: 'FAIL', className: 'fail' }
+    if (status === 'DONE' && score >= 60) return { label: 'OK', className: 'pass' }
+    if (status === 'DONE' && score >= 40) return { label: 'WARN', className: 'warn' }
+    return { label: 'FAIL', className: 'fail' }
+  }
+
   return (
     <>
       <div className="cg-page-header">
@@ -71,9 +81,10 @@ export default function SubmitClaim({ form, handleInputChange, handleFileChange,
               </div>
               <div className="cg-info-row">
                 <div className="cg-info-box">
-                  <div className="cg-info-box-label">Fraud Score</div>
-                  <div className="cg-info-box-value score">{safeText(lastResult.score)}</div>
-                  <div className="cg-score-bar"><div className="cg-score-bar-fill" style={{ width: `${scorePercent(lastResult.score)}%` }} /></div>
+                  <div className="cg-info-box-label">Score de confiance</div>
+                  <div className="cg-info-box-value score">{safeText(lastResult.score)}/100</div>
+                  <div className="cg-score-bar"><div className="cg-score-bar-fill" style={{ width: `${scorePercent(lastResult.score)}%`, backgroundColor: '#22c55e' }} /></div>
+                  <div className="cg-page-sub" style={{ marginTop: 6, fontSize: 11 }}>Seuil d'approbation: 65</div>
                 </div>
                 <div className="cg-info-box">
                   <div className="cg-info-box-label">Claim ID</div>
@@ -83,15 +94,15 @@ export default function SubmitClaim({ form, handleInputChange, handleFileChange,
               <div className="cg-info-row">
                 <div className="cg-info-box">
                   <div className="cg-info-box-label">Blockchain Tx</div>
-                  {lastResult.tx_hash
-                    ? <a href={hasValidTxHash ? `https://sepolia.etherscan.io/tx/${lastResult.tx_hash}` : '#'} target="_blank" rel="noreferrer" className="cg-info-box-value mono link">{shortHex(lastResult.tx_hash)}</a>
-                    : <div className="cg-info-box-value mono" style={{ color: 'var(--text-muted)' }}>{lastResult.decision === 'REJECTED' ? 'Skipped — rejected' : 'Not configured'}</div>}
+                  {lastResult.blockchain_tx || lastResult.tx_hash
+                    ? <span className="cg-info-box-value mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>{safeText(lastResult.blockchain_tx || lastResult.tx_hash)}</span>
+                    : <span className="cg-info-box-value" style={{ color: '#f59e0b', fontSize: 12 }}>Calcul en cours...</span>}
                 </div>
                 <div className="cg-info-box">
                   <div className="cg-info-box-label">IPFS Document</div>
-                  {lastResult.ipfs_hash
-                    ? <a href={toIpfsUrl(lastResult.ipfs_hash)} target="_blank" rel="noreferrer" className="cg-info-box-value mono link">{shortHex(lastResult.ipfs_hash)}</a>
-                    : <div className="cg-info-box-value mono" style={{ color: 'var(--text-muted)' }}>{lastResult.decision === 'REJECTED' ? 'Skipped — rejected' : 'Not configured'}</div>}
+                  {lastResult.ipfs_document || lastResult.ipfs_hash
+                    ? <a href={safeText(lastResult.ipfs_document || lastResult.ipfs_hash)} target="_blank" rel="noopener noreferrer" className="cg-info-box-value mono link" style={{ fontSize: 12, wordBreak: 'break-all' }}>{safeText(lastResult.ipfs_document || lastResult.ipfs_hash)}</a>
+                    : <span className="cg-info-box-value" style={{ color: '#f59e0b', fontSize: 12 }}>Non disponible</span>}
                 </div>
               </div>
               {(lastResult.agent_results ?? []).length > 0 && (
@@ -101,12 +112,21 @@ export default function SubmitClaim({ form, handleInputChange, handleFileChange,
                   <div className="cg-agent-list">
                     {lastResult.agent_results.map((agent) => (
                       <div key={`${lastResult.claim_id}-${agent.agent_name}`} className="cg-agent-item">
+                        {(() => {
+                          const badge = getAgentBadge(agent)
+                          const score = Number(agent?.score || 0)
+                          const reason = String(agent?.reasoning || '').trim() || 'Analyse complétée sans explication détaillée'
+                          return (
+                            <>
                         <div className="cg-agent-row">
                           <span className="cg-agent-name">{agent.agent_name}</span>
-                          <span className={`cg-agent-badge ${agent.decision ? 'pass' : 'fail'}`}>{agent.decision ? 'PASS' : 'FAIL'}</span>
+                          <span className={`cg-agent-badge ${badge.className}`}>{badge.label}</span>
                         </div>
-                        <div className="cg-agent-score">Score: {safeText(agent.score)}</div>
-                        <div className="cg-agent-reasoning">{safeText(agent.reasoning)}</div>
+                        <div className="cg-agent-score">Score: {score > 0 ? Math.round(score) : '—'}</div>
+                        <div className="cg-agent-reasoning">{safeText(reason)}</div>
+                            </>
+                          )
+                        })()}
                       </div>
                     ))}
                   </div>
