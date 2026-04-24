@@ -482,51 +482,23 @@ class ClaimValidationAgent(BaseAgent):
             }
         """
         LOGGER.info("ClaimValidationAgent: Starting validation")
-        
-        # Build document corpus
-        corpus = self._build_document_corpus(claim_data)
-        
-        # Check for prompt injection
-        injection_detected = detect_prompt_injection(corpus)
-        if injection_detected:
-            LOGGER.warning("ClaimValidationAgent: Prompt injection detected")
-            payload = {
-                "agent_name": self.name,
-                "validation_status": "INVALID",
-                "validation_score": 0,
-                "document_type": "irrelevant_document",
-                "missing_fields": ["all"],
-                "found_fields": [],
-                "reason": "Prompt injection or adversarial content detected in documents",
-                "should_stop_pipeline": True,
-                "details": {
-                    "injection_detected": True,
-                    "corpus_length": len(corpus),
+        tool_results = self.run_tool_pipeline(
+            claim_data,
+            {
+                "ocr_extractor": {"document_extractions": claim_data.get("document_extractions") or []},
+                "document_classifier": {
+                    "documents": claim_data.get("documents") or [],
+                    "document_extractions": claim_data.get("document_extractions") or [],
                 },
-            }
-            return self._ensure_contract(
-                {
-                    "agent": self.name,
-                    "status": "DONE",
-                    "output": payload,
-                    "score": float(payload["validation_score"]),
-                    "reason": str(payload["reason"]),
-                }
-            )
-        
-        # Classify document type
-        document_type = self._classify_document_type(corpus)
-        LOGGER.info(f"ClaimValidationAgent: Document classified as '{document_type}'")
-        
-        # Validate required fields
-        field_validation = self._validate_required_fields(claim_data, corpus)
-        
-        # Compute validation score
-        validation_score = self._compute_validation_score(
-            document_type, 
-            field_validation, 
-            corpus
+            },
         )
+
+        corpus = self._build_document_corpus(claim_data)
+        injection_detected = detect_prompt_injection(corpus)
+        classifier_out = tool_results["document_classifier"].get("output") or {}
+        document_type = str(classifier_out.get("document_type") or self._classify_document_type(corpus))
+        field_validation = self._validate_required_fields(claim_data, corpus)
+        validation_score = self._compute_validation_score(document_type, field_validation, corpus)
         
         # Determine validation status
         missing_count = len(field_validation["missing_fields"])
@@ -574,12 +546,11 @@ class ClaimValidationAgent(BaseAgent):
                 "injection_detected": injection_detected,
             },
         }
-        return self._ensure_contract(
-            {
-                "agent": self.name,
-                "status": "DONE",
-                "output": payload,
-                "score": float(payload["validation_score"]),
-                "reason": str(payload["reason"]),
-            }
+        self.enforce_tool_trace(tool_results, False)
+        return self.build_agent_result(
+            output=payload,
+            score=float(payload["validation_score"]),
+            reason=str(payload["reason"]),
+            tools_used=list(tool_results.keys()),
+            llm_fallback_used=False,
         )

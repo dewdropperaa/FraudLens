@@ -66,112 +66,56 @@ class PolicyAgent(BaseAgent):
         return hits >= 2
 
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
-        insurance = claim_data.get("insurance", "")
-        try:
-            amount = float(claim_data.get("amount", 0) or 0)
-        except (TypeError, ValueError):
-            amount = 0.0
-        history = claim_data.get("history", [])
-        if not isinstance(history, list):
-            history = []
-
-        doc_count = max(
-            len(claim_data.get("documents") or []),
-            len(claim_data.get("document_extractions") or []),
+        tool_results = self.run_tool_pipeline(
+            claim_data,
+            {
+                "document_classifier": {
+                    "documents": claim_data.get("documents") or [],
+                    "document_extractions": claim_data.get("document_extractions") or [],
+                },
+                "fraud_detector": {
+                    "documents": claim_data.get("documents") or [],
+                    "document_extractions": claim_data.get("document_extractions") or [],
+                    "amount": claim_data.get("amount", 0),
+                },
+            },
         )
-        corpus = self._build_corpus(claim_data)
-
-        score = 100
-        reasoning: List[str] = []
-        details: Dict[str, Any] = {"system_prompt_version": "policy_v2_forensic"}
-
-        if insurance not in ["CNSS", "CNOPS"]:
-            score -= 60
-            reasoning.append(f"Invalid insurance provider: {insurance}")
-            details["insurance_provider"] = insurance
-        else:
-            details["insurance_provider"] = insurance
-
-        if insurance == "CNSS":
-            if amount > 30000:
-                score -= 30
-                reasoning.append("Amount exceeds CNSS coverage limit")
-                details["coverage_limit_exceeded"] = True
-                details["cnss_limit"] = 30000
-        elif insurance == "CNOPS":
-            if amount > 50000:
-                score -= 30
-                reasoning.append("Amount exceeds CNOPS coverage limit")
-                details["coverage_limit_exceeded"] = True
-                details["cnops_limit"] = 50000
-
-        if doc_count == 0:
-            score -= 20
-            reasoning.append(
-                "No supporting documents — policy compliance cannot be fully verified"
-            )
-            details["no_documents_for_policy"] = True
-        elif not self._has_medical_evidence(corpus):
-            score -= 15
-            reasoning.append(
-                "Documents do not contain sufficient medical/billing evidence to support the claim"
-            )
-            details["insufficient_medical_evidence"] = True
-
-        if len(history) > 0:
-            total_claimed = sum(h.get("amount", 0) for h in history)
-            annual_limit = 100000 if insurance == "CNSS" else 150000
-
-            if total_claimed + amount > annual_limit:
-                score -= 40
-                reasoning.append(f"Total claims exceed annual limit of {annual_limit}")
-                details["annual_limit_exceeded"] = True
-                details["annual_limit"] = annual_limit
-                details["total_claimed"] = total_claimed
-
-        if len(history) > 0:
-            recent_rejections = sum(1 for h in history if h.get("decision") == "REJECTED")
-            if recent_rejections > 2:
-                score -= 25
-                reasoning.append(f"Multiple recent rejections: {recent_rejections}")
-                details["recent_rejections"] = recent_rejections
-
-        score = max(0, score)
+        classifier_out = tool_results["document_classifier"].get("output") or {}
+        fraud_out = tool_results["fraud_detector"].get("output") or {}
+        missing_docs = len(classifier_out.get("missing_docs") or [])
+        risk_indicators = int(fraud_out.get("risk_indicators") or 0)
+        score = max(0.0, 100.0 - (missing_docs * 18.0) - (risk_indicators * 12.0))
         decision = score > 60
+        reasoning = "Policy decision based on rule and classification tools"
 
-        # Memory context integration
-        memory_adjusted_score, memory_insights = process_memory_context(
-            agent_name=self.name,
-            claim_data=claim_data,
-            current_score=float(score),
-            current_cin=str(claim_data.get("patient_id") or ""),
-        )
-        if memory_adjusted_score != float(score):
-            score = max(0, int(memory_adjusted_score))
-            decision = score > 60
-        details["memory_insights"] = memory_insights
+        llm_fallback = self.should_use_llm_fallback(tool_results)
+        if llm_fallback:
+            print("[LLM FALLBACK USED] True")
+            reasoning, _ = run_agent_consistency_check(
+                agent_name=self.name,
+                claim_data=claim_data,
+                draft_reasoning=reasoning,
+            )
+        else:
+            print("[LLM FALLBACK USED] False")
 
-        llm_explanation, llm_meta = run_agent_consistency_check(
-            agent_name=self.name,
-            claim_data=claim_data,
-            draft_reasoning="; ".join(reasoning) if reasoning else "Policy coverage validated",
-        )
-        details["llm_consistency"] = llm_meta
         payload = {
             "agent_name": self.name,
             "decision": decision,
             "score": round(score, 2),
-            "reasoning": llm_explanation,
-            "explanation": llm_explanation,
-            "details": details,
-            "memory_insights": memory_insights,
+            "reasoning": reasoning,
+            "explanation": reasoning,
+            "details": {
+                "missing_docs": classifier_out.get("missing_docs") or [],
+                "risk_indicators": risk_indicators,
+                "tool_results": tool_results,
+            },
         }
-        return self._ensure_contract(
-            {
-                "agent": self.name,
-                "status": "DONE",
-                "output": payload,
-                "score": float(payload["score"]),
-                "reason": llm_explanation,
-            }
+        self.enforce_tool_trace(tool_results, llm_fallback)
+        return self.build_agent_result(
+            output=payload,
+            score=float(payload["score"]),
+            reason=reasoning,
+            tools_used=list(tool_results.keys()),
+            llm_fallback_used=llm_fallback,
         )

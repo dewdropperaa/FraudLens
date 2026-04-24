@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal, Tuple, get_args
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from crewai import Agent, Crew, Process, Task
@@ -28,6 +28,7 @@ from claimguard.v2.concierge import build_routing_decision
 from claimguard.v2.consensus import ConsensusConfig, ConsensusEngine, should_force_human_review
 from claimguard.v2.document_classifier import classify_document
 from claimguard.v2.evidence_mapper import build_fraud_heatmap
+from claimguard.v2.extraction.hybrid_extractor import HybridExtractor
 from claimguard.v2.field_verification import verify_structured_fields
 from claimguard.v2.fraud_ring_graph import get_fraud_ring_graph
 from claimguard.v2.flow_tracker import get_tracker
@@ -49,6 +50,7 @@ from claimguard.v2.schemas import (
     AgentOutput,
     ClaimGuardV2Response,
     DECISION_ENUM_VALUES,
+    DocumentType,
     MemoryInsights,
     PreValidationResult,
     RoutingDecision,
@@ -91,6 +93,11 @@ _CRITICAL_AGENT_FAILURE_MARKERS = (
 )
 _CRITICAL_FIELD_KEYS = {"cin", "ipp", "amount"}
 _HARD_REJECTION_REASON = "Claim rejected: data not found in supporting document"
+_VALIDATION_DOCUMENT_TYPES = set(get_args(DocumentType))
+_DOCUMENT_TYPE_NORMALIZATION_MAP: Dict[str, str] = {
+    "medical_claim_bundle": "hospital_bill",
+    "incomplete_claim_bundle": "unknown",
+}
 SEQUENTIAL_AGENT_CONTRACTS: tuple[AgentContract, ...] = (
     AgentContract("IdentityAgent", ()),
     AgentContract("DocumentAgent", ("IdentityAgent",)),
@@ -391,6 +398,14 @@ def _safe_json_load(text: str) -> Dict[str, Any]:
     return loaded
 
 
+def _normalize_validation_document_type(raw_document_type: Any) -> tuple[str, str | None]:
+    document_type = str(raw_document_type or "unknown").strip().lower()
+    normalized = _DOCUMENT_TYPE_NORMALIZATION_MAP.get(document_type, document_type)
+    if normalized in _VALIDATION_DOCUMENT_TYPES:
+        return normalized, None
+    return "unknown", document_type
+
+
 def _normalize_score_confidence_scale(score: float, confidence: float) -> tuple[float, float]:
     # Accept either 0..1 or 0..100 outputs; convert percentages when detected.
     s = score / 100.0 if score > 1.0 else score
@@ -564,6 +579,7 @@ class ClaimGuardV2Orchestrator:
         self._fraud_ring_graph = get_fraud_ring_graph()
         self._human_review_store = HumanReviewStore()
         self._pending_human_reviews = PendingHumanReviewRepository()
+        self._hybrid_extractor = HybridExtractor()
         print("LLM Provider: OLLAMA")
         print("Available models:", ["mistral", "llama3", "deepseek-r1"])
         assert_ollama_connection()
@@ -630,8 +646,7 @@ class ClaimGuardV2Orchestrator:
         if self._memory_degraded_streak >= 2:
             self._emit_memory_degraded_alert(claim_id=claim_id, report=report)
 
-    @staticmethod
-    def _build_ocr_blackboard_payload(claim_request: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_ocr_blackboard_payload(self, claim_request: Dict[str, Any]) -> Dict[str, Any]:
         texts: List[str] = []
         for extraction in claim_request.get("document_extractions", []) or []:
             if isinstance(extraction, dict):
@@ -645,56 +660,46 @@ class ClaimGuardV2Orchestrator:
                     texts.append(candidate)
         raw_text = "\n".join(texts).strip()
 
-        identity = claim_request.get("identity", {}) if isinstance(claim_request.get("identity"), dict) else {}
-        policy = claim_request.get("policy", {}) if isinstance(claim_request.get("policy"), dict) else {}
-        metadata = claim_request.get("metadata", {}) if isinstance(claim_request.get("metadata"), dict) else {}
+        hybrid_result = self._hybrid_extractor.extract(raw_text)
+        if hybrid_result.get("status") != "OK":
+            return {
+                "status": "ERROR",
+                "reason": str(hybrid_result.get("reason") or "Hybrid extraction failed"),
+                "stage": str(hybrid_result.get("stage") or "rule"),
+                "raw_text": raw_text,
+                "structured_fields": {},
+            }
+
+        fields = hybrid_result.get("fields", {}) if isinstance(hybrid_result.get("fields"), dict) else {}
         structured_fields: Dict[str, Any] = {
-            "cin": str(identity.get("cin") or identity.get("CIN") or claim_request.get("patient_id") or "").strip(),
-            "ipp": str(identity.get("ipp") or identity.get("IPP") or "").strip(),
-            "amount": claim_request.get("amount") or metadata.get("amount") or policy.get("amount") or "",
-            "date": str(
-                metadata.get("service_date")
-                or claim_request.get("service_date")
-                or policy.get("service_date")
-                or ""
-            ).strip(),
-            "provider": str(
-                identity.get("hospital")
-                or policy.get("hospital")
-                or metadata.get("hospital")
-                or identity.get("doctor")
-                or policy.get("doctor")
-                or metadata.get("doctor")
-                or ""
-            ).strip(),
-        }
-        if not structured_fields["cin"]:
-            structured_fields["cin"] = _extract_field_from_text([r"\bcin[:\s-]*([A-Z0-9-]{4,})\b"], raw_text)
-        if not structured_fields["ipp"]:
-            structured_fields["ipp"] = _extract_field_from_text([r"\bipp[:\s-]*([0-9]{6,10})\b"], raw_text)
-        if not structured_fields["amount"]:
-            extracted_amount = _extract_field_from_text(
-                [
-                    r"\b(?:montant|amount|total(?:\s+(?:ttc|due|a payer|à payer))?)\s*[:=]?\s*([0-9][0-9\s.,]{0,20})\b",
-                    r"\b([0-9][0-9\s.,]{0,20})\s*(?:mad|dh|dhs|dirhams?)\b",
-                ],
-                raw_text,
-            )
-            structured_fields["amount"] = _normalize_extracted_amount(extracted_amount)
-        if not structured_fields["date"]:
-            structured_fields["date"] = _extract_field_from_text(
-                [r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4})\b"],
-                raw_text,
-            )
-        if not structured_fields["provider"]:
-            structured_fields["provider"] = _extract_field_from_text(
+            "name": fields.get("name"),
+            "cin": fields.get("cin"),
+            "ipp": fields.get("patient_id"),
+            "date": fields.get("dob"),
+            "insurance": fields.get("insurance"),
+            "amount": _normalize_extracted_amount(
+                _extract_field_from_text(
+                    [
+                        r"\b(?:montant|amount|total(?:\s+(?:ttc|due|a payer|à payer))?)\s*[:=]?\s*([0-9][0-9\s.,]{0,20})\b",
+                        r"\b([0-9][0-9\s.,]{0,20})\s*(?:mad|dh|dhs|dirhams?)\b",
+                    ],
+                    raw_text,
+                )
+            ),
+            "provider": _extract_field_from_text(
                 [r"\b(?:hopital|hôpital|clinique|provider|doctor|dr\.?)[:\s-]*([A-Za-z0-9 '\-]{3,})"],
                 raw_text,
-            )
+            ),
+        }
         return {
+            "status": "OK",
             "raw_text": raw_text,
             "structured_fields": structured_fields,
+            "hybrid_result": hybrid_result,
         }
+
+    def self_test(self) -> bool:
+        return self._hybrid_extractor.self_test()
 
     @staticmethod
     def _is_unreadable_text(text: str) -> bool:
@@ -1859,6 +1864,31 @@ class ClaimGuardV2Orchestrator:
                 pipeline_version="v2",
             )
 
+        test_mode = bool(claim_request.get("metadata", {}).get("test_mode")) or os.getenv("ENVIRONMENT", "").lower() == "test"
+        if not test_mode and not self.self_test():
+            return _finalize_response(
+                exit_reason="low_confidence",
+                agent_outputs=[],
+                blackboard={"entries": {}, "terminated": True, "flags": {"hybrid_pipeline_not_stable": True}},
+                routing_decision=routing,
+                goa_used=False,
+                Ts=50.0,
+                decision="HUMAN_REVIEW",
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=[],
+                validation_result=None,
+                pre_validation_result=None,
+                forensic_trace=None,
+                decision_trace={"decision_reason": "HYBRID_PIPELINE_NOT_STABLE", "final_decision": "HUMAN_REVIEW"},
+                reason="HYBRID_PIPELINE_NOT_STABLE",
+                system_flags=["HYBRID_PIPELINE_NOT_STABLE"],
+                extracted_data={},
+                pipeline_version="v2",
+            )
+
         timeout_response = _check_pipeline_timeout("PRE_VALIDATION")
         if timeout_response is not None:
             return timeout_response
@@ -1866,6 +1896,46 @@ class ClaimGuardV2Orchestrator:
         tracker = get_tracker(claim_id)
         tracker.update("OCR Extraction", "RUNNING")
         extraction_payload = self._build_ocr_blackboard_payload(claim_request)
+        if str(extraction_payload.get("status", "OK")).upper() == "ERROR":
+            return _finalize_response(
+                exit_reason="low_confidence",
+                agent_outputs=[],
+                blackboard={
+                    "entries": {},
+                    "terminated": True,
+                    "flags": {"hybrid_extraction_failed": True},
+                    "extraction_error": {
+                        "status": "ERROR",
+                        "reason": str(extraction_payload.get("reason") or "Unknown extraction error"),
+                        "stage": str(extraction_payload.get("stage") or "rule"),
+                    },
+                },
+                routing_decision=routing,
+                goa_used=False,
+                Ts=50.0,
+                decision="HUMAN_REVIEW",
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=[],
+                validation_result=None,
+                pre_validation_result=None,
+                forensic_trace=None,
+                decision_trace={
+                    "decision_reason": "Hybrid extraction failed",
+                    "final_decision": "HUMAN_REVIEW",
+                    "extraction_error": {
+                        "status": "ERROR",
+                        "reason": str(extraction_payload.get("reason") or "Unknown extraction error"),
+                        "stage": str(extraction_payload.get("stage") or "rule"),
+                    },
+                },
+                reason="Hybrid extraction failed",
+                system_flags=["HYBRID_EXTRACTION_FAILED"],
+                extracted_data={},
+                pipeline_version="v2",
+            )
         extracted_text = str(extraction_payload["raw_text"])
         print("=== OCR TEXT START ===")
         print(extracted_text[:3000])
@@ -2435,16 +2505,23 @@ class ClaimGuardV2Orchestrator:
             required_fields=["validation_status", "validation_score", "document_type", "should_stop_pipeline", "reason"],
         )
         validation_payload = validation_raw.get("output", validation_raw) if isinstance(validation_raw, dict) else {}
+        normalized_document_type, original_document_type = _normalize_validation_document_type(
+            validation_payload.get("document_type", "unknown")
+        )
+        validation_details = dict(validation_payload.get("details", {}) or {})
+        if original_document_type is not None:
+            validation_details["raw_document_type"] = original_document_type
+            validation_details["document_type_normalized"] = normalized_document_type
         
         validation_result = ValidationResult(
             validation_status=validation_payload.get("validation_status", "INVALID"),
             validation_score=int(validation_payload.get("validation_score", 0)),
-            document_type=validation_payload.get("document_type", "unknown"),
+            document_type=normalized_document_type,
             missing_fields=validation_payload.get("missing_fields", []),
             found_fields=validation_payload.get("found_fields", []),
             reason=validation_payload.get("reason", "Validation output missing required fields"),
             should_stop_pipeline=bool(validation_payload.get("should_stop_pipeline", True)),
-            details=validation_payload.get("details", {}),
+            details=validation_details,
         )
         
         LOGGER.info(
@@ -2765,9 +2842,18 @@ class ClaimGuardV2Orchestrator:
             try:
                 if forensic_enabled and forensic_trace is not None:
                     forensic_trace["llm_calls_count"] += 1
-                parsed = parse_llm_json(str(result))
-                if not isinstance(parsed, dict):
-                    parsed = _safe_json_load(str(result))
+                if isinstance(result, dict) and {"response", "parsed", "agent"}.issubset(result.keys()):
+                    raw_response = str(result.get("response") or "")
+                    if not raw_response.strip():
+                        raise RuntimeError("LLM_RESPONSE_LOST")
+                    print("[LLM OUTPUT USED]")
+                    parsed = result.get("parsed")
+                    if not isinstance(parsed, dict):
+                        parsed = parse_llm_json(raw_response)
+                else:
+                    parsed = parse_llm_json(str(result))
+                    if not isinstance(parsed, dict):
+                        parsed = _safe_json_load(str(result))
             except Exception as exc:
                 tracker.update(contract.name, "FAILED")
                 LOGGER.exception("v2_agent_parse_failed agent=%s", contract.name)

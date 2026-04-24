@@ -83,23 +83,38 @@ _DOB_PATTERNS = (
 )
 
 IDENTITY_PROMPT = """
-Extract the following fields EXACTLY from the document.
-If a field is missing, return null but NEVER omit keys.
+You are an information extraction engine.
 
-Return STRICT JSON:
+Your task is to extract identity fields from a medical document.
+
+You MUST return VALID JSON.
+
+DO NOT explain.
+DO NOT add text.
+DO NOT return anything outside JSON.
+
+If you cannot find a field, return null.
+
+If you fail to return valid JSON, the system will consider your answer invalid.
+
+Return EXACTLY this schema:
 
 {{
-  "name": "...",
-  "cin": "...",
-  "dob": "...",
-  "is_valid": true/false,
-  "confidence": 0-100,
-  "issues": []
+  "name": string | null,
+  "cin": string | null,
+  "dob": string | null,
+  "is_valid": boolean,
+  "confidence": number (0-100),
+  "issues": array
 }}
 
-Document:
-{input}
+DOCUMENT:
+{document_text}
 """
+
+_IDENTITY_REGEX_NAME = re.compile(r"Nom complet\s*:\s*(.+)", re.IGNORECASE)
+_IDENTITY_REGEX_CIN = re.compile(r"CIN\s*:\s*(\w+)", re.IGNORECASE)
+_IDENTITY_REGEX_DOB = re.compile(r"Date de naissance\s*:\s*([\d/]+)", re.IGNORECASE)
 
 
 def _extract_identity_llm(document_text: str, agent_name: str) -> Dict[str, Any]:
@@ -107,16 +122,43 @@ def _extract_identity_llm(document_text: str, agent_name: str) -> Dict[str, Any]
     if len(safe_text.strip()) < 100:
         raise ValueError("Document text too short for identity extraction (<100 chars)")
     print("[LLM INPUT LENGTH]", len(safe_text))
-    prompt = IDENTITY_PROMPT.format(input=safe_text)
+    prompt = IDENTITY_PROMPT.format(document_text=safe_text)
     timeout_s = float(os.getenv("CLAIMGUARD_IDENTITY_LLM_TIMEOUT_S", "6"))
     llm = get_llm("simple", tracked=False)
     result_queue: Queue[Dict[str, Any]] = Queue(maxsize=1)
+    log_state = {"received": False, "parsed": False, "used": False}
+
+    def _invoke_and_parse(prompt_text: str) -> Dict[str, Any]:
+        with tracked_agent_context(agent_name):
+            result = safe_tracked_llm_call(agent_name, prompt_text, llm.invoke)
+            if not isinstance(result, dict):
+                raise RuntimeError("LLM_RESPONSE_LOST")
+            raw_response = str(result.get("response") or "")
+            if not raw_response.strip():
+                raise RuntimeError("LLM_RESPONSE_LOST")
+            print(f"[AGENT RAW RESPONSE] {raw_response[:500]}")
+            print("RAW LLM RESPONSE:", raw_response)
+            print("[LLM RESPONSE RECEIVED]")
+            log_state["received"] = True
+            parsed_local = result.get("parsed")
+            if parsed_local is None:
+                raise RuntimeError("LLM_RESPONSE_LOST")
+            print("[LLM RESPONSE PARSED]")
+        log_state["parsed"] = True
+        if not isinstance(parsed_local, dict):
+            parsed_local = parse_llm_json(raw_response)
+        if not isinstance(parsed_local, dict):
+            return {"error": "INVALID_JSON", "raw": raw_response}
+        print("[LLM OUTPUT USED]")
+        log_state["used"] = True
+        return parsed_local
 
     def _worker() -> None:
-        with tracked_agent_context(agent_name):
-            result = safe_tracked_llm_call(agent_name, prompt, llm.invoke)
-            parsed = parse_llm_json(json.dumps(result) if isinstance(result, dict) else str(result))
-        result_queue.put(parsed if isinstance(parsed, dict) else {"error": "INVALID_JSON", "raw": str(result)})
+        parsed = _invoke_and_parse(prompt)
+        if parsed.get("error") == "INVALID_JSON":
+            retry_prompt = f"{prompt}\n\nReturn ONLY valid JSON. No explanation."
+            parsed = _invoke_and_parse(retry_prompt)
+        result_queue.put(parsed)
 
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()
@@ -127,7 +169,12 @@ def _extract_identity_llm(document_text: str, agent_name: str) -> Dict[str, Any]
         parsed = result_queue.get_nowait()
     except Empty:
         return {"error": "IDENTITY_LLM_NO_RESULT", "raw": ""}
-    print(f"[AGENT PARSED OUTPUT] {str(parsed)[:500]}")
+    if not log_state["received"]:
+        raise RuntimeError("IdentityAgent missing [LLM RESPONSE RECEIVED] log.")
+    if not log_state["parsed"] or not isinstance(parsed, dict):
+        raise RuntimeError("IdentityAgent missing [LLM RESPONSE PARSED] payload.")
+    if not log_state["used"]:
+        raise RuntimeError("IdentityAgent missing [LLM OUTPUT USED] trace.")
     if parsed.get("error"):
         print("[AGENT VALIDATION RESULT] failed: parse_error")
         return parsed
@@ -148,6 +195,24 @@ def _extract_identity_llm(document_text: str, agent_name: str) -> Dict[str, Any]
         "confidence": max(0, min(100, int(parsed.get("confidence", 0) or 0))),
         "issues": [str(i) for i in issues if str(i).strip()],
     }
+
+
+def _regex_identity_fallback(document_text: str) -> Dict[str, Any]:
+    text = document_text or ""
+    extracted: Dict[str, Any] = {}
+
+    name_match = _IDENTITY_REGEX_NAME.search(text)
+    cin_match = _IDENTITY_REGEX_CIN.search(text)
+    dob_match = _IDENTITY_REGEX_DOB.search(text)
+
+    if name_match:
+        extracted["name"] = name_match.group(1).strip()
+    if cin_match:
+        extracted["cin"] = cin_match.group(1).strip().upper()
+    if dob_match:
+        extracted["dob"] = dob_match.group(1).strip()
+
+    return extracted
 
 
 def _clamp(value: int, lo: int = 0, hi: int = 100) -> int:
@@ -401,481 +466,73 @@ class IdentityAgent(BaseAgent):
         return ""
 
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
-        cin_raw = self._resolve_cin(claim_data)
-        ipp_raw = self._resolve_ipp(claim_data)
-        history = claim_data.get("history", [])
-        if not isinstance(history, list):
-            history = []
+        cin_raw = self._resolve_cin(claim_data).upper().strip()
+        ipp_raw = self._resolve_ipp(claim_data).strip()
+        corpus = sanitize_input(_build_ocr_corpus(claim_data))
+        tool_results = self.run_tool_pipeline(
+            claim_data,
+            {
+                "identity_extractor": {"text": corpus},
+                "fraud_detector": {
+                    "documents": claim_data.get("documents") or [],
+                    "document_extractions": claim_data.get("document_extractions") or [],
+                    "amount": claim_data.get("amount", 0),
+                },
+            },
+        )
+        extracted = dict(tool_results["identity_extractor"].get("output") or {})
+        if not cin_raw and extracted.get("cin"):
+            cin_raw = str(extracted.get("cin") or "").upper().strip()
 
-        raw_corpus = _build_ocr_corpus(claim_data)
-        sanitized_corpus = sanitize_input(raw_corpus)
-
-        try:
-            llm_identity = _extract_identity_llm(raw_corpus, self.name)
-        except Exception as exc:
-            return self._ensure_contract(
-                {
-                    "agent": self.name,
-                    "status": "ERROR",
-                    "output": {},
-                    "score": 0.0,
-                    "reason": str(exc),
-                }
-            )
-        if not isinstance(llm_identity, dict) or llm_identity.get("error"):
-            reason = "MISSING_FIELDS" if llm_identity.get("error") == "MISSING_FIELDS" else str(llm_identity.get("error") or "INVALID_JSON")
-            return self._ensure_contract(
-                {
-                    "agent": self.name,
-                    "status": "ERROR",
-                    "output": llm_identity if isinstance(llm_identity, dict) else {"raw": str(llm_identity)},
-                    "score": 0.0,
-                    "reason": reason,
-                }
-            )
-        if not cin_raw and llm_identity.get("cin"):
-            cin_raw = str(llm_identity.get("cin") or "").strip().upper()
-
-        score = 100
-        confidence = 90
-        observations: List[str] = []
-        missing_data: List[str] = []
+        score = 100.0
+        reasons: List[str] = []
         contradictions: List[str] = []
-        fraud_signals: List[str] = []
-        reasoning_steps: List[str] = []
-        details: Dict[str, Any] = {"system_prompt_version": "identity_v3_cin_analyst"}
-
-        # ── 1. CIN structure validation ────────────────────────────────
-        reasoning_steps.append("Step 1: Validate CIN structural format")
-
-        if not cin_raw:
-            format_valid = False
-            score -= 70
-            confidence = min(confidence, 40)
-            observations.append("No CIN provided — cannot perform identity analysis")
-            missing_data.append("cin")
-            reasoning_steps.append("CIN is missing; applied -70 penalty")
-        else:
-            structure = _validate_cin_structure(cin_raw)
-            format_valid = structure.valid
-
-            if not structure.valid:
-                score -= 70
-                confidence = min(confidence, 50)
-                observations.extend(structure.reasons)
-                reasoning_steps.append(
-                    f"CIN '{cin_raw}' failed structure validation: "
-                    + "; ".join(structure.reasons)
-                    + " → applied -70 penalty"
-                )
-            else:
-                if structure.reasons:
-                    observations.extend(structure.reasons)
-                reasoning_steps.append(
-                    f"CIN '{cin_raw}' is structurally valid "
-                    "(matches [A-Z]{{1,2}}[0-9]{{5,6}})"
-                )
-
-        details["cin_input"] = cin_raw or None
-        details["ipp_input"] = ipp_raw or None
-        details["format_valid"] = format_valid
-
-        # ── 2. Semantic realism check ──────────────────────────────────
-        reasoning_steps.append("Step 2: Check for suspicious numeric/letter patterns")
-
-        suspicious_patterns: List[str] = []
-        if cin_raw and format_valid:
-            suspicious_patterns = _check_suspicious_patterns(cin_raw)
-            if suspicious_patterns:
-                score -= 15
-                confidence = min(confidence, 75)
-                observations.extend(suspicious_patterns)
-                reasoning_steps.append(
-                    f"Suspicious pattern(s) detected: {suspicious_patterns} → applied -15 penalty"
-                )
-            else:
-                reasoning_steps.append("No suspicious patterns detected in CIN digits/prefix")
-        elif cin_raw and not format_valid:
-            reasoning_steps.append("Skipped realism check (CIN format already invalid)")
-
-        details["suspicious_patterns"] = suspicious_patterns
-
-        # ── 3. OCR cross-validation ────────────────────────────────────
-        reasoning_steps.append("Step 3: Cross-validate CIN against OCR/document text")
-
-        doc_count = max(
-            len(claim_data.get("documents") or []),
-            len(claim_data.get("document_extractions") or []),
-        )
-        ocr_checked = False
-        ocr_match = False
-
-        if doc_count == 0:
-            missing_data.append("documents")
-            observations.append("No documents provided — OCR cross-validation impossible")
-            score -= 30
-            confidence = min(confidence, 50)
-            reasoning_steps.append(
-                "No documents available; cannot cross-validate CIN → applied -30 penalty"
-            )
-        elif not cin_raw:
-            reasoning_steps.append("No CIN to cross-validate against documents")
-        else:
-            cin_found_in_ocr, cin_matches, ocr_obs = _ocr_cross_validate(
-                cin_raw, sanitized_corpus
-            )
-            ocr_checked = True
-            observations.extend(ocr_obs)
-
-            if not cin_found_in_ocr:
-                score -= 10
-                confidence = min(confidence, 60)
-                reasoning_steps.append(
-                    "CIN not found anywhere in document text → applied -10 penalty"
-                )
-            elif not cin_matches:
-                ocr_match = False
-                score -= 40
-                confidence = min(confidence, 50)
-                contradictions.append(
-                    f"Input CIN '{cin_raw}' contradicts CIN(s) found in documents"
-                )
-                reasoning_steps.append(
-                    "CIN mismatch between input and documents → applied -40 penalty"
-                )
-            else:
-                ocr_match = True
-                reasoning_steps.append("CIN confirmed present in document text (OCR match)")
-
-        details["ocr_checked"] = ocr_checked
-        details["ocr_match"] = ocr_match
-        ipp_found = False
-        if ipp_raw and _IPP_PATTERN.fullmatch(ipp_raw):
-            ipp_found = ipp_raw in re.sub(r"[^0-9]", "", sanitized_corpus)
-        details["evidence"] = {"cin_found": bool(ocr_match), "ipp_found": bool(ipp_found)}
-
-        # ── 4. Identity consistency ────────────────────────────────────
-        reasoning_steps.append("Step 4: Check identity field consistency (name, DOB)")
-
-        input_name = _extract_name_from_claim(claim_data)
-        ocr_name = _extract_name_from_ocr(sanitized_corpus) if sanitized_corpus else None
-
-        if not input_name:
-            missing_data.append("patient_name")
-        if input_name and ocr_name:
-            sim = _name_similarity(input_name, ocr_name)
-            details["name_similarity"] = round(sim, 3)
-            if sim < 0.5:
-                score -= 25
-                confidence = min(confidence, 55)
-                contradictions.append(
-                    f"Name mismatch: input='{input_name}' vs OCR='{ocr_name}' "
-                    f"(similarity {sim:.0%})"
-                )
-                reasoning_steps.append(
-                    f"Major name mismatch (similarity={sim:.0%}) → applied -25 penalty"
-                )
-            elif sim < 0.8:
-                score -= 10
-                observations.append(
-                    f"Minor name discrepancy: input='{input_name}' vs OCR='{ocr_name}' "
-                    f"(similarity {sim:.0%})"
-                )
-                reasoning_steps.append(
-                    f"Minor name discrepancy (similarity={sim:.0%}) → applied -10 penalty"
-                )
-            else:
-                reasoning_steps.append(
-                    f"Name consistent across sources (similarity={sim:.0%})"
-                )
-        elif input_name and not ocr_name:
-            observations.append("Could not extract name from documents for comparison")
-            reasoning_steps.append("Name present in input but not extractable from OCR")
-        elif not input_name and ocr_name:
-            observations.append(f"Name found in OCR ('{ocr_name}') but not in input fields")
-            reasoning_steps.append("Name found in OCR but missing from claim input")
-
-        input_dob = _extract_dob_from_claim(claim_data)
-        ocr_dob = _extract_dob_from_ocr(sanitized_corpus) if sanitized_corpus else None
-
-        if not input_dob:
-            missing_data.append("date_of_birth")
-            score -= 5
-            confidence = min(confidence, 65)
-            reasoning_steps.append("Date of birth missing → applied -5 penalty")
-        elif ocr_dob:
-            dob_norm_input = re.sub(r"[/\-.]", "", input_dob)
-            dob_norm_ocr = re.sub(r"[/\-.]", "", ocr_dob)
-            if dob_norm_input == dob_norm_ocr:
-                reasoning_steps.append("Date of birth consistent across input and OCR")
-            else:
-                score -= 15
-                contradictions.append(
-                    f"DOB mismatch: input='{input_dob}' vs OCR='{ocr_dob}'"
-                )
-                reasoning_steps.append(
-                    f"DOB mismatch (input='{input_dob}' vs OCR='{ocr_dob}') → applied -15 penalty"
-                )
-
-        # ── 5. Contextual fraud signals ────────────────────────────────
-        reasoning_steps.append("Step 5: Evaluate contextual fraud signals")
-
-        if len(history) > 0 and cin_raw:
-            seen_cins = set()
-            for h in history:
-                h_pid = str(h.get("patient_id", ""))
-                if h_pid:
-                    seen_cins.add(h_pid.strip().upper())
-
-            cin_upper = cin_raw.strip().upper()
-            patient_names_in_history = set(
-                str(h.get("patient_name", "")).strip()
-                for h in history if h.get("patient_name")
-            )
-
-            if len(patient_names_in_history) > 1:
-                fraud_signals.append(
-                    f"Multiple distinct names associated with this identity in history: "
-                    f"{patient_names_in_history}"
-                )
-                score -= 20
-                confidence = min(confidence, 55)
-                reasoning_steps.append(
-                    f"Multiple names in history ({len(patient_names_in_history)}) → "
-                    "applied -20 penalty"
-                )
-
-            if seen_cins and cin_upper not in seen_cins:
-                fraud_signals.append(
-                    f"Input CIN '{cin_raw}' not seen in claim history "
-                    f"(history IDs: {seen_cins})"
-                )
-                score -= 10
-                reasoning_steps.append(
-                    "CIN not present in claim history → applied -10 penalty"
-                )
-        elif len(history) == 0:
-            observations.append("No claim history to cross-reference identity against")
-            reasoning_steps.append("No history available for contextual checks")
-
-        if len(history) > 5:
-            fraud_signals.append(
-                f"High claim frequency ({len(history)} claims) may indicate identity misuse"
-            )
-            score -= 10
-            reasoning_steps.append(
-                f"High claim frequency ({len(history)}) → applied -10 penalty"
-            )
-
-        if cin_raw and doc_count > 0 and not any(
-            cin_raw.upper() in str(d).upper()
-            for d in (claim_data.get("documents") or [])
-        ) and not any(
-            cin_raw.upper() in (ex.get("extracted_text") or "").upper()
-            for ex in (claim_data.get("document_extractions") or [])
-            if isinstance(ex, dict)
-        ):
-            fraud_signals.append(
-                "CIN exists in input but is not referenced in any submitted document"
-            )
-
-        if doc_count > 0:
-            ext_list = claim_data.get("document_extractions") or []
-            empty_extractions = sum(
-                1 for ex in ext_list
-                if isinstance(ex, dict) and not (ex.get("extracted_text") or "").strip()
-            )
-            if ext_list and empty_extractions == len(ext_list):
-                fraud_signals.append("All documents have empty/unreadable text — possible poor quality or tampering")
-                score -= 3
-                reasoning_steps.append("All document extractions empty → applied -3 penalty")
-
-        details["fraud_signals_count"] = len(fraud_signals)
-        details["identity_llm"] = llm_identity
-
-        # ── 6. Scoring — clamp ─────────────────────────────────────────
-        score = _clamp(score)
-
-        # ── 7. Confidence rules ────────────────────────────────────────
-        reasoning_steps.append("Step 6: Apply confidence rules")
-
-        if missing_data or contradictions:
-            confidence = min(confidence, 69)
-            reasoning_steps.append(
-                "Missing data or contradictions present → confidence capped below 70"
-            )
-
-        if format_valid and ocr_match and not contradictions and not suspicious_patterns:
-            confidence = max(confidence, 85)
-        else:
-            confidence = min(confidence, 84)
-
-        confidence = _clamp(confidence)
-        if (cin_raw or ipp_raw) and not (ocr_match or ipp_found):
-            score = min(score, 20)
-
-        # ── 8. Build explanation ───────────────────────────────────────
-        reasoning_steps.append("Step 7: Build final assessment")
-
-        explanation_parts: List[str] = []
-        if not cin_raw:
-            explanation_parts.append(
-                "No CIN was provided; identity assessment is severely limited."
-            )
-        elif format_valid:
-            explanation_parts.append(
-                f"CIN '{cin_raw}' is structurally valid (matches Moroccan CIN format)."
-            )
-        else:
-            explanation_parts.append(
-                f"CIN '{cin_raw}' does NOT match the expected Moroccan CIN format."
-            )
-
-        if ocr_checked:
-            if ocr_match:
-                explanation_parts.append(
-                    "CIN is consistent with provided documents."
-                )
-            else:
-                explanation_parts.append(
-                    "CIN could NOT be confirmed in the submitted documents, "
-                    "indicating a potential inconsistency."
-                )
-
-        if contradictions:
-            explanation_parts.append(
-                f"Detected {len(contradictions)} contradiction(s) across identity sources."
-            )
-        if fraud_signals:
-            explanation_parts.append(
-                f"Identified {len(fraud_signals)} contextual fraud signal(s)."
-            )
-        if missing_data:
-            explanation_parts.append(
-                f"Missing data points: {', '.join(missing_data)}."
-            )
-
-        explanation_parts.append(
-            f"Final score: {score}/100 | Confidence: {confidence}/100."
-        )
-        explanation = " ".join(explanation_parts)
-
-        # ── 9. Fail conditions ─────────────────────────────────────────
-        if score == 100 and not ocr_checked:
-            raise RuntimeError(
-                "IdentityAgent: score=100 but OCR was not checked. "
-                "This violates the mandatory OCR cross-validation requirement."
-            )
-        if not reasoning_steps:
-            raise RuntimeError(
-                "IdentityAgent: no reasoning_steps produced. "
-                "Analysis must always document its reasoning."
-            )
-        if len(explanation) < 20:
-            raise RuntimeError(
-                "IdentityAgent: explanation is too generic/short. "
-                "A meaningful assessment is required."
-            )
-
-        # ── Structured output ──────────────────────────────────────────
-        cin_analysis = {
-            "format_valid": format_valid,
-            "suspicious_patterns": suspicious_patterns,
-            "ocr_match": ocr_match,
-        }
-
-        details["cin_analysis"] = cin_analysis
-        details["observations"] = observations
-        details["missing_data"] = missing_data
-        details["contradictions"] = contradictions
-        details["fraud_signals"] = fraud_signals
-        details["reasoning_steps"] = reasoning_steps
-        details["confidence"] = confidence
-
-        # ── Security layer (mirrors DocumentAgent) ─────────────────────
-        all_flags: List[str] = []
-        if not format_valid and cin_raw:
-            all_flags.append("invalid_cin_format")
-        if contradictions:
-            all_flags.append("identity_contradictions")
-        if missing_data:
-            all_flags.append("missing_identity_data")
-
-        risk_base = score_to_risk_score(float(score))
-        structured = {
-            "risk_score": risk_base,
-            "flags": list(dict.fromkeys(all_flags)),
-            "explanation": explanation,
-        }
-
-        def rebuild() -> Dict[str, Any]:
-            return {
-                "risk_score": 0.5,
-                "flags": list(dict.fromkeys([*all_flags, "validation_error"])),
-                "explanation": explanation,
-            }
-
-        validated = coerce_risk_output(structured, rebuild=rebuild)
-
-        fp = hash_text(json.dumps(
-            {"cin": cin_raw, "doc_count": doc_count, "history_len": len(history)},
-            sort_keys=True,
-            default=str,
-        ))
-        final_risk = float(validated.risk_score)
-        log_security_event(
-            agent_name=self.name,
-            payload_fingerprint=fp,
-            flags=validated.flags,
-            risk_score=final_risk,
-        )
-
+        structure = _validate_cin_structure(cin_raw) if cin_raw else CINStructureResult(False, ["CIN missing"])
+        if not structure.valid:
+            score -= 45
+            reasons.extend(structure.reasons)
+        if extracted.get("cin") and cin_raw and str(extracted.get("cin")).upper() != cin_raw:
+            score -= 20
+            contradictions.append("claim_cin_mismatch_with_extraction")
+        if tool_results["fraud_detector"].get("output", {}).get("risk_indicators", 0) > 0:
+            score -= 20
+            reasons.append("identity_related fraud indicators detected")
+        score = max(0.0, score)
         decision = score > 60
 
-        # Memory context integration
-        memory_adjusted_score, memory_insights = process_memory_context(
-            agent_name=self.name,
-            claim_data=claim_data,
-            current_score=float(score),
-            current_cin=cin_raw,
-        )
-        if memory_adjusted_score != float(score):
-            score = _clamp(int(memory_adjusted_score))
-            decision = score > 60
-        details["memory_insights"] = memory_insights
+        llm_fallback = self.should_use_llm_fallback(tool_results)
+        reasoning = "; ".join(reasons) if reasons else "Identity signals look consistent"
+        if llm_fallback:
+            print("[LLM FALLBACK USED] True")
+            llm_reasoning, _ = run_agent_consistency_check(
+                agent_name=self.name,
+                claim_data=claim_data,
+                draft_reasoning=reasoning,
+            )
+            reasoning = llm_reasoning
+        else:
+            print("[LLM FALLBACK USED] False")
 
-        llm_explanation = explanation
-        details["llm_consistency"] = {
-            "agent_type": "DETERMINISTIC_AGENT",
-            "llm_calls": 1 if llm_identity.get("confidence", 0) > 0 else 0,
-            "deterministic_declared": True,
-        }
         payload = {
             "agent_name": self.name,
             "decision": decision,
             "score": round(score, 2),
-            "reasoning": llm_explanation,
-            "details": details,
-            "cin_analysis": cin_analysis,
-            "evidence": {"cin_found": bool(ocr_match), "ipp_found": bool(ipp_found)},
-            "observations": observations,
-            "missing_data": missing_data,
-            "contradictions": contradictions,
-            "fraud_signals": fraud_signals,
-            "reasoning_steps": reasoning_steps,
-            "confidence": confidence,
-            "explanation": llm_explanation,
-            "risk_score": final_risk,
-            "flags": validated.flags,
-            "memory_insights": memory_insights,
-            "identity_extraction": llm_identity,
+            "reasoning": reasoning,
+            "explanation": reasoning,
+            "details": {
+                "cin": cin_raw or None,
+                "ipp": ipp_raw or None,
+                "cin_structure_valid": structure.valid,
+                "contradictions": contradictions,
+                "identity_extraction": extracted,
+                "tool_results": tool_results,
+            },
         }
-        return self._ensure_contract(
-            {
-                "agent": self.name,
-                "status": "DONE",
-                "output": payload,
-                "score": float(payload["score"]),
-                "reason": llm_explanation,
-            }
+        self.enforce_tool_trace(tool_results, llm_fallback)
+        return self.build_agent_result(
+            output=payload,
+            score=float(payload["score"]),
+            reason=reasoning,
+            tools_used=list(tool_results.keys()),
+            llm_fallback_used=llm_fallback,
         )

@@ -218,8 +218,13 @@ def _run_lightweight_llm_injection_classifier(text: str) -> dict[str, Any]:
             worker_error = None
         if worker_error is not None:
             raise worker_error
-        raw = result_queue.get_nowait()
-        content_str = json.dumps(raw, ensure_ascii=False, default=str) if isinstance(raw, dict) else str(raw).strip()
+        result = result_queue.get_nowait()
+        if not isinstance(result, dict):
+            raise RuntimeError("LLM_RESPONSE_LOST")
+        content_str = str(result.get("response") or "").strip()
+        if not content_str:
+            raise RuntimeError("LLM_RESPONSE_LOST")
+        print("[LLM OUTPUT USED]")
         try:
             parsed = json.loads(content_str)
         except json.JSONDecodeError:

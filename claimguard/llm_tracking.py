@@ -107,11 +107,21 @@ def safe_tracked_llm_call(agent_name: str, prompt: str, llm_callable: Callable[[
     print(f"[LLM CALL START] agent={agent_name}")
     print(f"[PROMPT LENGTH] {len(safe_prompt)}")
     raw = tracked_llm_call(agent_name, safe_prompt, llm_callable)
+    if raw is None:
+        raise RuntimeError("LLM_RESPONSE_LOST")
     raw_text = str(getattr(raw, "content", raw))
-    print(f"[AGENT RAW RESPONSE] {raw_text[:500]}")
+    if not raw_text.strip():
+        raise RuntimeError("LLM_RESPONSE_LOST")
+    print(f"[LLM RAW RESPONSE] {raw_text}")
+    print("[LLM RESPONSE RECEIVED]")
     parsed = parse_llm_json(raw_text)
     print(f"[AGENT PARSED OUTPUT] {str(parsed)[:500]}")
-    return parsed
+    print("[LLM RESPONSE PARSED]")
+    return {
+        "response": raw_text,
+        "parsed": parsed,
+        "agent": str(agent_name or "unassigned_agent"),
+    }
 
 
 class TrackedLLMProxy:

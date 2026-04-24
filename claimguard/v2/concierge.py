@@ -28,8 +28,8 @@ def score_document_complexity(documents: List[Dict[str, Any]], metadata: Dict[st
 
 def choose_model(complexity: str) -> str:
     mapping = {
-        "simple": "mistral",
-        "complex": "llama3",
+        "simple": "llama3",
+        "complex": "deepseek-r1",
         "high_risk": "deepseek-r1",
     }
     return mapping[complexity]

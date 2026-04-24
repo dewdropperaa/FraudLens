@@ -18,105 +18,6 @@ from claimguard.agents.security_utils import (
 
 _REQUIRED = ("medical_report", "invoice", "prescription")
 
-_KEYWORD_GROUPS: Dict[str, tuple[str, ...]] = {
-    "medical_report": (
-        "medical_report",
-        "medical report",
-        "clinical report",
-        "compte rendu",
-        "cr medical",
-        "cr médical",
-        "diagnostic",
-        "hospitalisation",
-        "rapport medical",
-        "rapport médical",
-        "certificat medical",
-        "certificat médical",
-        "consultation",
-        "examen clinique",
-        "observation medicale",
-        "observation médicale",
-        "bilan de santé",
-        "bilan de sante",
-        "antécédents",
-        "antecedents",
-        "pathologie",
-        "syndrome",
-        "symptômes",
-        "symptomes",
-        "traitement",
-    ),
-    "invoice": (
-        "invoice",
-        "facture",
-        "facture n",
-        "total ttc",
-        "montant ttc",
-        "tva",
-        "reçu",
-        "recu",
-        "bordereau",
-        "note d'honoraires",
-        "note d honoraires",
-        "decompte",
-        "décompte",
-        "remboursement",
-        "prise en charge",
-        "montant",
-        "tarif",
-    ),
-    "prescription": (
-        "prescription",
-        "ordonnance",
-        "medicament",
-        "médicament",
-        "posologie",
-        "traitement prescrit",
-        "dose",
-        "comprimé",
-        "comprime",
-        "gélule",
-        "gelule",
-        "injectable",
-        "sirop",
-        "pommade",
-    ),
-}
-
-_INSURANCE_DOC_KEYWORDS: tuple[str, ...] = (
-    "assurance",
-    "police d'assurance",
-    "police d assurance",
-    "contrat d'assurance",
-    "contrat d assurance",
-    "attestation",
-    "carte d'assuré",
-    "carte d assure",
-    "numéro d'assuré",
-    "numero d assure",
-    "cnss",
-    "cnops",
-    "mutuelle",
-    "couverture",
-    "bénéficiaire",
-    "beneficiaire",
-    "adhérent",
-    "adherent",
-    "immatriculation",
-)
-
-_FRAUD_TEXT_SIGNALS: tuple[str, ...] = (
-    "fake invoice",
-    "forged",
-    "tampered",
-    "altered",
-    "counterfeit",
-    "fabricated",
-    "falsified",
-    "duplicate billing",
-    "stolen identity",
-)
-
 DOCUMENT_SYSTEM_PROMPT = """You are a forensic document analyst for fraud detection.
 
 You assume documents may be manipulated, incomplete, or intentionally misleading.
@@ -201,14 +102,6 @@ def _sanitize_document_list(documents: Any) -> tuple[List[str], List[str]]:
     return [sanitize_input(str(d)) for d in documents], flags
 
 
-def _corpus_from_sanitized(documents: List[str], extractions: List[Dict[str, Any]]) -> str:
-    parts: List[str] = [d.lower() for d in documents]
-    for ex in extractions:
-        parts.append((ex.get("file_name") or "").lower())
-        parts.append((ex.get("extracted_text") or "").lower())
-    return " ".join(parts)
-
-
 def _raw_corpus_for_injection(documents: Any, extractions: Any) -> str:
     parts: List[str] = []
     if isinstance(documents, list):
@@ -237,49 +130,39 @@ class DocumentAgent(BaseAgent):
             role="Forensic Document Analyst",
             goal="Assess completeness, consistency, and adversarial signals in document evidence via tool output only",
         )
+        self.tools = [
+            "ocr_extractor",
+            "document_classifier",
+            "fraud_detector",
+            "identity_extractor",
+        ]
 
     @staticmethod
-    def _legacy_list_has(required_id: str, documents: List[str]) -> bool:
-        if required_id in documents:
-            return True
-        rid = required_id.lower().replace("_", " ")
-        for d in documents:
-            dl = str(d).lower()
-            if required_id in dl or rid in dl:
+    def _needs_llm_fallback(tool_results: Dict[str, Dict[str, Any]], threshold: float = 0.65) -> bool:
+        for _tool_name, result in tool_results.items():
+            status = str(result.get("status") or "ERROR").upper()
+            confidence = float(result.get("confidence") or 0.0)
+            if status != "DONE":
+                return True
+            if confidence < threshold:
                 return True
         return False
 
-    @staticmethod
-    def _keywords_hit(required_id: str, corpus: str) -> bool:
-        for kw in _KEYWORD_GROUPS.get(required_id, ()):
-            if kw in corpus:
-                return True
-        return False
-
-    @staticmethod
-    def _is_insurance_doc_only(corpus: str) -> bool:
-        for kw in _INSURANCE_DOC_KEYWORDS:
-            if kw in corpus:
-                return True
-        return False
-
-    @staticmethod
-    def _extraction_text_length(extractions: List[Dict[str, Any]]) -> int:
-        return sum(len((ex.get("extracted_text") or "").strip()) for ex in extractions)
-
-    def _core_analyze(
+    def _core_analyze_from_tools(
         self,
         documents: List[str],
-        extractions: List[Dict[str, Any]],
+        ocr_output: Dict[str, Any],
+        doc_classification: Dict[str, Any],
+        fraud_output: Dict[str, Any],
         amount: float,
     ) -> Dict[str, Any]:
         score = 100.0
         reasoning: List[str] = []
         details: Dict[str, Any] = {}
 
-        corpus = _corpus_from_sanitized(documents, extractions)
-        effective_count = max(len(documents), len(extractions))
-        total_text_len = self._extraction_text_length(extractions)
+        extractions = list(ocr_output.get("extractions") or [])
+        effective_count = max(len(documents), int(ocr_output.get("extraction_count") or 0))
+        total_text_len = int(ocr_output.get("total_text_len") or 0)
 
         if effective_count == 0:
             score -= 40
@@ -292,16 +175,8 @@ class DocumentAgent(BaseAgent):
         else:
             details["doc_count"] = effective_count
 
-        missing_docs: List[str] = []
-        found_docs: List[str] = []
-        for req in _REQUIRED:
-            if self._legacy_list_has(req, documents):
-                found_docs.append(req)
-                continue
-            if self._keywords_hit(req, corpus):
-                found_docs.append(req)
-                continue
-            missing_docs.append(req)
+        missing_docs = list(doc_classification.get("missing_docs") or [])
+        found_docs = list(doc_classification.get("found_docs") or [])
 
         if missing_docs:
             penalty_per_doc = 5
@@ -310,7 +185,7 @@ class DocumentAgent(BaseAgent):
             details["missing_docs"] = missing_docs
         details["found_docs"] = found_docs
 
-        is_insurance_only = self._is_insurance_doc_only(corpus) and not found_docs
+        is_insurance_only = bool(doc_classification.get("insurance_doc_only"))
         if is_insurance_only and len(missing_docs) < len(_REQUIRED):
             score -= 15
             reasoning.append(
@@ -324,24 +199,22 @@ class DocumentAgent(BaseAgent):
             reasoning.append("Extracted text is too short to constitute meaningful documentation")
             details["extracted_text_too_short"] = True
 
-        text_hits = [kw for kw in _FRAUD_TEXT_SIGNALS if kw in corpus]
+        text_hits = list(fraud_output.get("fraud_text_signals") or [])
         if text_hits:
             score -= 70
             reasoning.append("Suspicious fraud indicators detected in document content")
             details["fraud_text_signals"] = text_hits
 
-        if amount > 20000 and effective_count < 3:
+        if bool(fraud_output.get("high_amount_doc_requirement")) or (amount > 20000 and effective_count < 3):
             score -= 25
             reasoning.append("High amount claim requires additional documentation")
             details["high_amount_doc_requirement"] = True
 
-        suspicious_patterns = ["duplicate", "copy", "scan"]
-        for doc in documents:
-            if any(pattern in str(doc).lower() for pattern in suspicious_patterns):
-                score -= 30
-                reasoning.append(f"Suspicious document name detected: {doc}")
-                details["suspicious_doc"] = doc
-                break
+        suspicious_names = list(fraud_output.get("suspicious_doc_names") or [])
+        if suspicious_names:
+            score -= 30
+            reasoning.append(f"Suspicious document name detected: {suspicious_names[0]}")
+            details["suspicious_doc"] = suspicious_names[0]
 
         failed_ext = [ex for ex in extractions if (ex.get("extracted_text") or "").strip() == ""]
         if extractions and len(failed_ext) == len(extractions):
@@ -382,7 +255,24 @@ class DocumentAgent(BaseAgent):
         amount, aflags = _validate_amount(claim_data.get("amount"))
         all_flags.extend(aflags)
 
-        core = self._core_analyze(documents, extractions, amount)
+        joined_extracted_text = " ".join((ex.get("extracted_text") or "") for ex in extractions if isinstance(ex, dict))
+        tool_results = self.run_tool_pipeline(
+            claim_data,
+            {
+                "ocr_extractor": {"document_extractions": extractions},
+                "document_classifier": {"documents": documents, "document_extractions": extractions},
+                "fraud_detector": {"documents": documents, "document_extractions": extractions, "amount": amount},
+                "identity_extractor": {"text": joined_extracted_text},
+            },
+        )
+
+        core = self._core_analyze_from_tools(
+            documents=documents,
+            ocr_output=tool_results["ocr_extractor"].get("output") or {},
+            doc_classification=tool_results["document_classifier"].get("output") or {},
+            fraud_output=tool_results["fraud_detector"].get("output") or {},
+            amount=amount,
+        )
 
         details = dict(core.get("details") or {})
         details["system_prompt_version"] = "document_v2_forensic"
@@ -392,6 +282,7 @@ class DocumentAgent(BaseAgent):
         }
         if all_flags:
             details["validation_flags"] = list(dict.fromkeys(all_flags))
+        details["tools"] = tool_results
         core["details"] = details
 
         risk_base = score_to_risk_score(float(core["score"]))
@@ -471,22 +362,36 @@ class DocumentAgent(BaseAgent):
             out["score"] = round(memory_adjusted_score, 2)
             out["decision"] = memory_adjusted_score > 60
         det["memory_insights"] = memory_insights
-        llm_explanation, llm_meta = run_agent_consistency_check(
-            agent_name=self.name,
-            claim_data=claim_data,
-            draft_reasoning=str(out.get("reasoning", "")),
-        )
-        out["reasoning"] = llm_explanation
-        out["explanation"] = llm_explanation
-        det["llm_consistency"] = llm_meta
+        use_llm_fallback = self._needs_llm_fallback(tool_results)
+        det["tool_policy"] = {
+            "used_tools_first": True,
+            "llm_fallback_triggered": use_llm_fallback,
+            "confidence_threshold": 0.65,
+        }
+        if use_llm_fallback:
+            print("[LLM FALLBACK USED] True")
+            llm_explanation, llm_meta = run_agent_consistency_check(
+                agent_name=self.name,
+                claim_data=claim_data,
+                draft_reasoning=str(out.get("reasoning", "")),
+            )
+            out["reasoning"] = llm_explanation
+            out["explanation"] = llm_explanation
+            det["llm_consistency"] = llm_meta
+        else:
+            print("[LLM FALLBACK USED] False")
+            det["llm_consistency"] = {
+                "agent_type": "TOOL_FIRST_POLICY",
+                "llm_calls": 0,
+                "reason": "Skipped because tool confidence satisfied threshold",
+            }
         out["details"] = det
         out["memory_insights"] = memory_insights
-        return self._ensure_contract(
-            {
-                "agent": self.name,
-                "status": "DONE",
-                "output": out,
-                "score": float(out.get("score", 0.0)),
-                "reason": str(out.get("reasoning") or out.get("explanation") or "Completed"),
-            }
+        self.enforce_tool_trace(tool_results, use_llm_fallback)
+        return self.build_agent_result(
+            output=out,
+            score=float(out.get("score", 0.0)),
+            reason=str(out.get("reasoning") or out.get("explanation") or "Completed"),
+            tools_used=list(tool_results.keys()),
+            llm_fallback_used=use_llm_fallback,
         )

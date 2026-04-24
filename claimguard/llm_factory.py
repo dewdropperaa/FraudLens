@@ -10,8 +10,8 @@ except ImportError:  # Backward-compat fallback until langchain-ollama is instal
 from claimguard.llm_tracking import TrackedLLMProxy, safe_tracked_llm_call
 
 _MODEL_ROUTES: Final[dict[str, str]] = {
-    "simple": "mistral",
-    "complex": "llama3",
+    "simple": "llama3",
+    "complex": "deepseek-r1",
     "high_risk": "deepseek-r1",
 }
 
@@ -50,7 +50,8 @@ def assert_ollama_connection() -> None:
         return
     if os.getenv("PYTEST_CURRENT_TEST"):
         return
-    llm = get_llm("mistral", tracked=False)
-    response = safe_tracked_llm_call("SystemHealthCheck", "Say 'Ollama working' and respond with JSON", llm.invoke)
-    if not str(response).strip():
+    llm = get_llm("llama3", tracked=False)
+    result = safe_tracked_llm_call("SystemHealthCheck", "Say 'Ollama working' and respond with JSON", llm.invoke)
+    response = str(result.get("response") or "")
+    if not response.strip():
         raise RuntimeError("Ollama connectivity test failed: empty response.")

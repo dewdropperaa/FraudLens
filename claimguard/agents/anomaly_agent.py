@@ -197,146 +197,44 @@ class AnomalyAgent(BaseAgent):
         }
 
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
-        all_flags: List[str] = []
-
-        pid = claim_data.get("patient_id")
-        if pid is None:
-            all_flags.append("missing_patient_id")
-        elif not isinstance(pid, (str, int)):
-            all_flags.append("malformed_patient_id")
-        patient_key = _patient_fingerprint(pid)
-
-        amount, aflags = _validate_amount(claim_data.get("amount"))
-        all_flags.extend(aflags)
-
-        raw_history = claim_data.get("history")
-        history, hflags = _normalize_history(raw_history)
-        all_flags.extend(hflags)
-
-        raw_documents = claim_data.get("documents")
-        if raw_documents is None:
-            document_list: List[Any] = []
-        elif isinstance(raw_documents, list):
-            document_list = raw_documents
-        else:
-            document_list = []
-            all_flags.append("malformed_documents")
-
-        document_count = len(document_list)
-
-        raw_injection_corpus = _raw_fingerprint_for_injection(claim_data, raw_history, raw_documents)
-        if detect_prompt_injection(raw_injection_corpus):
-            all_flags.append("prompt_injection_detected")
-
-        if all_flags:
-            details_pre = {"validation_flags": list(dict.fromkeys(all_flags))}
-        else:
-            details_pre = {}
-
-        core = self._core_analyze(patient_key, amount, history, document_count)
-        details = dict(core.get("details") or {})
-        details.update(details_pre)
-        details["system_prompt_version"] = "anomaly_v2_forensic"
-        details["numeric_context"] = {"amount": amount, "document_count": document_count}
-        details["behavioral_context"] = {"history_len": len(history)}
-        core["details"] = details
-
-        risk_base = score_to_risk_score(float(core["score"]))
-        if any(
-            x in all_flags
-            for x in (
-                "missing_patient_id",
-                "malformed_history",
-                "malformed_patient_id",
-                "invalid_amount",
-                "amount_out_of_bounds",
-                "malformed_documents",
-                "missing_amount",
-            )
-        ):
-            risk_base = bump_risk(risk_base, 0.1)
-            if "defensive_uncertainty" not in all_flags:
-                all_flags.append("defensive_uncertainty")
-
-        if "prompt_injection_detected" in all_flags:
-            risk_base = bump_risk(risk_base, 0.1)
-
-        structured = {
-            "risk_score": risk_base,
-            "flags": list(dict.fromkeys(all_flags)),
-            "explanation": str(core.get("reasoning", "")),
-        }
-
-        def rebuild() -> Dict[str, Any]:
-            return {
-                "risk_score": 0.5,
-                "flags": list(dict.fromkeys([*all_flags, "validation_error"])),
-                "explanation": str(core.get("reasoning", "")),
-            }
-
-        validated = coerce_risk_output(structured, rebuild=rebuild)
-
-        fp = hash_text(
-            json.dumps(
-                {
-                    "patient_key": patient_key,
-                    "amount": amount,
-                    "history": history,
-                    "document_count": document_count,
-                },
-                sort_keys=True,
-                default=str,
-            )
-        )
-        final_risk = float(validated.risk_score)
-        if "defensive_uncertainty" in validated.flags:
-            final_risk = max(final_risk, 0.4)
-
-        log_security_event(
-            agent_name=self.name,
-            payload_fingerprint=fp,
-            flags=validated.flags,
-            risk_score=final_risk,
-        )
-
-        structured = validated.model_dump()
-        structured["risk_score"] = final_risk
-        out = {
-            **core,
-            "risk_score": final_risk,
-            "flags": validated.flags,
-            "explanation": validated.explanation,
-        }
-        det = dict(out.get("details") or {})
-        det["structured_risk"] = structured
-
-        # Memory context integration
-        memory_adjusted_score, memory_insights = process_memory_context(
-            agent_name=self.name,
-            claim_data=claim_data,
-            current_score=float(core["score"]),
-            current_cin=str(claim_data.get("patient_id") or ""),
-        )
-        if memory_adjusted_score != float(core["score"]):
-            out["score"] = round(memory_adjusted_score, 2)
-            out["decision"] = memory_adjusted_score > 60
-        llm_explanation, llm_meta = run_agent_consistency_check(
-            agent_name=self.name,
-            claim_data=claim_data,
-            draft_reasoning=str(out.get("reasoning", "")),
-        )
-        out["reasoning"] = llm_explanation
-        out["explanation"] = llm_explanation
-        det["llm_consistency"] = llm_meta
-        det["memory_insights"] = memory_insights
-        out["details"] = det
-        out["memory_insights"] = memory_insights
-        return self._ensure_contract(
+        tool_results = self.run_tool_pipeline(
+            claim_data,
             {
-                "agent": self.name,
-                "status": "DONE",
-                "output": out,
-                "score": float(out.get("score", 0.0)),
-                "reason": str(out.get("reasoning") or out.get("explanation") or "Completed"),
-            }
+                "fraud_detector": {
+                    "documents": claim_data.get("documents") or [],
+                    "document_extractions": claim_data.get("document_extractions") or [],
+                    "amount": claim_data.get("amount", 0),
+                }
+            },
+        )
+        fraud_out = tool_results["fraud_detector"].get("output") or {}
+        indicators = int(fraud_out.get("risk_indicators") or 0)
+        score = max(0.0, 100.0 - (indicators * 22.0))
+        reasoning = "Anomaly score computed from fraud/anomaly tool signals"
+        llm_fallback = self.should_use_llm_fallback(tool_results)
+        if llm_fallback:
+            print("[LLM FALLBACK USED] True")
+            reasoning, _ = run_agent_consistency_check(
+                agent_name=self.name,
+                claim_data=claim_data,
+                draft_reasoning=reasoning,
+            )
+        else:
+            print("[LLM FALLBACK USED] False")
+
+        payload = {
+            "agent_name": self.name,
+            "decision": score > 60,
+            "score": round(score, 2),
+            "reasoning": reasoning,
+            "explanation": reasoning,
+            "details": {"risk_indicators": indicators, "tool_results": tool_results},
+        }
+        self.enforce_tool_trace(tool_results, llm_fallback)
+        return self.build_agent_result(
+            output=payload,
+            score=float(payload["score"]),
+            reason=reasoning,
+            tools_used=list(tool_results.keys()),
+            llm_fallback_used=llm_fallback,
         )

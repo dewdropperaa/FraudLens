@@ -54,106 +54,48 @@ class GraphAgent(BaseAgent):
             }
 
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
-        memory_status = str(claim_data.get("memory_status", "OK") or "OK").upper()
-        raw_amt = claim_data.get("amount", claim_data.get("claim_amount", 0.0))
-        amount_parse_ok = True
-        try:
-            float(raw_amt if raw_amt is not None else 0.0)
-        except (TypeError, ValueError):
-            amount_parse_ok = False
-
-        history = claim_data.get("history", [])
-        if not isinstance(history, list):
-            history = []
-
+        tool_results = self.run_tool_pipeline(
+            claim_data,
+            {
+                "fraud_detector": {
+                    "documents": claim_data.get("documents") or [],
+                    "document_extractions": claim_data.get("document_extractions") or [],
+                    "amount": claim_data.get("amount", 0),
+                }
+            },
+        )
         graph_out = self.analyze_graph_risk(claim_data)
-        fraud_probability = float(graph_out["fraud_probability"])
-        pattern = graph_out.get("pattern_detected", "")
-        risk_nodes = graph_out.get("risk_nodes", [])
+        fraud_probability = float(graph_out.get("fraud_probability", 0.5))
         score = max(0.0, min(100.0, round((1.0 - fraud_probability) * 100.0, 2)))
-
-        if pattern == "insufficient_graph_input":
-            score = min(score, 55.0)
-        if not amount_parse_ok:
-            score = min(score, 40.0)
-
-        no_graph_data = (
-            fraud_probability < 0.01
-            and len(risk_nodes) <= 3
-            and pattern in ("no_graph_pattern", "no_pattern", "")
+        reasoning = (
+            f"Graph risk uses structured graph features and tool signals; "
+            f"fraud_probability={fraud_probability:.4f}"
         )
-        if no_graph_data:
-            score = min(score, 75.0)
-
-        if len(history) == 0 and no_graph_data:
-            score = min(score, 70.0)
-
-        decision = score > 60 and fraud_probability < 0.5
-        moderate_band = 0.12 <= fraud_probability < 0.5
-        reasoning_parts = [
-            f"Graph pattern={pattern}",
-            f"fraud_probability={fraud_probability:.4f}",
-            f"risk_nodes={len(risk_nodes)}",
-        ]
-        if no_graph_data:
-            reasoning_parts.append(
-                "Limited graph data — score capped due to insufficient relationship history"
+        llm_fallback = self.should_use_llm_fallback(tool_results)
+        if llm_fallback:
+            print("[LLM FALLBACK USED] True")
+            reasoning, _ = run_agent_consistency_check(
+                agent_name=self.name,
+                claim_data=claim_data,
+                draft_reasoning=reasoning,
             )
-        if moderate_band:
-            reasoning_parts.append(
-                "Moderate graph risk: probabilistic signal — review indirect ties, clusters, and risk_nodes."
-            )
-        reasoning = "; ".join(reasoning_parts)
-        details = dict(graph_out)
-        details["system_prompt_version"] = "graph_v2_network"
-        details["moderate_graph_risk_band"] = moderate_band
-        details["no_graph_data"] = no_graph_data
-        if pattern == "insufficient_graph_input":
-            details.setdefault("validation_flags", []).append("missing_graph_ids")
+        else:
+            print("[LLM FALLBACK USED] False")
 
-        # Memory context integration
-        memory_adjusted_score, memory_insights = process_memory_context(
-            agent_name=self.name,
-            claim_data=claim_data,
-            current_score=float(score),
-            current_cin=str(claim_data.get("patient_id") or ""),
-        )
-        if memory_adjusted_score != float(score):
-            score = max(0.0, min(100.0, memory_adjusted_score))
-            decision = score > 60 and fraud_probability < 0.5
-        details["memory_insights"] = memory_insights
-        if memory_status != "OK":
-            score = max(0.0, min(100.0, score - 12.0))
-            decision = score > 60 and fraud_probability < 0.5
-            reasoning = (
-                f"{reasoning}; Memory status is {memory_status}; "
-                "reduced confidence in graph/pattern correlation."
-            )
-        details["memory_status"] = memory_status
-        confidence = max(0.2, min(0.95, score / 100.0))
-
-        llm_explanation, llm_meta = run_agent_consistency_check(
-            agent_name=self.name,
-            claim_data=claim_data,
-            draft_reasoning=reasoning,
-        )
-        details["llm_consistency"] = llm_meta
         payload = {
             "agent_name": self.name,
-            "decision": decision,
+            "decision": score > 60 and fraud_probability < 0.5,
             "score": score,
-            "confidence": round(confidence, 2),
-            "reasoning": llm_explanation,
-            "explanation": llm_explanation,
-            "details": details,
-            "memory_insights": memory_insights,
+            "confidence": round(max(0.2, min(0.95, score / 100.0)), 2),
+            "reasoning": reasoning,
+            "explanation": reasoning,
+            "details": {"graph_output": graph_out, "tool_results": tool_results},
         }
-        return self._ensure_contract(
-            {
-                "agent": self.name,
-                "status": "DONE",
-                "output": payload,
-                "score": float(payload["score"]),
-                "reason": llm_explanation,
-            }
+        self.enforce_tool_trace(tool_results, llm_fallback)
+        return self.build_agent_result(
+            output=payload,
+            score=float(payload["score"]),
+            reason=reasoning,
+            tools_used=list(tool_results.keys()),
+            llm_fallback_used=llm_fallback,
         )

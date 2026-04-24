@@ -1,12 +1,23 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Any, Dict, List
+
+from claimguard.v2.tools import execute_tool as run_registered_tool
+from claimguard.v2.tools import list_tools as list_registered_tools
 
 
 class BaseAgent(ABC):
+    _observability: Dict[str, int] = {
+        "runs": 0,
+        "tool_usage": 0,
+        "llm_fallback": 0,
+        "tool_failures": 0,
+    }
+
     def __init__(self, name: str, role: str, goal: str):
         self.name = name
         self.role = role
         self.goal = goal
+        self.tools = []
 
     @abstractmethod
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -20,13 +31,19 @@ class BaseAgent(ABC):
                 "output": {},
                 "score": 0.0,
                 "reason": reason,
+                "tools_used": [],
+                "tool_policy": {
+                    "tool_first": True,
+                    "llm_fallback_used": False,
+                },
             }
 
         if result is None:
             return _error("Agent returned None")
         if not isinstance(result, dict):
             return _error("Agent returned non-dict output")
-        if not {"agent", "status", "output", "score", "reason"}.issubset(result.keys()):
+        required = {"agent", "status", "output", "score", "reason", "tools_used", "tool_policy"}
+        if not required.issubset(result.keys()):
             return _error("Agent returned invalid contract")
         payload = dict(result)
         payload["agent"] = str(payload.get("agent") or self.name)
@@ -34,19 +51,128 @@ class BaseAgent(ABC):
         payload["output"] = payload.get("output") if isinstance(payload.get("output"), dict) else {}
         payload["score"] = float(payload.get("score") or 0.0)
         payload["reason"] = str(payload.get("reason") or "")
+        payload["tools_used"] = payload.get("tools_used") if isinstance(payload.get("tools_used"), list) else []
+        policy = payload.get("tool_policy") if isinstance(payload.get("tool_policy"), dict) else {}
+        payload["tool_policy"] = {
+            "tool_first": bool(policy.get("tool_first", False)),
+            "llm_fallback_used": bool(policy.get("llm_fallback_used", False)),
+        }
         if payload["status"] not in {"DONE", "ERROR"}:
             return _error("Agent returned invalid status")
         if payload["output"] in ({}, None):
             return _error("EMPTY_OUTPUT")
+        if payload["status"] == "DONE" and not payload["tools_used"]:
+            return _error("DONE_WITHOUT_TOOLS")
+        if payload["status"] == "DONE" and not payload["tool_policy"]["tool_first"]:
+            return {
+                "agent": self.name,
+                "status": "ERROR",
+                "output": {"system_state": "unstable", "action": "HUMAN_REVIEW"},
+                "score": 0.0,
+                "reason": "SYSTEM_UNSTABLE: tool_first invariant violated",
+                "tools_used": payload["tools_used"],
+                "tool_policy": {
+                    "tool_first": False,
+                    "llm_fallback_used": payload["tool_policy"]["llm_fallback_used"],
+                },
+            }
         if payload["status"] == "DONE" and payload["reason"].strip() == "":
             return _error("Missing reason for DONE status")
         return payload
+
+    def _require_llm_response_bundle(self, llm_result: Dict[str, Any] | None) -> Dict[str, Any]:
+        if not isinstance(llm_result, dict):
+            raise RuntimeError("LLM_RESPONSE_LOST")
+        raw_response = llm_result.get("response")
+        if raw_response is None or not str(raw_response).strip():
+            raise RuntimeError("LLM_RESPONSE_LOST")
+        if "parsed" not in llm_result:
+            raise RuntimeError("LLM_RESPONSE_LOST")
+        print("[LLM OUTPUT USED]")
+        return llm_result
+
+    def execute_tool(self, tool_name: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        print(f"[TOOL SELECTED] {tool_name}")
+        available = set(list_registered_tools())
+        if tool_name not in available:
+            return {
+                "tool": tool_name,
+                "status": "ERROR",
+                "output": {},
+                "confidence": 0.0,
+                "reason": f"Tool '{tool_name}' is not registered",
+            }
+        result = run_registered_tool(tool_name, input_data)
+        print(f"[TOOL EXECUTED] {tool_name}")
+        return result
+
+    def run_tool_pipeline(self, claim_data: Dict[str, Any], tool_inputs: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        print("[TOOL PIPELINE START]")
+        selected = list(tool_inputs.keys())
+        print(f"[TOOLS SELECTED] {selected}")
+        results: Dict[str, Dict[str, Any]] = {}
+        for tool_name, input_data in tool_inputs.items():
+            results[tool_name] = self.execute_tool(tool_name, input_data if isinstance(input_data, dict) else {})
+        print(f"[TOOLS EXECUTED] {list(results.keys())}")
+        for tool_name, result in results.items():
+            print(f"[TOOL RESULT USED] {tool_name} status={result.get('status')} confidence={result.get('confidence')}")
+            BaseAgent._observability["tool_usage"] += 1
+            if str(result.get("status") or "ERROR").upper() != "DONE":
+                BaseAgent._observability["tool_failures"] += 1
+        return results
+
+    @staticmethod
+    def should_use_llm_fallback(tool_results: Dict[str, Dict[str, Any]], threshold: float = 0.65) -> bool:
+        for result in tool_results.values():
+            status = str(result.get("status") or "ERROR").upper()
+            confidence = float(result.get("confidence") or 0.0)
+            if status != "DONE" or confidence < threshold:
+                return True
+        return False
+
+    def enforce_tool_trace(self, tool_results: Dict[str, Dict[str, Any]], llm_fallback_used: bool) -> None:
+        if not tool_results:
+            raise RuntimeError("TOOL_TRACE_MISSING")
+        print(f"[LLM FALLBACK USED] {llm_fallback_used}")
+        if llm_fallback_used:
+            BaseAgent._observability["llm_fallback"] += 1
+        print("[AGENT MIGRATION STATUS] tool_first_enforced")
+        runs = max(1, BaseAgent._observability["runs"])
+        print(f"[TOOL USAGE RATE] {BaseAgent._observability['tool_usage'] / runs:.2f}")
+        print(f"[LLM FALLBACK RATE] {BaseAgent._observability['llm_fallback'] / runs:.2f}")
+        print(f"[TOOL FAILURE RATE] {BaseAgent._observability['tool_failures'] / max(1, BaseAgent._observability['tool_usage']):.2f}")
+
+    def build_agent_result(
+        self,
+        *,
+        output: Dict[str, Any],
+        score: float,
+        reason: str,
+        tools_used: List[str],
+        llm_fallback_used: bool,
+        status: str = "DONE",
+    ) -> Dict[str, Any]:
+        return self._ensure_contract(
+            {
+                "agent": self.name,
+                "status": status,
+                "output": output,
+                "score": float(score),
+                "reason": reason,
+                "tools_used": list(tools_used),
+                "tool_policy": {
+                    "tool_first": True,
+                    "llm_fallback_used": bool(llm_fallback_used),
+                },
+            }
+        )
 
     def run(self, blackboard: Dict[str, Any]) -> Dict[str, Any]:
         return self._ensure_contract(self.analyze(blackboard))
 
     def safe_run(self, blackboard: Dict[str, Any]) -> Dict[str, Any]:
         try:
+            BaseAgent._observability["runs"] += 1
             result = self.run(blackboard)
             if result is None:
                 return {

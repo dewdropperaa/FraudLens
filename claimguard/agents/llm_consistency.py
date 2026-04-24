@@ -113,20 +113,23 @@ def run_agent_consistency_check(
 
     llm = get_llm("simple", tracked=False)
     with tracked_agent_context(agent_name):
-        response = safe_tracked_llm_call(agent_name, prompt, llm.invoke)
+        result = safe_tracked_llm_call(agent_name, prompt, llm.invoke)
     after = len(get_llm_tracking_records())
     llm_calls = max(0, after - before)
     if llm_calls < EXPECTED_LLM_CALLS_PER_AGENT:
         raise Exception(f"{agent_name} produced output without LLM call")
-    raw_response = json.dumps(response, ensure_ascii=False, default=str) if isinstance(response, dict) else str(response)
-    parsed = parse_llm_json(raw_response)
+    raw_response = str(result.get("response") or "")
+    if not raw_response.strip():
+        raise RuntimeError("LLM_RESPONSE_LOST")
+    print("[LLM OUTPUT USED]")
+    parsed = result.get("parsed")
+    if not isinstance(parsed, dict):
+        parsed = parse_llm_json(raw_response)
     response_text = ""
     if isinstance(parsed, dict):
         response_text = str(parsed.get("explanation") or parsed.get("reasoning") or "").strip()
-    if not response_text and isinstance(response, dict):
-        response_text = str(response.get("explanation", "")).strip()
-    if not response_text and isinstance(response, dict) and response.get("error") == "invalid_json":
-        response_text = str(response.get("raw", "")).strip()
+    if not response_text and isinstance(parsed, dict):
+        response_text = str(parsed.get("raw", "")).strip() if parsed.get("error") == "invalid_json" else ""
     explanation = response_text if response_text else draft_reasoning
     return explanation, {
         "agent_type": "LLM_AGENT",
