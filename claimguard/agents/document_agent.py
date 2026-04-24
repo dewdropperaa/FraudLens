@@ -481,4 +481,12 @@ class DocumentAgent(BaseAgent):
         det["llm_consistency"] = llm_meta
         out["details"] = det
         out["memory_insights"] = memory_insights
-        return out
+        return self._ensure_contract(
+            {
+                "agent": self.name,
+                "status": "DONE",
+                "output": out,
+                "score": float(out.get("score", 0.0)),
+                "reason": str(out.get("reasoning") or out.get("explanation") or "Completed"),
+            }
+        )

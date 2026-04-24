@@ -6,20 +6,23 @@ import os
 import hashlib
 import re
 import inspect
+import time
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, List, Literal, Tuple
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from crewai import Agent, Crew, Process, Task
 from langchain_community.embeddings import FakeEmbeddings, OllamaEmbeddings
 from sklearn.cluster import KMeans
 
+from claimguard.agents.identity_agent import IdentityAgent as DeterministicIdentityAgent
 from claimguard.agents.validation_agent import ClaimValidationAgent
 from claimguard.agents.security_utils import classify_prompt_injection, sanitize_for_prompt
 from claimguard.llm_factory import assert_ollama_connection, get_crewai_llm
-from claimguard.llm_tracking import tracked_agent_context
+from claimguard.llm_tracking import parse_llm_json, safe_tracked_llm_call, tracked_agent_context
 from claimguard.v2.blackboard import AgentContract, BlackboardValidationError, SharedBlackboard
 from claimguard.v2.concierge import build_routing_decision
 from claimguard.v2.consensus import ConsensusConfig, ConsensusEngine, should_force_human_review
@@ -227,6 +230,135 @@ def _exit_from_ts(ts: float) -> Dict[str, Any]:
 
 def _log_pipeline_terminated(stage: str, reason: str) -> None:
     LOGGER.warning("[PIPELINE TERMINATED] stage=%s reason=%s", stage, reason)
+
+
+def run_agent_with_timeout(
+    agent_name: str,
+    runner: Any,
+    timeout: float = 20.0,
+) -> Dict[str, Any]:
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(runner)
+        try:
+            return {"status": "DONE", "result": future.result(timeout=timeout)}
+        except FuturesTimeoutError:
+            future.cancel()
+            return {
+                "agent": agent_name,
+                "status": "TIMEOUT",
+                "score": 0,
+                "reason": "Execution timeout",
+                "output": {},
+            }
+        except Exception as exc:
+            return {
+                "agent": agent_name,
+                "status": "ERROR",
+                "score": 0,
+                "reason": str(exc),
+                "output": {},
+            }
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def validate_agent_result(
+    result: Dict[str, Any],
+    *,
+    required_fields: List[str] | None = None,
+) -> Dict[str, Any]:
+    required = {"agent", "status", "output", "score", "reason"}
+    payload = dict(result or {})
+    agent_name = str(payload.get("agent") or "UNKNOWN_AGENT")
+
+    def _error(reason: str) -> Dict[str, Any]:
+        return {
+            "agent": agent_name,
+            "status": "ERROR",
+            "output": {},
+            "score": 0.0,
+            "reason": reason,
+        }
+
+    if not required.issubset(payload.keys()):
+        return _error("VALIDATION_FAIL:SCHEMA")
+    status = str(payload.get("status") or "").upper()
+    if status not in {"DONE", "ERROR"}:
+        return _error("VALIDATION_FAIL:STATUS")
+    output = payload.get("output")
+    if not isinstance(output, dict):
+        return _error("VALIDATION_FAIL:OUTPUT_TYPE")
+    if status == "DONE" and not output:
+        return _error("VALIDATION_FAIL:EMPTY_OUTPUT")
+    if status == "DONE" and required_fields:
+        missing = [field for field in required_fields if output.get(field) in (None, "", [], {})]
+        if missing:
+            return _error(f"VALIDATION_FAIL:MISSING_FIELDS:{','.join(missing)}")
+    try:
+        score = float(payload.get("score", 0.0))
+    except (TypeError, ValueError):
+        return _error("VALIDATION_FAIL:SCORE_TYPE")
+    if score < 0.0 or score > 100.0:
+        return _error("VALIDATION_FAIL:SCORE_RANGE")
+    reason = str(payload.get("reason") or "").strip()
+    if status == "DONE" and not reason:
+        return _error("VALIDATION_FAIL:REASON")
+    payload["status"] = status
+    payload["score"] = score
+    payload["reason"] = reason
+    payload["output"] = output
+    return payload
+
+
+def run_agent_safe(agent: Any, input_data: Dict[str, Any], timeout: float = 20.0) -> Dict[str, Any]:
+    agent_name = str(getattr(agent, "name", getattr(agent, "role", "UNKNOWN_AGENT")))
+    started = perf_counter()
+    LOGGER.info("[AGENT START] %s", agent_name)
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        if callable(agent):
+            future = executor.submit(agent, input_data)
+        elif hasattr(agent, "run") and callable(getattr(agent, "run")):
+            future = executor.submit(agent.run, input_data)
+        elif hasattr(agent, "analyze") and callable(getattr(agent, "analyze")):
+            future = executor.submit(agent.analyze, input_data)
+        else:
+            raise ValueError(f"Unsupported agent runner type for {agent_name}")
+        try:
+            raw = future.result(timeout=timeout)
+            result = raw if isinstance(raw, dict) else {"agent": agent_name, "status": "ERROR", "output": {}, "score": 0.0, "reason": "VALIDATION_FAIL:NON_DICT"}
+            result.setdefault("agent", agent_name)
+            result.setdefault("status", "DONE")
+            result.setdefault("output", {})
+            result.setdefault("score", 0.0)
+            result.setdefault("reason", "")
+            validated = validate_agent_result(result)
+            LOGGER.info("[AGENT STATUS] %s %s", agent_name, validated.get("status"))
+            return validated
+        except FuturesTimeoutError:
+            future.cancel()
+            LOGGER.warning("[AGENT STATUS] %s TIMEOUT", agent_name)
+            return {
+                "agent": agent_name,
+                "status": "ERROR",
+                "output": {},
+                "score": 0.0,
+                "reason": "TIMEOUT",
+            }
+        except Exception:
+            LOGGER.exception("agent_execution_exception agent=%s", agent_name)
+            return {
+                "agent": agent_name,
+                "status": "ERROR",
+                "output": {},
+                "score": 0.0,
+                "reason": "EXCEPTION",
+            }
+    finally:
+        elapsed = perf_counter() - started
+        LOGGER.info("[AGENT TIME] %s %.3fs", agent_name, elapsed)
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def finalize_decision(consensus_result: Dict[str, Any], critical_failures: List[str]) -> str:
@@ -438,6 +570,34 @@ class ClaimGuardV2Orchestrator:
 
     def _make_chat_llm(self, model_name: str):
         return get_crewai_llm(model_name)
+
+    @staticmethod
+    def _run_identity_agent_local(claim_request: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute the deterministic IdentityAgent implementation and normalize to the
+        JSON shape expected by the v2 multi-agent pipeline.
+        """
+        result = DeterministicIdentityAgent().analyze(claim_request)
+        output = result.get("output", {}) if isinstance(result, dict) else {}
+        explanation = str(
+            output.get("explanation")
+            or output.get("reasoning")
+            or result.get("reason")
+            or "Identity analysis completed"
+        )
+        evidence = output.get("evidence", {}) if isinstance(output.get("evidence"), dict) else {}
+        memory_insights = output.get("memory_insights")
+        if memory_insights is None and isinstance(output.get("details"), dict):
+            memory_insights = output["details"].get("memory_insights")
+        return {
+            "score": float(output.get("score", result.get("score", 0.0))),
+            "confidence": float(output.get("confidence", 0.0)),
+            "explanation": explanation,
+            "claims": [{"statement": explanation, "evidence": "", "verified": bool(evidence.get("cin_found") or evidence.get("ipp_found"))}],
+            "hallucination_flags": [],
+            "memory_insights": memory_insights or {},
+            "evidence": evidence,
+        }
 
     def get_memory_health_report(self) -> MemoryHealthReport:
         return get_memory_health(self._memory_config, self._memory)
@@ -1556,8 +1716,12 @@ class ClaimGuardV2Orchestrator:
         )
 
     def run(self, claim_request: Dict[str, Any]) -> ClaimGuardV2Response:
+        start_time = time.time()
+        max_pipeline_time = 60.0
+        LOGGER.info("[PIPELINE START] claim_id=%s", str(claim_request.get("metadata", {}).get("claim_id") or ""))
         print("ACTIVE_PIPELINE_FILE:", inspect.getfile(self.__class__.run))
-        print("STAGE: PRE_VALIDATION")
+        print("[STAGE] PRE_VALIDATION")
+        print(f"[PIPELINE TIME] {time.time() - start_time:.2f}s")
         routing = build_routing_decision(claim_request)
         claim_id = str(claim_request.get("metadata", {}).get("claim_id") or "")
         if not claim_id:
@@ -1617,6 +1781,20 @@ class ClaimGuardV2Orchestrator:
                 exit_reason=exit_reason,
                 claim_id=claim_id,
             )
+            runtime_agents = payload.get("agents")
+            if isinstance(runtime_agents, list) and runtime_agents:
+                envelope["agents"] = runtime_agents
+            else:
+                envelope["agents"] = [
+                    {
+                        "agent": str(item.get("agent", "")),
+                        "status": "DONE",
+                        "output": item,
+                        "score": float(item.get("score", 0.0)),
+                        "reason": str(item.get("explanation", "")),
+                    }
+                    for item in envelope.get("agent_outputs", [])
+                ]
             blackboard_snapshot = self._ensure_contract_blackboard(dict(envelope["blackboard_snapshot"]))
             blackboard_snapshot["flags"] = dict(blackboard_snapshot.get("flags", {}))
             blackboard_snapshot["flags"]["exit_reason"] = exit_reason
@@ -1650,6 +1828,40 @@ class ClaimGuardV2Orchestrator:
             response = ClaimGuardV2Response(**payload)
             assert response.exit_reason in EXIT_REASONS
             return response
+
+        def _check_pipeline_timeout(stage_name: str, current_agent_outputs: List[AgentOutput] | None = None) -> ClaimGuardV2Response | None:
+            elapsed = time.time() - start_time
+            print(f"[STAGE] {stage_name}")
+            print(f"[PIPELINE TIME] {elapsed:.2f}s")
+            if elapsed <= max_pipeline_time:
+                return None
+            system_flags = ["TIMEOUT"]
+            return _finalize_response(
+                exit_reason="low_confidence",
+                agent_outputs=current_agent_outputs or [],
+                blackboard={"entries": {}, "terminated": True, "flags": {"pipeline_timeout": True}},
+                routing_decision=routing,
+                goa_used=False,
+                Ts=50.0,
+                decision="HUMAN_REVIEW",
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=[],
+                validation_result=None,
+                pre_validation_result=None,
+                forensic_trace=None,
+                decision_trace={"decision_reason": "Pipeline timeout exceeded", "final_decision": "HUMAN_REVIEW"},
+                reason="Pipeline timeout exceeded",
+                system_flags=system_flags,
+                extracted_data={},
+                pipeline_version="v2",
+            )
+
+        timeout_response = _check_pipeline_timeout("PRE_VALIDATION")
+        if timeout_response is not None:
+            return timeout_response
 
         tracker = get_tracker(claim_id)
         tracker.update("OCR Extraction", "RUNNING")
@@ -1686,7 +1898,8 @@ class ClaimGuardV2Orchestrator:
             reason=str(doc_classification.get("reason") or ""),
             flags=["NON_CLAIM"] if str(doc_classification.get("label", "")).upper() == "NON_CLAIM" else [],
         )
-        print("STAGE: FIELD_VERIFICATION")
+        print("[STAGE] FIELD_VERIFICATION")
+        print(f"[PIPELINE TIME] {time.time() - start_time:.2f}s")
         field_verification, verification_meta = _verify_structured_fields(structured_data, extracted_text)
         verified_structured_data = dict(verification_meta.get("verified_fields", {}))
         verification_summary = dict(verification_meta.get("summary", {}))
@@ -2216,17 +2429,22 @@ class ClaimGuardV2Orchestrator:
         tracker.update("ClaimValidation", "RUNNING")
         
         validation_agent = ClaimValidationAgent()
-        validation_raw = validation_agent.analyze(claim_request)
+        validation_raw = run_agent_safe(validation_agent, claim_request, timeout=20.0)
+        validation_raw = validate_agent_result(
+            validation_raw,
+            required_fields=["validation_status", "validation_score", "document_type", "should_stop_pipeline", "reason"],
+        )
+        validation_payload = validation_raw.get("output", validation_raw) if isinstance(validation_raw, dict) else {}
         
         validation_result = ValidationResult(
-            validation_status=validation_raw["validation_status"],
-            validation_score=validation_raw["validation_score"],
-            document_type=validation_raw["document_type"],
-            missing_fields=validation_raw["missing_fields"],
-            found_fields=validation_raw["found_fields"],
-            reason=validation_raw["reason"],
-            should_stop_pipeline=validation_raw["should_stop_pipeline"],
-            details=validation_raw["details"],
+            validation_status=validation_payload.get("validation_status", "INVALID"),
+            validation_score=int(validation_payload.get("validation_score", 0)),
+            document_type=validation_payload.get("document_type", "unknown"),
+            missing_fields=validation_payload.get("missing_fields", []),
+            found_fields=validation_payload.get("found_fields", []),
+            reason=validation_payload.get("reason", "Validation output missing required fields"),
+            should_stop_pipeline=bool(validation_payload.get("should_stop_pipeline", True)),
+            details=validation_payload.get("details", {}),
         )
         
         LOGGER.info(
@@ -2344,7 +2562,10 @@ class ClaimGuardV2Orchestrator:
         else:
             memory_context = []
             self._track_memory_health(claim_id=claim_id, report=memory_health)
-            system_flags.append("MEMORY_DEGRADED")
+            if memory_status == "DISABLED":
+                system_flags.append("MEMORY_DISABLED")
+            else:
+                system_flags.append("MEMORY_DEGRADED")
             LOGGER.warning(
                 "memory_status=%s failure_reason=%s",
                 memory_status,
@@ -2388,12 +2609,17 @@ class ClaimGuardV2Orchestrator:
             LOGGER.info("memory_context_empty claim_cin=%s", current_cin)
 
         # ── Step 2: Run agents sequentially ────────────────────────────────
-        print("STAGE: AGENTS")
+        print("[STAGE] AGENTS")
+        print(f"[PIPELINE TIME] {time.time() - start_time:.2f}s")
         agent_outputs: List[AgentOutput] = []
+        runtime_agents: List[Dict[str, Any]] = []
         fraud_ring_analysis: Dict[str, Any] = {"fraud_rings": []}
         agent_input_traces: List[Dict[str, Any]] = []
 
         for contract in SEQUENTIAL_AGENT_CONTRACTS:
+            timeout_response = _check_pipeline_timeout("AGENTS", agent_outputs)
+            if timeout_response is not None:
+                return timeout_response
             try:
                 blackboard.require(contract.requires)
             except BlackboardValidationError:
@@ -2473,18 +2699,89 @@ class ClaimGuardV2Orchestrator:
                 process=Process.sequential,
                 verbose=False,
             )
-            try:
+            def _kickoff_with_context() -> Any:
                 with tracked_agent_context(contract.name):
-                    result = crew.kickoff()
+                    return safe_tracked_llm_call(
+                        contract.name,
+                        prompt,
+                        lambda _: crew.kickoff(),
+                    )
+            print(f"[AGENT START] {contract.name}")
+            identity_timeout = float(os.getenv("CLAIMGUARD_IDENTITY_AGENT_TIMEOUT_S", "25"))
+            per_agent_timeout = identity_timeout if contract.name == "IdentityAgent" else 20.0
+            runner = (
+                lambda: self._run_identity_agent_local(claim_request)
+                if contract.name == "IdentityAgent"
+                else _kickoff_with_context
+            )
+            run_result = run_agent_with_timeout(
+                contract.name,
+                runner,
+                timeout=per_agent_timeout,
+            )
+            if run_result.get("status") != "DONE":
+                print(f"[AGENT END] {contract.name} -> {run_result}")
+                if contract.name == "IdentityAgent":
+                    identity = claim_request.get("identity", {}) if isinstance(claim_request.get("identity"), dict) else {}
+                    cin = str(identity.get("cin") or identity.get("CIN") or claim_request.get("patient_id") or "").strip().upper()
+                    ipp = str(identity.get("ipp") or identity.get("IPP") or "").strip()
+                    normalized_text = str(blackboard.extracted_text or "").upper()
+                    cin_found = bool(cin) and cin in normalized_text
+                    ipp_found = bool(ipp) and ipp in normalized_text
+                    fallback_explanation = (
+                        "IdentityAgent timeout fallback used. "
+                        f"CIN present={bool(cin)} CIN found_in_ocr={cin_found} "
+                        f"IPP present={bool(ipp)} IPP found_in_ocr={ipp_found}."
+                    )
+                    parsed = {
+                        "score": 0.2 if (cin or ipp) and not (cin_found or ipp_found) else 0.4,
+                        "confidence": 0.35,
+                        "explanation": fallback_explanation,
+                        "claims": [{"statement": fallback_explanation, "evidence": "", "verified": False}],
+                        "hallucination_flags": ["identity_timeout_fallback"],
+                        "memory_insights": {"used": False, "signals": [], "note": "Timeout fallback path"},
+                        "evidence": {"cin_found": cin_found, "ipp_found": ipp_found},
+                    }
+                    result = json.dumps(parsed, ensure_ascii=False)
+                    print("[AGENT END] IdentityAgent -> FALLBACK_DONE")
+                    tracker.update(contract.name, "DONE")
+                    system_flags.append(f"AGENT_{run_result.get('status', 'ERROR')}_{contract.name.upper()}_FALLBACK")
+                else:
+                    tracker.update(contract.name, "FAILED")
+                    system_flags.append(f"AGENT_{run_result.get('status', 'ERROR')}_{contract.name.upper()}")
+                    runtime_agents.append(
+                        {
+                            "agent": contract.name,
+                            "status": "ERROR",
+                            "output": {},
+                            "score": 0.0,
+                            "reason": str(run_result.get("status") or "EXCEPTION"),
+                        }
+                    )
+                    continue
+            else:
+                result = run_result.get("result")
+            print(f"[AGENT END] {contract.name} -> DONE")
+            try:
                 if forensic_enabled and forensic_trace is not None:
                     forensic_trace["llm_calls_count"] += 1
-                parsed = _safe_json_load(str(result))
+                parsed = parse_llm_json(str(result))
+                if not isinstance(parsed, dict):
+                    parsed = _safe_json_load(str(result))
             except Exception as exc:
                 tracker.update(contract.name, "FAILED")
-                LOGGER.exception("v2_agent_failed agent=%s", contract.name)
-                raise RuntimeError(
-                    f"Ollama agent execution failed for {contract.name}: {exc}"
-                ) from exc
+                LOGGER.exception("v2_agent_parse_failed agent=%s", contract.name)
+                system_flags.append(f"AGENT_PARSE_ERROR_{contract.name.upper()}")
+                runtime_agents.append(
+                    {
+                        "agent": contract.name,
+                        "status": "ERROR",
+                        "output": {},
+                        "score": 0.0,
+                        "reason": "VALIDATION_FAIL",
+                    }
+                )
+                continue
             
             score = float(parsed.get("score", 0.0))
             confidence = float(parsed.get("confidence", 0.0))
@@ -2789,6 +3086,17 @@ class ClaimGuardV2Orchestrator:
                 memory_insights=memory_insights,
             )
             agent_outputs.append(output)
+            runtime_agents.append(
+                validate_agent_result(
+                    {
+                        "agent": contract.name,
+                        "status": "DONE",
+                        "output": parsed if isinstance(parsed, dict) else {},
+                        "score": (float(score) * 100.0) if float(score) <= 1.0 else float(score),
+                        "reason": str(explanation),
+                    }
+                )
+            )
             _trace_stage(
                 stage=f"AGENT_{contract.name}",
                 status="PASS",
@@ -2816,6 +3124,31 @@ class ClaimGuardV2Orchestrator:
                 break
 
         # ── Step 3: GOA ────────────────────────────────────────────────────
+        if not agent_outputs:
+            return _finalize_response(
+                exit_reason="low_confidence",
+                agent_outputs=[],
+                agents=runtime_agents,
+                blackboard={"entries": {}, "terminated": True},
+                routing_decision=routing,
+                goa_used=False,
+                Ts=50.0,
+                decision="HUMAN_REVIEW",
+                retry_count=0,
+                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
+                contradictions=[],
+                trust_layer=None,
+                memory_context=memory_context,
+                validation_result=validation_result,
+                pre_validation_result=None,
+                forensic_trace=forensic_trace,
+                decision_trace={"final_decision": "HUMAN_REVIEW", "decision_reason": "All agents failed or timed out"},
+                reason="ALL_AGENTS_FAILED",
+                system_flags=sorted(set([*system_flags, "ALL_AGENTS_FAILED"])),
+                extracted_data=verified_structured_data,
+                pipeline_version="v2",
+            )
+
         goa_used = self._goa_trigger(claim_request, routing)
         if goa_used:
             goa_payload = self._run_goa(claim_request, routing)
@@ -2859,7 +3192,11 @@ class ClaimGuardV2Orchestrator:
                 forensic_trace["hard_failures"].append("BLACKBOARD_NOT_CHANGING")
 
         # ── Step 4: Consensus ──────────────────────────────────────────────
-        print("STAGE: CONSENSUS")
+        timeout_response = _check_pipeline_timeout("CONSENSUS", agent_outputs)
+        if timeout_response is not None:
+            return timeout_response
+        print("[STAGE] CONSENSUS")
+        print(f"[PIPELINE TIME] {time.time() - start_time:.2f}s")
         if blackboard_state.get("terminated"):
             _trace_stage(
                 stage="CONSENSUS",
@@ -2899,6 +3236,18 @@ class ClaimGuardV2Orchestrator:
             )
         tracker.update("Consensus", "RUNNING")
         consensus_entries = dict(blackboard_state.get("entries", {}))
+        for agent_row in runtime_agents:
+            if not isinstance(agent_row, dict):
+                continue
+            agent_name = str(agent_row.get("agent") or "")
+            if not agent_name:
+                continue
+            payload = dict(consensus_entries.get(agent_name, {}))
+            payload["status"] = str(agent_row.get("status", "ERROR")).upper()
+            payload["score"] = float(agent_row.get("score", 0.0))
+            payload.setdefault("confidence", 0.0)
+            payload.setdefault("explanation", str(agent_row.get("reason", "")))
+            consensus_entries[agent_name] = payload
         for ao in agent_outputs:
             payload = dict(consensus_entries.get(ao.agent, {}))
             payload["status"] = str(ao.output_snapshot.get("status", ""))
@@ -2945,6 +3294,11 @@ class ClaimGuardV2Orchestrator:
                 2,
             )
             system_flags.append("HALLUCINATION_FORCE_HUMAN_REVIEW")
+        if consensus_result.get("conflicts"):
+            system_flags.append("AGENT_CONFLICT")
+        if bool(consensus_result.get("too_many_error_agents", False)):
+            system_flags.append("TOO_MANY_ERROR_AGENTS")
+            consensus_result["decision"] = "HUMAN_REVIEW"
         blackboard_state["insufficient_agents"] = consensus_result.get("insufficient_agents", [])
         blackboard_state["insufficient_force_human_review"] = consensus_result.get("insufficient_force_human_review", False)
         blackboard_state["hallucination_agents"] = consensus_result.get("hallucination_agents", [])
@@ -3346,10 +3700,24 @@ class ClaimGuardV2Orchestrator:
             decision=FINAL_DECISION,
             ts_score=consensus_result["Ts"],
         )
+        success_count = sum(1 for row in runtime_agents if str(row.get("status", "")).upper() == "DONE")
+        error_count = sum(1 for row in runtime_agents if str(row.get("status", "")).upper() == "ERROR")
+        LOGGER.info("[AGENT SUCCESS COUNT] %s", success_count)
+        LOGGER.info("[AGENT ERROR COUNT] %s", error_count)
+        LOGGER.info(
+            "[FINAL DECISION TRACE] decision=%s score=%.2f reason=%s flags=%s",
+            FINAL_DECISION,
+            float(consensus_result.get("Ts", 0.0)),
+            str(decision_trace.get("decision_reason", "")),
+            sorted(set(system_flags)),
+        )
+        LOGGER.info("[TOTAL TIME] %.3fs", time.time() - start_time)
+        LOGGER.info("[PIPELINE END] claim_id=%s", claim_id)
 
         return _finalize_response(
             exit_reason=FINAL_EXIT_REASON,
             agent_outputs=agent_outputs,
+            agents=runtime_agents,
             blackboard=blackboard_state,
             routing_decision=routing,
             goa_used=goa_used,

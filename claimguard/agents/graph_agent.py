@@ -138,7 +138,7 @@ class GraphAgent(BaseAgent):
             draft_reasoning=reasoning,
         )
         details["llm_consistency"] = llm_meta
-        return {
+        payload = {
             "agent_name": self.name,
             "decision": decision,
             "score": score,
@@ -148,3 +148,12 @@ class GraphAgent(BaseAgent):
             "details": details,
             "memory_insights": memory_insights,
         }
+        return self._ensure_contract(
+            {
+                "agent": self.name,
+                "status": "DONE",
+                "output": payload,
+                "score": float(payload["score"]),
+                "reason": llm_explanation,
+            }
+        )

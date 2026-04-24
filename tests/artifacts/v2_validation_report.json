@@ -2,23 +2,23 @@
   "accuracy": 0.15,
   "false_positive_rate": 0.85,
   "false_negative_rate": 0.0,
-  "avg_Ts": 0.0,
+  "avg_Ts": 20.96,
   "retry_distribution": {
-    "0": 100,
+    "0": 40,
     "1": 0,
     "2": 0,
-    "3": 0
+    "3": 60
   },
   "agent_performance_metrics": {
     "avg_latency_ms_per_agent": {
-      "IdentityAgent": 0.0,
-      "DocumentAgent": 0.0,
-      "PolicyAgent": 0.0,
-      "AnomalyAgent": 0.0,
-      "PatternAgent": 0.0,
-      "GraphRiskAgent": 0.0
+      "IdentityAgent": 4.72,
+      "DocumentAgent": 8.8,
+      "PolicyAgent": 5.13,
+      "AnomalyAgent": 4.58,
+      "PatternAgent": 5.47,
+      "GraphRiskAgent": 4.23
     },
-    "avg_confidence_drift": 0.0,
+    "avg_confidence_drift": 0.2988,
     "avg_contradiction_frequency": 0
   }
 }

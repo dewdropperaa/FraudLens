@@ -9,22 +9,24 @@ NEVER claims a CIN is "officially valid" or "verified with authority".
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 from difflib import SequenceMatcher
+from queue import Empty, Queue
 from typing import Any, Dict, List, Optional, Tuple
 
 from claimguard.agents.base_agent import BaseAgent
-from claimguard.agents.llm_consistency import run_agent_consistency_check
 from claimguard.agents.memory_utils import process_memory_context
 from claimguard.agents.security_utils import (
-    bump_risk,
     coerce_risk_output,
-    detect_prompt_injection,
     hash_text,
     log_security_event,
     sanitize_input,
     score_to_risk_score,
 )
+from claimguard.llm_factory import get_llm
+from claimguard.llm_tracking import parse_llm_json, safe_tracked_llm_call, tracked_agent_context
 
 IDENTITY_SYSTEM_PROMPT = """You are an identity verification specialist operating as a fraud analyst.
 
@@ -79,6 +81,73 @@ _DOB_PATTERNS = (
     re.compile(r"\b(\d{2})[/\-.](\d{2})[/\-.](\d{4})\b"),
     re.compile(r"\b(\d{4})[/\-.](\d{2})[/\-.](\d{2})\b"),
 )
+
+IDENTITY_PROMPT = """
+Extract the following fields EXACTLY from the document.
+If a field is missing, return null but NEVER omit keys.
+
+Return STRICT JSON:
+
+{{
+  "name": "...",
+  "cin": "...",
+  "dob": "...",
+  "is_valid": true/false,
+  "confidence": 0-100,
+  "issues": []
+}}
+
+Document:
+{input}
+"""
+
+
+def _extract_identity_llm(document_text: str, agent_name: str) -> Dict[str, Any]:
+    safe_text = sanitize_input(document_text or "")
+    if len(safe_text.strip()) < 100:
+        raise ValueError("Document text too short for identity extraction (<100 chars)")
+    print("[LLM INPUT LENGTH]", len(safe_text))
+    prompt = IDENTITY_PROMPT.format(input=safe_text)
+    timeout_s = float(os.getenv("CLAIMGUARD_IDENTITY_LLM_TIMEOUT_S", "6"))
+    llm = get_llm("simple", tracked=False)
+    result_queue: Queue[Dict[str, Any]] = Queue(maxsize=1)
+
+    def _worker() -> None:
+        with tracked_agent_context(agent_name):
+            result = safe_tracked_llm_call(agent_name, prompt, llm.invoke)
+            parsed = parse_llm_json(json.dumps(result) if isinstance(result, dict) else str(result))
+        result_queue.put(parsed if isinstance(parsed, dict) else {"error": "INVALID_JSON", "raw": str(result)})
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+    worker.join(timeout=timeout_s)
+    if worker.is_alive():
+        return {"error": "IDENTITY_LLM_TIMEOUT", "raw": ""}
+    try:
+        parsed = result_queue.get_nowait()
+    except Empty:
+        return {"error": "IDENTITY_LLM_NO_RESULT", "raw": ""}
+    print(f"[AGENT PARSED OUTPUT] {str(parsed)[:500]}")
+    if parsed.get("error"):
+        print("[AGENT VALIDATION RESULT] failed: parse_error")
+        return parsed
+    required_fields = ("name", "cin", "dob", "is_valid", "confidence")
+    missing_fields = [field for field in required_fields if field not in parsed]
+    if missing_fields:
+        print(f"[AGENT VALIDATION RESULT] failed: missing_fields={missing_fields}")
+        return {"error": "MISSING_FIELDS", "missing_fields": missing_fields, "raw": json.dumps(parsed, default=str)}
+    issues = parsed.get("issues", [])
+    if not isinstance(issues, list):
+        issues = [str(issues)]
+    print("[AGENT VALIDATION RESULT] passed")
+    return {
+        "name": str(parsed.get("name") or "").strip(),
+        "cin": str(parsed.get("cin") or "").strip().upper(),
+        "dob": str(parsed.get("dob") or "").strip(),
+        "is_valid": bool(parsed.get("is_valid", False)),
+        "confidence": max(0, min(100, int(parsed.get("confidence", 0) or 0))),
+        "issues": [str(i) for i in issues if str(i).strip()],
+    }
 
 
 def _clamp(value: int, lo: int = 0, hi: int = 100) -> int:
@@ -341,7 +410,31 @@ class IdentityAgent(BaseAgent):
         raw_corpus = _build_ocr_corpus(claim_data)
         sanitized_corpus = sanitize_input(raw_corpus)
 
-        injection_detected = detect_prompt_injection(raw_corpus)
+        try:
+            llm_identity = _extract_identity_llm(raw_corpus, self.name)
+        except Exception as exc:
+            return self._ensure_contract(
+                {
+                    "agent": self.name,
+                    "status": "ERROR",
+                    "output": {},
+                    "score": 0.0,
+                    "reason": str(exc),
+                }
+            )
+        if not isinstance(llm_identity, dict) or llm_identity.get("error"):
+            reason = "MISSING_FIELDS" if llm_identity.get("error") == "MISSING_FIELDS" else str(llm_identity.get("error") or "INVALID_JSON")
+            return self._ensure_contract(
+                {
+                    "agent": self.name,
+                    "status": "ERROR",
+                    "output": llm_identity if isinstance(llm_identity, dict) else {"raw": str(llm_identity)},
+                    "score": 0.0,
+                    "reason": reason,
+                }
+            )
+        if not cin_raw and llm_identity.get("cin"):
+            cin_raw = str(llm_identity.get("cin") or "").strip().upper()
 
         score = 100
         confidence = 90
@@ -597,15 +690,8 @@ class IdentityAgent(BaseAgent):
                 score -= 3
                 reasoning_steps.append("All document extractions empty → applied -3 penalty")
 
-        if injection_detected:
-            fraud_signals.append("Prompt injection patterns detected in document text")
-            score -= 15
-            confidence = min(confidence, 50)
-            reasoning_steps.append(
-                "Prompt injection detected in document corpus → applied -15 penalty"
-            )
-
         details["fraud_signals_count"] = len(fraud_signals)
+        details["identity_llm"] = llm_identity
 
         # ── 6. Scoring — clamp ─────────────────────────────────────────
         score = _clamp(score)
@@ -708,8 +794,6 @@ class IdentityAgent(BaseAgent):
 
         # ── Security layer (mirrors DocumentAgent) ─────────────────────
         all_flags: List[str] = []
-        if injection_detected:
-            all_flags.append("prompt_injection_detected")
         if not format_valid and cin_raw:
             all_flags.append("invalid_cin_format")
         if contradictions:
@@ -718,9 +802,6 @@ class IdentityAgent(BaseAgent):
             all_flags.append("missing_identity_data")
 
         risk_base = score_to_risk_score(float(score))
-        if injection_detected:
-            risk_base = max(0.5, bump_risk(risk_base, 0.1))
-
         structured = {
             "risk_score": risk_base,
             "flags": list(dict.fromkeys(all_flags)),
@@ -763,13 +844,13 @@ class IdentityAgent(BaseAgent):
             decision = score > 60
         details["memory_insights"] = memory_insights
 
-        llm_explanation, llm_meta = run_agent_consistency_check(
-            agent_name=self.name,
-            claim_data=claim_data,
-            draft_reasoning=explanation,
-        )
-        details["llm_consistency"] = llm_meta
-        return {
+        llm_explanation = explanation
+        details["llm_consistency"] = {
+            "agent_type": "DETERMINISTIC_AGENT",
+            "llm_calls": 1 if llm_identity.get("confidence", 0) > 0 else 0,
+            "deterministic_declared": True,
+        }
+        payload = {
             "agent_name": self.name,
             "decision": decision,
             "score": round(score, 2),
@@ -787,4 +868,14 @@ class IdentityAgent(BaseAgent):
             "risk_score": final_risk,
             "flags": validated.flags,
             "memory_insights": memory_insights,
+            "identity_extraction": llm_identity,
         }
+        return self._ensure_contract(
+            {
+                "agent": self.name,
+                "status": "DONE",
+                "output": payload,
+                "score": float(payload["score"]),
+                "reason": llm_explanation,
+            }
+        )

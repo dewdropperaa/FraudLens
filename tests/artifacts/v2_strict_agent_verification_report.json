@@ -1,42 +1,22 @@
 {
   "agents_active": true,
-  "llm_calls_detected": 12,
-  "llm_calls_per_agent": {
-    "IdentityAgent": 2,
-    "DocumentAgent": 2,
-    "PolicyAgent": 2,
-    "AnomalyAgent": 2,
-    "PatternAgent": 2,
-    "GraphRiskAgent": 2
-  },
-  "prompt_variation": {
-    "unknown": 12
-  },
+  "llm_calls_detected": 0,
+  "llm_calls_per_agent": {},
+  "prompt_variation": {},
   "static_behavior_detected": false,
   "score_variation": {
-    "IdentityAgent": 0.0,
-    "DocumentAgent": 0.0,
-    "PolicyAgent": 0.0,
-    "AnomalyAgent": 0.0,
-    "PatternAgent": 0.0,
-    "GraphRiskAgent": 0.0
+    "IdentityAgent": 0.0
   },
   "critical_failures": [
-    "identical_outputs_across_inputs:AnomalyAgent:confidence",
-    "identical_outputs_across_inputs:AnomalyAgent:score",
-    "identical_outputs_across_inputs:DocumentAgent:confidence",
-    "identical_outputs_across_inputs:DocumentAgent:explanation",
-    "identical_outputs_across_inputs:DocumentAgent:score",
-    "identical_outputs_across_inputs:GraphRiskAgent:score",
+    "differential_analysis_failed:Ts",
+    "differential_analysis_failed:decision",
+    "highly_similar_explanations:IdentityAgent",
     "identical_outputs_across_inputs:IdentityAgent:confidence",
     "identical_outputs_across_inputs:IdentityAgent:score",
-    "identical_outputs_across_inputs:PatternAgent:confidence",
-    "identical_outputs_across_inputs:PatternAgent:score",
-    "identical_outputs_across_inputs:PolicyAgent:confidence",
-    "identical_outputs_across_inputs:PolicyAgent:explanation",
-    "identical_outputs_across_inputs:PolicyAgent:score"
+    "no_llm_calls_detected"
   ],
   "suspected_issues": [
+    "LLM not used",
     "hardcoded outputs"
   ],
   "decision_path_trace": [
@@ -44,38 +24,13 @@
       "input_type": "valid_claim_complete",
       "agent_outputs": {
         "IdentityAgent": {
-          "score": 0.35,
-          "confidence": 0.3,
-          "explanation": "IdentityAgent analyzed input=unknown, CIN=unknown, amount=0, provider=unknown, upstream_entries=0."
-        },
-        "DocumentAgent": {
-          "score": 0.36,
-          "confidence": 0.297,
-          "explanation": "DocumentAgent analyzed input=unknown, CIN=unknown, amount=0, provider=unknown, upstream_entries=1."
-        },
-        "PolicyAgent": {
-          "score": 0.365,
-          "confidence": 0.2955,
-          "explanation": "PolicyAgent analyzed input=unknown, CIN=unknown, amount=0, provider=unknown, upstream_entries=2."
-        },
-        "AnomalyAgent": {
-          "score": 0.38,
-          "confidence": 0.24,
-          "explanation": "No prior history for CIN AB123456; anomaly baseline limited. Checked current claim amount=2000 against in-document fields only."
-        },
-        "PatternAgent": {
-          "score": 0.375,
-          "confidence": 0.09000000000000001,
-          "explanation": "INSUFFICIENT_DATA for pattern analysis: checked CIN=AB123456, provider=Hopital Atlas, current amount=2000, and available history_count=0. Could not run repetition/frequency/provider recurrence checks because historical claims are missing. Claim remains unverified for behavioral pattern assertions. Memory status=DISABLED; confidence reduced because pattern detection memory is unavailable."
-        },
-        "GraphRiskAgent": {
-          "score": 0.37,
-          "confidence": 0.264,
-          "explanation": "GraphRiskAgent analyzed input=unknown, CIN=unknown, amount=0, provider=unknown, upstream_entries=5. [graph cluster=none; cin_reuse=True; doctor_reuse=False; network_risk=0.350] Memory status=DISABLED; confidence reduced because pattern detection memory is unavailable."
+          "score": 0.0,
+          "confidence": 0.0,
+          "explanation": "No explanation provided"
         }
       },
-      "Ts": 18.45,
-      "decision": "HUMAN_REVIEW"
+      "Ts": 0.0,
+      "decision": "REJECTED"
     },
     {
       "input_type": "empty_document",
@@ -105,42 +60,23 @@
       "input_type": "missing_identity",
       "agent_outputs": {
         "IdentityAgent": {
-          "score": 0.35,
-          "confidence": 0.3,
+          "score": 0.0,
+          "confidence": 0.0,
           "explanation": "Insufficient data to perform reliable analysis"
-        },
-        "DocumentAgent": {
-          "score": 0.36,
-          "confidence": 0.297,
-          "explanation": "DocumentAgent analyzed input=unknown, CIN=unknown, amount=0, provider=unknown, upstream_entries=1."
-        },
-        "PolicyAgent": {
-          "score": 0.365,
-          "confidence": 0.2955,
-          "explanation": "PolicyAgent analyzed input=unknown, CIN=unknown, amount=0, provider=unknown, upstream_entries=2."
-        },
-        "AnomalyAgent": {
-          "score": 0.38,
-          "confidence": 0.24,
-          "explanation": "No prior history for CIN unknown; anomaly baseline limited. Checked current claim amount=2000 against in-document fields only."
-        },
-        "PatternAgent": {
-          "score": 0.375,
-          "confidence": 0.09000000000000001,
-          "explanation": "INSUFFICIENT_DATA for pattern analysis: checked CIN=unknown, provider=Hopital Atlas, current amount=2000, and available history_count=0. Could not run repetition/frequency/provider recurrence checks because historical claims are missing. Claim remains unverified for behavioral pattern assertions. Memory status=DISABLED; confidence reduced because pattern detection memory is unavailable."
-        },
-        "GraphRiskAgent": {
-          "score": 0.37,
-          "confidence": 0.09000000000000001,
-          "explanation": "INSUFFICIENT_DATA for graph risk: checked graph identifiers (claim_id=strict-edge-missing-identity, cin=missing, hospital=Hopital Atlas, doctor=Dr Amrani). Could not build a complete graph structure (node count and relationship types) because required fields are missing: cin. Claim remains unverified for relational-risk conclusions. Memory status=DISABLED; confidence reduced because pattern detection memory is unavailable."
         }
       },
-      "Ts": 18.16,
-      "decision": "HUMAN_REVIEW"
+      "Ts": 0.0,
+      "decision": "REJECTED"
     },
     {
       "input_type": "invalid_cin",
-      "agent_outputs": {},
+      "agent_outputs": {
+        "IdentityAgent": {
+          "score": 0.0,
+          "confidence": 0.0,
+          "explanation": "No explanation provided"
+        }
+      },
       "Ts": 0.0,
       "decision": "REJECTED"
     },

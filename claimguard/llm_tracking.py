@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable, Generator, List
 
-_CURRENT_AGENT: ContextVar[str] = ContextVar("claimguard_current_agent", default="unknown")
+_CURRENT_AGENT: ContextVar[str] = ContextVar("claimguard_current_agent", default="unassigned_agent")
 _CALL_LOG: List["LLMCallRecord"] = []
 
 
@@ -24,7 +26,7 @@ class LLMCallRecord:
 
 
 def set_current_agent(agent_name: str) -> None:
-    _CURRENT_AGENT.set(str(agent_name or "unknown"))
+    _CURRENT_AGENT.set(str(agent_name or "unassigned_agent"))
 
 
 def get_current_agent() -> str:
@@ -33,7 +35,7 @@ def get_current_agent() -> str:
 
 @contextmanager
 def tracked_agent_context(agent_name: str) -> Generator[None, None, None]:
-    token = _CURRENT_AGENT.set(str(agent_name or "unknown"))
+    token = _CURRENT_AGENT.set(str(agent_name or "unassigned_agent"))
     try:
         yield
     finally:
@@ -62,18 +64,54 @@ def tracked_llm_call(agent_name: str, prompt: str, actual_llm_call: Callable[[st
     print(f"[RESPONSE PREVIEW]={response_preview}")
     _CALL_LOG.append(
         LLMCallRecord(
-            agent_name=str(agent_name or "unknown"),
+            agent_name=str(agent_name or "unassigned_agent"),
             prompt_hash=prompt_hash,
             prompt_runtime_hash=runtime_hash,
             prompt_preview=prompt_preview,
             response_preview=response_preview,
             has_blackboard_context=("Blackboard:" in safe_prompt),
             has_previous_outputs=('"entries"' in safe_prompt or "entries" in safe_prompt),
-            has_ocr_text=("Here is the extracted document content:" in safe_prompt),
+            has_ocr_text=(
+                "Here is the extracted document content:" in safe_prompt
+                or "Document:" in safe_prompt
+            ),
             has_verified_fields=("verified_structured_data" in safe_prompt or "Here are structured fields:" in safe_prompt),
         )
     )
     return response
+
+
+def parse_llm_json(response: str) -> dict[str, Any]:
+    raw_text = str(response or "")
+    try:
+        parsed = json.loads(raw_text)
+        if isinstance(parsed, dict):
+            return parsed
+        return {"error": "INVALID_JSON", "raw": raw_text}
+    except Exception:
+        pass
+    json_candidate = re.search(r"{.*}", raw_text, re.DOTALL)
+    if json_candidate:
+        try:
+            parsed = json.loads(json_candidate.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+            return {"error": "INVALID_JSON", "raw": raw_text}
+        except Exception:
+            pass
+    return {"error": "INVALID_JSON", "raw": raw_text}
+
+
+def safe_tracked_llm_call(agent_name: str, prompt: str, llm_callable: Callable[[str], Any]) -> dict[str, Any]:
+    safe_prompt = str(prompt or "")
+    print(f"[LLM CALL START] agent={agent_name}")
+    print(f"[PROMPT LENGTH] {len(safe_prompt)}")
+    raw = tracked_llm_call(agent_name, safe_prompt, llm_callable)
+    raw_text = str(getattr(raw, "content", raw))
+    print(f"[AGENT RAW RESPONSE] {raw_text[:500]}")
+    parsed = parse_llm_json(raw_text)
+    print(f"[AGENT PARSED OUTPUT] {str(parsed)[:500]}")
+    return parsed
 
 
 class TrackedLLMProxy:
@@ -122,7 +160,10 @@ class TrackedLLMProxy:
                 response_preview=response_preview,
                 has_blackboard_context=("Blackboard:" in safe_prompt),
                 has_previous_outputs=('"entries"' in safe_prompt or "entries" in safe_prompt),
-                has_ocr_text=("Here is the extracted document content:" in safe_prompt),
+                has_ocr_text=(
+                    "Here is the extracted document content:" in safe_prompt
+                    or "Document:" in safe_prompt
+                ),
                 has_verified_fields=("verified_structured_data" in safe_prompt or "Here are structured fields:" in safe_prompt),
             )
         )
