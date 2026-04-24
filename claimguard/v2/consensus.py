@@ -10,12 +10,12 @@ from claimguard.v2.schemas import AgentOutput
 LOGGER = logging.getLogger("claimguard.v2.consensus")
 
 AGENT_WEIGHTS: Dict[str, float] = {
-    "IdentityAgent": 0.1,
-    "DocumentAgent": 0.15,
-    "PolicyAgent": 0.2,
-    "AnomalyAgent": 0.2,
-    "PatternAgent": 0.15,
-    "GraphRiskAgent": 0.2,
+    "IdentityAgent": 0.9,
+    "DocumentAgent": 0.8,
+    "PolicyAgent": 0.75,
+    "AnomalyAgent": 0.85,
+    "PatternAgent": 0.7,
+    "GraphRiskAgent": 0.8,
 }
 
 
@@ -94,10 +94,17 @@ class ConsensusEngine:
 
     @staticmethod
     def _weighted_sum(entries: Dict[str, Dict[str, Any]]) -> float:
-        return sum(
-            AGENT_WEIGHTS.get(agent, 0.0) * float(payload.get("confidence", 0.0))
-            for agent, payload in entries.items()
-        )
+        weighted = 0.0
+        for agent, payload in entries.items():
+            if not isinstance(payload, dict):
+                continue
+            status = str(payload.get("status", "DONE")).upper()
+            if status != "DONE":
+                continue
+            raw_score = float(payload.get("score", payload.get("confidence", 0.0)))
+            score_0_100 = raw_score * 100.0 if raw_score <= 1.0 else raw_score
+            weighted += AGENT_WEIGHTS.get(agent, 0.0) * max(0.0, min(100.0, score_0_100))
+        return weighted
 
     @staticmethod
     def _detect_contradictions(entries: Dict[str, Dict[str, Any]]) -> List[Contradiction]:
@@ -173,7 +180,45 @@ class ConsensusEngine:
         for contradiction in contradictions:
             penalty = max(0.0, min(1.0, contradiction.penalty))
             penalty_product *= 1.0 - penalty
-        return max(0.0, min(100.0, weighted_sum * penalty_product * 100.0))
+        normalizer = sum(AGENT_WEIGHTS.values()) or 1.0
+        normalized = weighted_sum / normalizer
+        return max(0.0, min(100.0, normalized * penalty_product))
+
+    @staticmethod
+    def _detect_conflicts(entries: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        conflicts: List[Dict[str, Any]] = []
+        identity = entries.get("IdentityAgent", {})
+        document = entries.get("DocumentAgent", {})
+        anomaly = entries.get("AnomalyAgent", {})
+
+        identity_valid = bool(identity.get("is_valid") or identity.get("decision") is True)
+        document_mismatch = bool(
+            document.get("document_mismatch")
+            or document.get("mismatch")
+            or "mismatch" in str(document.get("explanation", "")).lower()
+        )
+        if identity_valid and document_mismatch:
+            conflicts.append(
+                {
+                    "type": "IDENTITY_DOCUMENT_MISMATCH",
+                    "reason": "Identity valid while document agent reports mismatch.",
+                    "penalty": 8.0,
+                }
+            )
+
+        anomaly_score = float(anomaly.get("score", 0.0))
+        identity_score = float(identity.get("score", 0.0))
+        anomaly_score = anomaly_score * 100.0 if anomaly_score <= 1.0 else anomaly_score
+        identity_score = identity_score * 100.0 if identity_score <= 1.0 else identity_score
+        if anomaly_score >= 80.0 and identity_score >= 80.0:
+            conflicts.append(
+                {
+                    "type": "HIGH_FRAUD_HIGH_IDENTITY_TRUST",
+                    "reason": "High anomaly/fraud score conflicts with high identity trust.",
+                    "penalty": 6.0,
+                }
+            )
+        return conflicts
 
     @staticmethod
     def _decision_for_ts(ts: float) -> str:
@@ -286,14 +331,31 @@ class ConsensusEngine:
         score_evolution: List[float] = []
         retry_logs: List[Dict[str, Any]] = []
         retry_count = 0
+        error_agents = [
+            name for name, payload in current_entries.items()
+            if isinstance(payload, dict) and str(payload.get("status", "DONE")).upper() != "DONE"
+        ]
+        success_agents = [
+            name for name, payload in current_entries.items()
+            if isinstance(payload, dict) and str(payload.get("status", "DONE")).upper() == "DONE"
+        ]
+        failure_ratio = (len(error_agents) / max(1, len(error_agents) + len(success_agents)))
+        too_many_error_agents = failure_ratio >= 0.5
 
         while True:
             weighted_sum = self._weighted_sum(current_entries)
             contradictions = self._detect_contradictions(current_entries)
             ts = round(self._nexus_truth_score(weighted_sum, contradictions), 2)
+            conflicts = self._detect_conflicts(current_entries)
+            if conflicts:
+                ts = max(0.0, ts - sum(float(item.get("penalty", 0.0)) for item in conflicts))
             score_evolution.append(ts)
             decision = self._decision_for_ts(ts)
             contradiction_payload = [c.to_dict() for c in contradictions]
+            if not success_agents:
+                decision = "HUMAN_REVIEW"
+            elif (65.0 <= ts <= 70.0) or conflicts or too_many_error_agents:
+                decision = "HUMAN_REVIEW"
             LOGGER.info(
                 "consensus_eval retry=%s Ts=%.2f decision=%s contradictions=%s",
                 retry_count,
@@ -312,6 +374,10 @@ class ConsensusEngine:
                     "score_evolution": score_evolution,
                     "retry_logs": retry_logs,
                     "entries": current_entries,
+                    "conflicts": conflicts,
+                    "error_agents": error_agents,
+                    "success_agents": success_agents,
+                    "too_many_error_agents": too_many_error_agents,
                 }
 
             if retry_count >= self._max_reflexive_retries:
@@ -324,6 +390,10 @@ class ConsensusEngine:
                     "score_evolution": score_evolution,
                     "retry_logs": retry_logs,
                     "entries": current_entries,
+                    "conflicts": conflicts,
+                    "error_agents": error_agents,
+                    "success_agents": success_agents,
+                    "too_many_error_agents": too_many_error_agents,
                 }
 
             retry_count += 1

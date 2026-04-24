@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 from typing import Any, Final
 
-from langchain_community.llms import Ollama
-from claimguard.llm_tracking import TrackedLLMProxy
+try:
+    from langchain_ollama import OllamaLLM as Ollama
+except ImportError:  # Backward-compat fallback until langchain-ollama is installed everywhere.
+    from langchain_community.llms import Ollama
+from claimguard.llm_tracking import TrackedLLMProxy, safe_tracked_llm_call
 
 _MODEL_ROUTES: Final[dict[str, str]] = {
     "simple": "mistral",
@@ -48,6 +51,6 @@ def assert_ollama_connection() -> None:
     if os.getenv("PYTEST_CURRENT_TEST"):
         return
     llm = get_llm("mistral", tracked=False)
-    response = llm.invoke("Say 'Ollama working'")
+    response = safe_tracked_llm_call("SystemHealthCheck", "Say 'Ollama working' and respond with JSON", llm.invoke)
     if not str(response).strip():
         raise RuntimeError("Ollama connectivity test failed: empty response.")

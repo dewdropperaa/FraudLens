@@ -490,7 +490,7 @@ class ClaimValidationAgent(BaseAgent):
         injection_detected = detect_prompt_injection(corpus)
         if injection_detected:
             LOGGER.warning("ClaimValidationAgent: Prompt injection detected")
-            return {
+            payload = {
                 "agent_name": self.name,
                 "validation_status": "INVALID",
                 "validation_score": 0,
@@ -504,6 +504,15 @@ class ClaimValidationAgent(BaseAgent):
                     "corpus_length": len(corpus),
                 },
             }
+            return self._ensure_contract(
+                {
+                    "agent": self.name,
+                    "status": "DONE",
+                    "output": payload,
+                    "score": float(payload["validation_score"]),
+                    "reason": str(payload["reason"]),
+                }
+            )
         
         # Classify document type
         document_type = self._classify_document_type(corpus)
@@ -548,7 +557,7 @@ class ClaimValidationAgent(BaseAgent):
             f"score={validation_score}, should_stop={should_stop_pipeline}"
         )
         
-        return {
+        payload = {
             "agent_name": self.name,
             "validation_status": validation_status,
             "validation_score": validation_score,
@@ -565,3 +574,12 @@ class ClaimValidationAgent(BaseAgent):
                 "injection_detected": injection_detected,
             },
         }
+        return self._ensure_contract(
+            {
+                "agent": self.name,
+                "status": "DONE",
+                "output": payload,
+                "score": float(payload["validation_score"]),
+                "reason": str(payload["reason"]),
+            }
+        )

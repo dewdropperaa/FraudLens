@@ -2,361 +2,661 @@
   {
     "claim_idx": 0,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 1,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 2,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 3,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 4,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 5,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 6,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 7,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 8,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 9,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 10,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 11,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 12,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 13,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 14,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 15,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 16,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 17,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 18,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 19,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 20,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 21,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 22,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 23,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 24,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 25,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 26,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 27,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 28,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 29,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 30,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 31,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 32,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 33,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 34,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 35,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 36,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 37,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 38,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 39,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 40,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 41,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 42,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 43,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 44,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 45,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 46,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 47,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 48,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 49,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 50,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 51,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 52,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 53,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 54,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 55,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 56,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 57,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 58,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
     "claim_idx": 59,
     "decision": "REJECTED",
-    "ts_evolution": [],
+    "ts_evolution": [
+      34.93,
+      34.93,
+      34.93,
+      34.93
+    ],
     "failure_points": []
   },
   {
