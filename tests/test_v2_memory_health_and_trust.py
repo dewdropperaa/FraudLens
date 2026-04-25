@@ -22,6 +22,7 @@ from claimguard.v2.trust_layer import (
     OnChainTrustPayload,
     SanitizedTrustDocument,
     TrustLayerService,
+    is_trust_eligible,
 )
 
 
@@ -274,4 +275,73 @@ def test_rejected_with_dispute_risk_produces_ipfs_bundle() -> None:
     )
     assert result is not None
     assert result.evidence_cid == "QmRejEvidence"
+
+
+def test_is_trust_eligible_accepts_orchestrator_blackboard_shape() -> None:
+    blackboard = {
+        "identity": {"cin": "AB123456"},
+        "verified_structured_data": {"amount": "2400"},
+        "document_classification": {"label": "MEDICAL_CLAIM"},
+        "extracted_text": "Facture medicale montant 2400 MAD",
+    }
+    assert is_trust_eligible(blackboard) is True
+
+
+def test_trust_layer_fallback_document_when_claim_request_documents_not_eligible() -> None:
+    class _FakeIPFS:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.last_docs: list[SanitizedTrustDocument] = []
+
+        def upload_documents(self, claim_id: str, documents: list[SanitizedTrustDocument]) -> str:
+            self.calls += 1
+            self.last_docs = list(documents)
+            return "QmFallbackCID"
+
+    class _FakeChain:
+        def store_record(self, payload: OnChainTrustPayload) -> str:
+            return "0xtx"
+
+    class _FakeFirebase:
+        def store_record(self, payload: FirebaseTrustRecord) -> str:
+            return "f-fallback"
+
+    class _Fallback:
+        def log_blockchain_failure(self, context):
+            return None
+
+    ipfs = _FakeIPFS()
+    service = TrustLayerService(
+        ipfs_client=ipfs,
+        blockchain_client=_FakeChain(),
+        firebase_client=_FakeFirebase(),
+        fallback_logger=_Fallback(),
+    )
+    result = service.process_approved_claim(
+        {
+            "claim_id": "fallback-1",
+            "decision": "APPROVED",
+            "ts_score": 91.0,
+            "claim_request": {
+                "documents": [
+                    {
+                        "id": "d-non-trust-type",
+                        "document_type": "other",
+                        "text": "short text",
+                    }
+                ]
+            },
+            "blackboard": {
+                "identity": {"cin": "AB123456"},
+                "verified_structured_data": {"amount": "2400"},
+                "document_classification": {"label": "MEDICAL_CLAIM"},
+                "extracted_text": "Facture medicale montant total 2400 MAD",
+            },
+            "agent_outputs": [{"agent": "A", "explanation": "ok"}],
+            "flags": [],
+        }
+    )
+    assert result["cid"] == "QmFallbackCID"
+    assert ipfs.calls == 1
+    assert len(ipfs.last_docs) >= 1
 

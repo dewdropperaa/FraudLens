@@ -466,6 +466,7 @@ body {
 .cg-agent-badge { font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 99px; }
 .cg-agent-badge.pass { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }
 .cg-agent-badge.fail { background: var(--danger-bg);  color: var(--danger);  border: 1px solid var(--danger-border);  }
+.cg-agent-badge.warn { background: #fffbeb; color: #b45309; border: 1px solid #fcd34d; }
 .cg-agent-score     { font-size: 11px; color: var(--text-muted); }
 .cg-agent-reasoning { font-size: 11px; color: var(--text-secondary); line-height: 1.5; }
 

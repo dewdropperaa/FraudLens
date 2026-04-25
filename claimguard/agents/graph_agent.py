@@ -71,13 +71,18 @@ class GraphAgent(BaseAgent):
             reasoning = "Graphe de risque non disponible — analyse réseau ignorée"
             payload = {
                 "agent_name": self.name,
+                "status": "REVIEW",
                 "decision": True,
                 "score": score,
-                "confidence": 0.75,
+                "confidence": 75.0,
                 "reasoning": reasoning,
                 "explanation": reasoning,
+                "signals": ["GRAPH_UNAVAILABLE"],
+                "data_used": graph_out,
                 "details": {"graph_output": graph_out, "tool_results": tool_results},
             }
+            assert payload["score"] is not None
+            assert str(payload["explanation"]).strip() != ""
             return self._build_result(status="DONE", score=score, reason=reasoning, output=payload, flags=["GRAPH_UNAVAILABLE"])
         score = 100.0
         flags: list[str] = []  # SCORE-FIX
@@ -111,13 +116,18 @@ class GraphAgent(BaseAgent):
         fraud_probability = float(graph_out.get("fraud_probability") or 0.0)
         payload = {
             "agent_name": self.name,
+            "status": "PASS" if score >= 70 else ("REVIEW" if score >= 40 else "FAIL"),
             "decision": score > 60 and fraud_probability < 0.5,
             "score": score,
-            "confidence": round(max(0.2, min(0.95, score / 100.0)), 2),
+            "confidence": round(max(20.0, min(95.0, score)), 2),
             "reasoning": reasoning,
             "explanation": reasoning,
+            "signals": list(flags),
+            "data_used": graph_out,
             "details": {"graph_output": graph_out, "tool_results": tool_results},
         }
+        assert payload["score"] is not None
+        assert str(payload["explanation"]).strip() != ""
         self.enforce_tool_trace(tool_results, llm_fallback)
         return self._build_result(  # SCORE-FIX
             status="DONE",

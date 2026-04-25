@@ -30,12 +30,14 @@ function scorePercent(score) {
 }
 
 function getAgentBadge(agent) {
-  // UI-FIX
   const status = String(agent?.status || '').toUpperCase()
   const score = Number(agent?.score || 0)
+  if (status === 'PASS') return 'PASS'
+  if (status === 'REVIEW') return 'REVIEW'
+  if (status === 'FAIL') return 'FAIL'
   if (status === 'ERROR' || status === 'TIMEOUT') return 'FAIL'
-  if (status === 'DONE' && score >= 60) return 'OK'
-  if (status === 'DONE' && score >= 40) return 'WARN'
+  if (status === 'DONE' && score >= 60) return 'PASS'
+  if (status === 'DONE' && score >= 40) return 'REVIEW'
   return 'FAIL'
 }
 
@@ -476,9 +478,9 @@ export default function InvestigatorDashboard({ claims = [], claimsLoading, fetc
                       <span className="text-xs">{getAgentBadge(ag)}</span>
                     </div>
                     <div className="mt-1 text-xs text-[var(--text-secondary)]">
-                      score: {(Number(ag.score || 0) > 0 ? Math.round(Number(ag.score || 0)) : '—')} | confidence: {ag.confidence ?? 'N/A'}
+                      score: {Math.round(Number(ag.score || 0))} | confidence: {ag.confidence ?? 'N/A'}
                     </div>
-                    <div className="mt-1 text-xs">{ag.explanation || ag.reasoning || 'Analyse complétée sans explication détaillée'}</div>
+                    <div className="mt-1 text-xs">{ag.explanation || ag.reasoning || 'Explanation unavailable — system error'}</div>
                     {ag.evidence_used && <div className="mt-1 text-xs text-[var(--text-secondary)]">evidence: {String(ag.evidence_used)}</div>}
                   </div>
                 ))}

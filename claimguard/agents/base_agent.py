@@ -27,6 +27,27 @@ class BaseAgent(ABC):
     def analyze(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
+    @staticmethod
+    def _status_from_score(score_0_100: float) -> str:
+        if score_0_100 >= 70.0:
+            return "PASS"
+        if score_0_100 >= 40.0:
+            return "REVIEW"
+        return "FAIL"
+
+    def _canonical_agent_name(self, output: Dict[str, Any]) -> str:
+        explicit = str(output.get("agent_name") or "").strip()
+        if explicit:
+            compact = explicit.replace(" ", "")
+            if compact.lower() == "graphagent":
+                return "GraphRiskAgent"
+            if compact.lower().endswith("agent"):
+                return compact
+        cls_name = self.__class__.__name__
+        if cls_name == "GraphAgent":
+            return "GraphRiskAgent"
+        return cls_name
+
     def _build_result(  # SCORE-FIX
         self,
         status: str,
@@ -35,14 +56,65 @@ class BaseAgent(ABC):
         output: Dict[str, Any],
         flags: List[str] | None = None,
     ) -> Dict[str, Any]:
-        return {
-            "agent": self.__class__.__name__,
+        normalized_output = dict(output or {})
+        score_0_100 = max(0.0, min(100.0, float(score)))
+        explanation = str(
+            normalized_output.get("explanation")
+            or normalized_output.get("reasoning")
+            or reason
+            or ""
+        ).strip()
+        confidence_raw = normalized_output.get("confidence")
+        if confidence_raw is None:
+            confidence_0_100 = min(100.0, score_0_100 + 10.0)
+        else:
+            confidence_0_100 = float(confidence_raw)
+            if confidence_0_100 <= 1.0:
+                confidence_0_100 *= 100.0
+            confidence_0_100 = max(0.0, min(100.0, confidence_0_100))
+        signal_values = normalized_output.get("signals")
+        if not isinstance(signal_values, list):
+            signal_values = list(flags or [])
+        data_used = normalized_output.get("data_used")
+        if not isinstance(data_used, dict):
+            data_used = dict(normalized_output.get("details") or {})
+        decision_status = str(normalized_output.get("status") or "").upper()
+        if decision_status not in {"PASS", "REVIEW", "FAIL"}:
+            decision_status = self._status_from_score(score_0_100)
+        agent_name = self._canonical_agent_name(normalized_output)
+        decision_payload = {
+            "agent_name": agent_name,
+            "status": decision_status,
+            "score": round(score_0_100, 2),
+            "confidence": round(confidence_0_100, 2),
+            "explanation": explanation,
+            "signals": list(signal_values),
+            "data_used": data_used,
+        }
+        normalized_output["agent_name"] = agent_name
+        normalized_output["status"] = decision_status
+        normalized_output["score"] = round(score_0_100, 2)
+        normalized_output["confidence"] = round(confidence_0_100, 2)
+        normalized_output["explanation"] = explanation
+        normalized_output["signals"] = list(signal_values)
+        normalized_output["data_used"] = data_used
+        normalized_output["final_decision"] = decision_payload
+        result = {
+            "agent": agent_name,
             "status": str(status or "ERROR").upper(),
-            "score": round(float(score), 2),
-            "reason": str(reason or "").strip(),
-            "output": output or {},
+            "score": round(score_0_100, 2),
+            "reason": explanation,
+            "explanation": explanation,
+            "confidence": round(confidence_0_100, 2),
+            "signals": list(signal_values),
+            "data_used": data_used,
+            "output": normalized_output,
             "flags": flags or [],
         }
+        assert result["score"] is not None
+        assert result["explanation"] != ""
+        logger.error("[AGENT FINAL OUTPUT] %s -> %s", agent_name, decision_payload)
+        return result
 
     def _ensure_contract(self, result: Dict[str, Any] | None) -> Dict[str, Any]:
         def _error(reason: str) -> Dict[str, Any]:
@@ -58,7 +130,18 @@ class BaseAgent(ABC):
             return _error("Agent returned None")
         if not isinstance(result, dict):
             return _error("Agent returned non-dict output")
-        required = {"agent", "status", "output", "score", "reason", "flags"}  # SCORE-FIX
+        required = {
+            "agent",
+            "status",
+            "output",
+            "score",
+            "reason",
+            "explanation",
+            "confidence",
+            "signals",
+            "data_used",
+            "flags",
+        }  # SCORE-FIX
         if not required.issubset(result.keys()):
             return _error("Agent returned invalid contract")
         payload = dict(result)
@@ -67,11 +150,17 @@ class BaseAgent(ABC):
         payload["output"] = payload.get("output") if isinstance(payload.get("output"), dict) else {}
         payload["score"] = float(payload.get("score") or 0.0)
         payload["reason"] = str(payload.get("reason") or "")
+        payload["explanation"] = str(payload.get("explanation") or payload["reason"] or "")
+        payload["confidence"] = float(payload.get("confidence") or 0.0)
+        payload["signals"] = payload.get("signals") if isinstance(payload.get("signals"), list) else []
+        payload["data_used"] = payload.get("data_used") if isinstance(payload.get("data_used"), dict) else {}
         payload["flags"] = payload.get("flags") if isinstance(payload.get("flags"), list) else []  # SCORE-FIX
         if payload["status"] not in {"DONE", "ERROR", "TIMEOUT"}:  # SCORE-FIX
             return _error("Agent returned invalid status")
         if payload["status"] == "DONE" and payload["reason"].strip() == "":
             return _error("Missing reason for DONE status")
+        if payload["status"] == "DONE" and payload["explanation"].strip() == "":
+            return _error("Missing explanation for DONE status")
         return payload
 
     def _require_llm_response_bundle(self, llm_result: Dict[str, Any] | None) -> Dict[str, Any]:

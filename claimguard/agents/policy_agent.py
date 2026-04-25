@@ -113,12 +113,18 @@ class PolicyAgent(BaseAgent):
             decision = True
             payload = {
                 "agent_name": self.name,
+                "status": "REVIEW",
                 "decision": decision,
                 "score": round(score, 2),
+                "confidence": round(min(100.0, score + 10.0), 2),
                 "reasoning": reasoning,
                 "explanation": reasoning,
+                "signals": ["POLICY_DATA_MISSING"],
+                "data_used": {"policy": policy, "tools": tool_results},
                 "details": {"tool_results": tool_results},
             }
+            assert payload["score"] is not None
+            assert str(payload["explanation"]).strip() != ""
             return self._build_result(status="DONE", score=score, reason=reasoning, output=payload, flags=["POLICY_DATA_MISSING"])  # SCORE-FIX
         score = max(0.0, min(100.0, score))
         decision = score > 60
@@ -137,16 +143,26 @@ class PolicyAgent(BaseAgent):
 
         payload = {
             "agent_name": self.name,
+            "status": "PASS" if score >= 70 else ("REVIEW" if score >= 40 else "FAIL"),
             "decision": decision,
             "score": round(score, 2),
+            "confidence": round(min(100.0, score + 10.0), 2),
             "reasoning": reasoning,
             "explanation": reasoning,
+            "signals": list(flags),
+            "data_used": {
+                "policy": policy,
+                "document_classifier": classifier_out,
+                "fraud_detector": fraud_out,
+            },
             "details": {
                 "missing_docs": classifier_out.get("missing_docs") or [],
                 "risk_indicators": int(fraud_out.get("risk_indicators") or 0),
                 "tool_results": tool_results,
             },
         }
+        assert payload["score"] is not None
+        assert str(payload["explanation"]).strip() != ""
         self.enforce_tool_trace(tool_results, llm_fallback)
         return self._build_result(  # SCORE-FIX
             status="DONE",

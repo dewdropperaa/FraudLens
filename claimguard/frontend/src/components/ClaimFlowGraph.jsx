@@ -229,7 +229,7 @@ export function ClaimFlowGraph({ claimId, agentOutputs = [] }) {
                   <div className="mb-2 text-red-600 text-xs bg-red-50 p-2 rounded border border-red-100">
                     <div className="font-semibold">Execution Failed</div>
                     <div className="mt-1 line-clamp-2 hover:line-clamp-none transition-all duration-300 cursor-pointer">
-                      {output?.explanation || output?.reasoning || "An unexpected error occurred during agent execution."}
+                      {output?.explanation || output?.reasoning || "Explanation unavailable — system error"}
                     </div>
                   </div>
                 )}
@@ -239,7 +239,7 @@ export function ClaimFlowGraph({ claimId, agentOutputs = [] }) {
                     {output.score !== undefined && output.score !== null && (
                       <div className="flex justify-between">
                         <span className="text-gray-500">Score:</span>
-                        <span className="font-medium">{Number(output.score).toFixed(2)}</span>
+                        <span className="font-medium">{Number(output.score).toFixed(0)}</span>
                       </div>
                     )}
                     {output.confidence !== undefined && output.confidence !== null && (
@@ -254,6 +254,11 @@ export function ClaimFlowGraph({ claimId, agentOutputs = [] }) {
                 {(output?.explanation || output?.reasoning) && status !== 'FAILED' && (
                   <div className="mt-2 text-gray-600 border-t border-gray-100 pt-2 line-clamp-3 hover:line-clamp-none transition-all duration-300 cursor-pointer">
                     {output.explanation || output.reasoning}
+                  </div>
+                )}
+                {!(output?.explanation || output?.reasoning) && status !== 'FAILED' && (
+                  <div className="mt-2 text-gray-600 border-t border-gray-100 pt-2 line-clamp-3 hover:line-clamp-none transition-all duration-300 cursor-pointer">
+                    Explanation unavailable — system error
                   </div>
                 )}
               </div>

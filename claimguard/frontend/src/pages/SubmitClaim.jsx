@@ -2,12 +2,14 @@ import { Icons } from '../components'
 
 export default function SubmitClaim({ form, handleInputChange, handleFileChange, handleSubmit, isSubmitting, submitError, selectedFiles, lastResult, hasValidTxHash, safeText, shortHex, toIpfsUrl, scorePercent, currentClaimId }) {
   const getAgentBadge = (agent) => {
-    // UI-FIX
     const status = String(agent?.status || '').toUpperCase()
     const score = Number(agent?.score || 0)
+    if (status === 'PASS') return { label: 'PASS', className: 'pass' }
+    if (status === 'REVIEW') return { label: 'REVIEW', className: 'warn' }
+    if (status === 'FAIL') return { label: 'FAIL', className: 'fail' }
     if (status === 'ERROR' || status === 'TIMEOUT') return { label: 'FAIL', className: 'fail' }
-    if (status === 'DONE' && score >= 60) return { label: 'OK', className: 'pass' }
-    if (status === 'DONE' && score >= 40) return { label: 'WARN', className: 'warn' }
+    if (status === 'DONE' && score >= 60) return { label: 'PASS', className: 'pass' }
+    if (status === 'DONE' && score >= 40) return { label: 'REVIEW', className: 'warn' }
     return { label: 'FAIL', className: 'fail' }
   }
 
@@ -115,14 +117,16 @@ export default function SubmitClaim({ form, handleInputChange, handleFileChange,
                         {(() => {
                           const badge = getAgentBadge(agent)
                           const score = Number(agent?.score || 0)
-                          const reason = String(agent?.reasoning || '').trim() || 'Analyse complétée sans explication détaillée'
+                          const reason =
+                            String(agent?.explanation || agent?.reasoning || '').trim()
+                            || 'Explanation unavailable — system error'
                           return (
                             <>
                         <div className="cg-agent-row">
                           <span className="cg-agent-name">{agent.agent_name}</span>
                           <span className={`cg-agent-badge ${badge.className}`}>{badge.label}</span>
                         </div>
-                        <div className="cg-agent-score">Score: {score > 0 ? Math.round(score) : '—'}</div>
+                        <div className="cg-agent-score">Score: {Math.round(score)}</div>
                         <div className="cg-agent-reasoning">{safeText(reason)}</div>
                             </>
                           )

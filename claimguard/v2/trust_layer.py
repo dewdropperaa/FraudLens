@@ -20,18 +20,93 @@ class TrustLayerIPFSFailure(RuntimeError):
     pass
 
 
+def _to_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(" ", "")
+    if not text:
+        return None
+    text = text.replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _normalize_blackboard_for_trust(blackboard: Dict[str, Any]) -> Dict[str, Any]:
+    bb = blackboard if isinstance(blackboard, dict) else {}
+    identity_src = bb.get("identity", {})
+    verified = bb.get("verified_structured_data", {})
+    doc_class = bb.get("document_classification", {})
+    request = bb.get("request", {})
+    request_data = request.get("data", {}) if isinstance(request, dict) else {}
+
+    identity: Dict[str, Any] = identity_src if isinstance(identity_src, dict) else {}
+    verified_data: Dict[str, Any] = verified if isinstance(verified, dict) else {}
+    doc_classification: Dict[str, Any] = doc_class if isinstance(doc_class, dict) else {}
+    request_verified: Dict[str, Any] = request_data if isinstance(request_data, dict) else {}
+
+    cin_value = (
+        identity.get("cin")
+        or identity.get("CIN")
+        or verified_data.get("cin")
+        or verified_data.get("CIN")
+        or request_verified.get("cin")
+        or request_verified.get("CIN")
+        or ""
+    )
+    name_value = (
+        identity.get("name")
+        or verified_data.get("name")
+        or request_verified.get("name")
+        or ""
+    )
+    amount_value = (
+        bb.get("amount")
+        if bb.get("amount") is not None
+        else (
+            verified_data.get("amount")
+            if verified_data.get("amount") is not None
+            else request_verified.get("amount")
+        )
+    )
+    amount = _to_float_or_none(amount_value)
+
+    raw_doc_type = (
+        bb.get("document_type")
+        or doc_classification.get("document_type")
+        or doc_classification.get("label")
+        or ""
+    )
+    normalized_document_type = str(raw_doc_type).strip().lower().replace(" ", "_")
+    if normalized_document_type in {"medical_claim", "hospital_bill", "medical_invoice", "invoice"}:
+        normalized_document_type = "medical_claim_bundle"
+    if not normalized_document_type:
+        normalized_document_type = "medical_claim_bundle"
+
+    ocr_text = (
+        bb.get("ocr_text")
+        or bb.get("text")
+        or bb.get("extracted_text")
+        or (request.get("text") if isinstance(request, dict) else "")
+        or ""
+    )
+    return {
+        "identity": {"cin": str(cin_value or "").strip(), "name": str(name_value or "").strip()},
+        "amount": amount,
+        "document_type": normalized_document_type,
+        "ocr_text": str(ocr_text or ""),
+    }
+
+
 def is_trust_eligible(blackboard: Dict[str, Any]) -> bool:
-    identity = blackboard.get("identity", {}) if isinstance(blackboard.get("identity"), dict) else {}
-    amount = blackboard.get("amount")
-    if amount is None and isinstance(blackboard.get("verified_structured_data"), dict):
-        amount = blackboard["verified_structured_data"].get("amount")
-    document_type = blackboard.get("document_type")
-    if document_type is None and isinstance(blackboard.get("document_classification"), dict):
-        document_type = blackboard["document_classification"].get("document_type")
-    return (
-        identity.get("cin") is not None
-        and amount is not None
-        and str(document_type or "").strip().lower() == "medical_claim_bundle"
+    normalized = _normalize_blackboard_for_trust(blackboard)
+    return bool(
+        normalized.get("identity", {}).get("cin")
+        and normalized.get("amount") is not None
+        and normalized.get("ocr_text")
     )
 
 
@@ -486,14 +561,14 @@ class TrustLayerService:
             # Tier-1 audit hash + Firebase; optional IPFS evidence bundle when disputed.
             evidence_cid: str | None = None
             if dispute_risk:
-                bb = blackboard if isinstance(blackboard, dict) else {}
+                bb = _normalize_blackboard_for_trust(blackboard if isinstance(blackboard, dict) else {})
                 dispute_docs = list(self._sanitize_documents(claim_request.get("documents", [])))
                 if not dispute_docs and is_trust_eligible(bb):
-                    raw_text = bb.get("ocr_text") or bb.get("text") or ""
+                    raw_text = bb.get("ocr_text") or ""
                     dispute_docs.append(
                         SanitizedTrustDocument(
                             document_id=claim_id,
-                            document_type="medical_claim_bundle",
+                            document_type=str(bb.get("document_type") or "medical_claim_bundle"),
                             content=raw_text[:5000],
                         )
                     )
@@ -509,10 +584,14 @@ class TrustLayerService:
                             )[:5000],
                         )
                     )
-                try:
-                    evidence_cid = self.ipfs_client.upload_documents(claim_id, dispute_docs)
-                except Exception as e:
-                    LOGGER.error(f"IPFS FAILED: {e}")
+                if dispute_docs:
+                    try:
+                        evidence_cid = self.ipfs_client.upload_documents(claim_id, dispute_docs)
+                    except Exception as e:
+                        LOGGER.error(f"IPFS FAILED: {e}")
+                        evidence_cid = None
+                else:
+                    LOGGER.warning("trust_layer_ipfs_skipped_empty_documents claim_id=%s", claim_id)
                     evidence_cid = None
             firebase_payload = FirebaseTrustRecord.model_validate(
                 {
@@ -542,24 +621,34 @@ class TrustLayerService:
         cid: str | None = None
         tx_hash: Optional[str] = None
 
-        bb = blackboard if isinstance(blackboard, dict) else {}
+        bb = _normalize_blackboard_for_trust(blackboard if isinstance(blackboard, dict) else {})
         documents = list(self._sanitize_documents(claim_request.get("documents", [])))
         if not documents and is_trust_eligible(bb):
-            raw_text = bb.get("ocr_text") or bb.get("text") or ""
+            raw_text = str(bb.get("ocr_text") or "")
             documents.append(
                 SanitizedTrustDocument(
                     document_id=claim_id,
-                    document_type="medical_claim_bundle",
+                    document_type=str(bb.get("document_type") or "medical_claim_bundle"),
                     content=raw_text[:5000],
                 )
             )
+        LOGGER.info(f"[DEBUG] identity={bb.get('identity')}")
+        LOGGER.info(f"[DEBUG] amount={bb.get('amount')}")
+        LOGGER.info(f"[DEBUG] doc_type={bb.get('document_type')}")
+        LOGGER.info(f"[DEBUG] text_present={bool(bb.get('ocr_text'))}")
+        LOGGER.info(f"[DEBUG] trust_eligible={is_trust_eligible(bb)}")
+        LOGGER.info(f"[DEBUG] documents_count={len(documents)}")
         LOGGER.info(
             f"[TRUST LAYER] documents_count={len(documents)} eligible={is_trust_eligible(bb)}"
         )
-        try:
-            cid = self.ipfs_client.upload_documents(claim_id, documents)
-        except Exception as e:
-            LOGGER.error(f"IPFS FAILED: {e}")
+        if documents:
+            try:
+                cid = self.ipfs_client.upload_documents(claim_id, documents)
+            except Exception as e:
+                LOGGER.error(f"IPFS FAILED: {e}")
+                cid = None
+        else:
+            LOGGER.warning("trust_layer_ipfs_skipped_empty_documents claim_id=%s", claim_id)
             cid = None
 
         onchain_payload = OnChainTrustPayload.model_validate(

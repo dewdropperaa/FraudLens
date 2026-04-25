@@ -331,6 +331,13 @@ class DocumentAgent(BaseAgent):
             "flags": validated.flags,
             "explanation": validated.explanation,
         }
+        out["status"] = "PASS" if float(out.get("score", 0.0)) >= 70 else ("REVIEW" if float(out.get("score", 0.0)) >= 40 else "FAIL")
+        out["confidence"] = round(min(100.0, float(out.get("score", 0.0)) + 10.0), 2)
+        out["signals"] = list(out.get("flags") or [])
+        out["data_used"] = {
+            "document_classifier": tool_results.get("document_classifier", {}).get("output", {}),
+            "ocr_extractor": tool_results.get("ocr_extractor", {}).get("output", {}),
+        }
         det = dict(out.get("details") or {})
         det["structured_risk"] = structured
 
@@ -370,6 +377,8 @@ class DocumentAgent(BaseAgent):
             }
         out["details"] = det
         out["memory_insights"] = memory_insights
+        assert out["score"] is not None
+        assert str(out.get("explanation") or out.get("reasoning") or "").strip() != ""
         self.enforce_tool_trace(tool_results, use_llm_fallback)
         return self._build_result(  # SCORE-FIX
             status="DONE",

@@ -20,6 +20,19 @@ AGENT_WEIGHTS: Dict[str, float] = {
 }
 
 
+def _resolve_score(result: Dict[str, Any], agent_name: str) -> float:
+    if result.get("score", None) is not None:
+        raw = float(result["score"])
+    else:
+        output = result.get("output") if isinstance(result.get("output"), dict) else {}
+        final_decision = output.get("final_decision") if isinstance(output.get("final_decision"), dict) else {}
+        nested_score = final_decision.get("score", output.get("score"))
+        if nested_score is None:
+            raise ValueError(f"{agent_name} missing score")
+        raw = float(nested_score)
+    return raw * 100.0 if raw <= 1.0 else raw
+
+
 def calculate_weighted_score(agent_results: Dict[str, Dict[str, Any]]) -> float:
     total_weight = 0.0  # SCORE-FIX
     weighted_sum = 0.0  # SCORE-FIX
@@ -30,10 +43,7 @@ def calculate_weighted_score(agent_results: Dict[str, Dict[str, Any]]) -> float:
         status = str(result.get("status", "ERROR")).upper()
         if status in {"ERROR", "TIMEOUT"}:
             continue
-        if result.get("score", None) is None:
-            raise ValueError(f"{agent_name} missing score")
-        score_value = float(result["score"])
-        score_0_100 = score_value * 100.0 if score_value <= 1.0 else score_value
+        score_0_100 = _resolve_score(result, agent_name)
         weight = AGENT_WEIGHTS.get(agent_name, 0.10)
         weighted_sum += score_0_100 * weight
         total_weight += weight
@@ -260,10 +270,7 @@ class ConsensusEngine:
             status = str(payload.get("status", "DONE")).upper()
             if status != "DONE":
                 continue
-            if payload.get("score", None) is None:
-                raise ValueError(f"{agent} missing score")
-            raw_score = float(payload["score"])
-            score_0_100 = raw_score * 100.0 if raw_score <= 1.0 else raw_score
+            score_0_100 = _resolve_score(payload, agent)
             weighted += AGENT_WEIGHTS.get(agent, 0.0) * max(0.0, min(100.0, score_0_100))
         return weighted
 

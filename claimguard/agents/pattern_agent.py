@@ -75,13 +75,18 @@ class PatternAgent(BaseAgent):
             reasoning = "Historique non disponible — analyse de pattern limitée"
             payload = {
                 "agent_name": self.name,
+                "status": "REVIEW",
                 "decision": True,
                 "score": round(score, 2),
-                "confidence": 0.72,
+                "confidence": 72.0,
                 "reasoning": reasoning,
                 "explanation": reasoning,
+                "signals": ["MEMORY_DISABLED"],
+                "data_used": {"fraud_detector": fraud_out},
                 "details": {"tool_results": tool_results, "memory_status": memory_status},
             }
+            assert payload["score"] is not None
+            assert str(payload["explanation"]).strip() != ""
             return self._build_result(status="DONE", score=score, reason=reasoning, output=payload, flags=["MEMORY_DISABLED"])  # SCORE-FIX
         if bool(fraud_out.get("known_fraud_pattern")):
             score -= 40
@@ -114,13 +119,18 @@ class PatternAgent(BaseAgent):
 
         payload = {
             "agent_name": self.name,
+            "status": "PASS" if score >= 70 else ("REVIEW" if score >= 40 else "FAIL"),
             "decision": decision,
             "score": round(score, 2),
-            "confidence": round(max(0.2, min(0.95, score / 100.0)), 2),
+            "confidence": round(max(20.0, min(95.0, score)), 2),
             "reasoning": reasoning,
             "explanation": reasoning,
+            "signals": list(flags),
+            "data_used": fraud_out,
             "details": {"tool_results": tool_results, "risk_indicators": int(fraud_out.get("risk_indicators") or 0)},
         }
+        assert payload["score"] is not None
+        assert str(payload["explanation"]).strip() != ""
         self.enforce_tool_trace(tool_results, llm_fallback)
         return self._build_result(  # SCORE-FIX
             status="DONE",

@@ -535,10 +535,14 @@ class IdentityAgent(BaseAgent):
 
         payload = {
             "agent_name": self.name,
+            "status": "PASS" if score >= 70 else ("REVIEW" if score >= 40 else "FAIL"),
             "decision": decision,
             "score": round(score, 2),
+            "confidence": round(min(100.0, score + 10.0), 2),
             "reasoning": reasoning,
             "explanation": reasoning,
+            "signals": list(flags),
+            "data_used": extracted,
             "details": {
                 "cin": cin_raw or None,
                 "ipp": ipp_raw or None,
@@ -550,6 +554,8 @@ class IdentityAgent(BaseAgent):
                 "ipp_found_in_ocr": ipp_found_in_ocr,
             },
         }
+        assert payload["score"] is not None
+        assert str(payload["explanation"]).strip() != ""
         self.enforce_tool_trace(tool_results, llm_fallback)
         return self._build_result(  # SCORE-FIX
             status="DONE",

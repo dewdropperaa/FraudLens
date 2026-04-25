@@ -241,12 +241,18 @@ class AnomalyAgent(BaseAgent):
 
         payload = {
             "agent_name": self.name,
+            "status": "PASS" if score >= 70 else ("REVIEW" if score >= 40 else "FAIL"),
             "decision": score > 60,
             "score": round(score, 2),
+            "confidence": round(min(100.0, score + 10.0), 2),
             "reasoning": reasoning,
             "explanation": reasoning,
+            "signals": list(flags),
+            "data_used": fraud_out,
             "details": {"risk_indicators": indicators, "tool_results": tool_results},
         }
+        assert payload["score"] is not None
+        assert str(payload["explanation"]).strip() != ""
         self.enforce_tool_trace(tool_results, llm_fallback)
         return self._build_result(  # SCORE-FIX
             status="DONE",

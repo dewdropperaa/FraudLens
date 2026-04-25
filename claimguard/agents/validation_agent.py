@@ -577,6 +577,9 @@ class ClaimValidationAgent(BaseAgent):
         
         payload = {
             "agent_name": self.name,
+            "status": "PASS" if validation_score >= 70 else ("REVIEW" if validation_score >= 40 else "FAIL"),
+            "score": float(validation_score),
+            "confidence": float(min(100, validation_score + 10)),
             "validation_status": validation_status,
             "validation_score": validation_score,
             "document_type": document_type,
@@ -621,6 +624,15 @@ class ClaimValidationAgent(BaseAgent):
                 },
             },
         }
+        payload["explanation"] = str(payload.get("reason") or reason)
+        payload["signals"] = list(field_validation.get("missing_fields", []))
+        payload["data_used"] = {
+            "document_classifier": classifier_out,
+            "coverage_metrics": coverage_metrics,
+            "field_details": field_validation.get("field_details", {}),
+        }
+        assert payload["score"] is not None
+        assert str(payload["explanation"]).strip() != ""
         self.enforce_tool_trace(tool_results, False)
         return self.build_agent_result(
             output=payload,

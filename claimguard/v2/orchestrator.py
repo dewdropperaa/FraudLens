@@ -464,6 +464,17 @@ def _normalize_score_confidence_scale(score: float, confidence: float) -> tuple[
     return s, c
 
 
+def _to_ui_agent_status(*, runtime_status: str, score_0_100: float, insufficient_data: bool) -> str:
+    normalized_runtime = str(runtime_status or "").strip().upper()
+    if normalized_runtime in {"ERROR", "TIMEOUT"}:
+        return "FAIL"
+    if insufficient_data:
+        return "REVIEW"
+    if score_0_100 >= 60.0:
+        return "PASS"
+    return "FAIL"
+
+
 def _coerce_claims(parsed: Dict[str, Any], explanation: str) -> List[Dict[str, Any]]:
     claims = parsed.get("claims")
     if not isinstance(claims, list):
@@ -727,22 +738,54 @@ class ClaimGuardV2Orchestrator:
         raw_text = "\n".join(texts).strip()
 
         hybrid_result = self._hybrid_extractor.extract(raw_text)
-        if hybrid_result.get("status") != "OK":
-            return {
-                "status": "ERROR",
-                "reason": str(hybrid_result.get("reason") or "Hybrid extraction failed"),
-                "stage": str(hybrid_result.get("stage") or "rule"),
-                "raw_text": raw_text,
-                "structured_fields": {},
-            }
-
         fields = hybrid_result.get("fields", {}) if isinstance(hybrid_result.get("fields"), dict) else {}
+        extraction_warnings: List[Dict[str, str]] = []
+        if hybrid_result.get("status") != "OK":
+            extraction_warnings.append(
+                {
+                    "type": "HYBRID_EXTRACTION_DEGRADED",
+                    "reason": str(hybrid_result.get("reason") or "Hybrid extraction failed"),
+                    "stage": str(hybrid_result.get("stage") or "rule"),
+                }
+            )
         structured_fields: Dict[str, Any] = {
-            "name": fields.get("name"),
-            "cin": fields.get("cin"),
-            "ipp": fields.get("patient_id"),
-            "date": fields.get("dob"),
-            "insurance": fields.get("insurance"),
+            "name": fields.get("name")
+            or _extract_field_from_text(
+                [
+                    r"\b(?:nom\s+complet|nom(?:\s+du)?\s+patient)\s*[:\-]\s*([A-Za-zÀ-ÖØ-öø-ÿ' -]{3,})",
+                ],
+                raw_text,
+            ),
+            "cin": fields.get("cin")
+            or _extract_field_from_text(
+                [
+                    r"\bCIN\s*[:\-]?\s*([A-Z]{1,2}\d{5,6})\b",
+                    r"\b([A-Z]{1,2}\d{5,6})\b",
+                ],
+                raw_text,
+            ),
+            "ipp": fields.get("patient_id")
+            or _extract_field_from_text(
+                [
+                    r"\b(?:N[°º]\s*)?IPP\s*[:\-]?\s*([A-Za-z0-9\-]+)\b",
+                ],
+                raw_text,
+            ),
+            "date": fields.get("dob")
+            or _extract_field_from_text(
+                [
+                    r"\b(?:date\s+de\s+naissance|né\s+le)\s*[:\-]?\s*(\d{2}[/-]\d{2}[/-]\d{2,4})\b",
+                    r"\b(\d{2}[/-]\d{2}[/-]\d{4})\b",
+                ],
+                raw_text,
+            ),
+            "insurance": fields.get("insurance")
+            or _extract_field_from_text(
+                [
+                    r"\b(?:mutuelle|assurance|organisme)\s*[:\-]\s*([A-Za-z0-9À-ÖØ-öø-ÿ' \-]+)",
+                ],
+                raw_text,
+            ),
             "amount": _extract_amount_from_text(raw_text),
             "provider": _extract_field_from_text(
                 [
@@ -757,6 +800,7 @@ class ClaimGuardV2Orchestrator:
             "raw_text": raw_text,
             "structured_fields": structured_fields,
             "hybrid_result": hybrid_result,
+            "extraction_warnings": extraction_warnings,
         }
 
     def self_test(self) -> bool:
@@ -1888,39 +1932,87 @@ class ClaimGuardV2Orchestrator:
             # SCORE-FIX: preserve runtime status/score/reason contract for frontend cards.
             runtime_agents_list = payload.get("agents", [])
             if isinstance(runtime_agents_list, list) and runtime_agents_list:
-                payload["agent_results"] = [
-                    {
-                        "agent_name": str(item.get("agent", "")),
-                        "status": str(item.get("status", "ERROR")).upper(),
-                        "score": float(item.get("score", 0.0)),
-                        "reasoning": str(item.get("reason", "")).strip()
-                        or "Analyse complétée sans explication détaillée",
-                        "flags": list(item.get("flags", [])),
-                        "decision": str(item.get("status", "ERROR")).upper() == "DONE"
-                        and float(item.get("score", 0.0)) >= 60.0,
-                    }
-                    for item in runtime_agents_list
-                    if isinstance(item, dict) and item.get("agent")
-                ]
+                ui_agent_results: List[Dict[str, Any]] = []
+                for item in runtime_agents_list:
+                    if not isinstance(item, dict) or not item.get("agent"):
+                        continue
+                    runtime_status = str(item.get("status", "ERROR")).upper()
+                    raw_score = float(item.get("score", 0.0))
+                    score_0_100 = (raw_score * 100.0) if raw_score <= 1.0 else raw_score
+                    score_0_100 = max(0.0, min(100.0, score_0_100))
+                    output_payload = item.get("output") if isinstance(item.get("output"), dict) else {}
+                    reasoning_value = str(
+                        output_payload.get("explanation")
+                        or output_payload.get("reasoning")
+                        or item.get("reason")
+                        or ""
+                    ).strip()
+                    if not reasoning_value:
+                        reasoning_value = "Fallback: agent did not return structured output"
+                    insufficient_data = bool(
+                        output_payload.get("insufficient_data", False)
+                        or str(output_payload.get("analysis_status", "")).upper() == "INSUFFICIENT_DATA"
+                    )
+                    ui_status = _to_ui_agent_status(
+                        runtime_status=runtime_status,
+                        score_0_100=score_0_100,
+                        insufficient_data=insufficient_data,
+                    )
+                    confidence_0_100 = float(output_payload.get("confidence", 0.0))
+                    if confidence_0_100 <= 1.0:
+                        confidence_0_100 *= 100.0
+                    confidence_0_100 = max(0.0, min(100.0, confidence_0_100))
+                    signals = list(output_payload.get("hallucination_flags", []))
+                    if not signals:
+                        signals = list(item.get("flags", []))
+                    ui_agent_results.append(
+                        {
+                            "agent_name": str(item.get("agent", "")),
+                            "status": ui_status,
+                            "score": round(score_0_100, 2),
+                            "confidence": round(confidence_0_100, 2),
+                            "explanation": reasoning_value,
+                            "reasoning": reasoning_value,
+                            "signals": signals,
+                            "data_used": output_payload if output_payload else {},
+                            "flags": list(item.get("flags", [])),
+                            "decision": ui_status == "PASS",
+                        }
+                    )
+                payload["agent_results"] = ui_agent_results
             else:
-                payload["agent_results"] = [
-                    {
-                        "agent_name": str(getattr(item, "agent", "")),
-                        "status": "DONE",
-                        "score": (float(getattr(item, "score", 0.0)) * 100.0)
-                        if float(getattr(item, "score", 0.0)) <= 1.0
-                        else float(getattr(item, "score", 0.0)),
-                        "reasoning": str(getattr(item, "explanation", "")).strip()
-                        or "Analyse complétée sans explication détaillée",
-                        "flags": list(getattr(item, "hallucination_flags", [])),
-                        "decision": (
-                            ((float(getattr(item, "score", 0.0)) * 100.0)
-                             if float(getattr(item, "score", 0.0)) <= 1.0
-                             else float(getattr(item, "score", 0.0))) >= 60.0
-                        ),
-                    }
-                    for item in payload.get("agent_outputs", [])
-                ]
+                ui_agent_results = []
+                for item in payload.get("agent_outputs", []):
+                    raw_score = float(getattr(item, "score", 0.0))
+                    score_0_100 = (raw_score * 100.0) if raw_score <= 1.0 else raw_score
+                    score_0_100 = max(0.0, min(100.0, score_0_100))
+                    explanation_value = str(getattr(item, "explanation", "")).strip()
+                    if not explanation_value:
+                        explanation_value = "Fallback: agent did not return structured output"
+                    insufficient_data = bool(getattr(item, "output_snapshot", {}).get("insufficient_data", False))
+                    ui_status = _to_ui_agent_status(
+                        runtime_status="DONE",
+                        score_0_100=score_0_100,
+                        insufficient_data=insufficient_data,
+                    )
+                    raw_confidence = float(getattr(item, "confidence", 0.0))
+                    confidence_0_100 = raw_confidence * 100.0 if raw_confidence <= 1.0 else raw_confidence
+                    confidence_0_100 = max(0.0, min(100.0, confidence_0_100))
+                    ui_agent_results.append(
+                        {
+                            "agent_name": str(getattr(item, "agent", "")),
+                            "status": ui_status,
+                            "score": round(score_0_100, 2),
+                            "confidence": round(confidence_0_100, 2),
+                            "explanation": explanation_value,
+                            "reasoning": explanation_value,
+                            "signals": list(getattr(item, "hallucination_flags", [])),
+                            "data_used": dict(getattr(item, "output_snapshot", {}) or {}),
+                            "flags": list(getattr(item, "hallucination_flags", [])),
+                            "decision": ui_status == "PASS",
+                        }
+                    )
+                payload["agent_results"] = ui_agent_results
             payload.setdefault("claim_id", claim_id)
             payload.setdefault("pipeline_version", "v2")
             payload.setdefault("extracted_data", blackboard_snapshot.get("verified_structured_data", {}))
@@ -1969,6 +2061,23 @@ class ClaimGuardV2Orchestrator:
             payload["audit_trail"] = list((payload.get("decision_trace", {}) or {}).get("audit_trail", []))
             payload["processing_time_ms"] = int((time.time() - start_time) * 1000)
             payload["routed_to"] = "INVESTIGATOR" if decision_value in {"HUMAN_REVIEW", "REJECTED"} else "DASHBOARD"
+            payload["agent_results"] = [
+                {
+                    "agent_name": str(row.get("agent_name", "")),
+                    "status": str(row.get("status", "REVIEW")).upper() if str(row.get("status", "")).upper() in {"PASS", "FAIL", "REVIEW"} else "REVIEW",
+                    "score": max(0.0, min(100.0, float(row.get("score", 50.0)))),
+                    "confidence": max(0.0, min(100.0, float(row.get("confidence", 50.0)))),
+                    "explanation": str(row.get("explanation") or row.get("reasoning") or "").strip()
+                    or "Fallback: agent did not return structured output",
+                    "reasoning": str(row.get("explanation") or row.get("reasoning") or "").strip()
+                    or "Fallback: agent did not return structured output",
+                    "signals": list(row.get("signals", [])),
+                    "data_used": dict(row.get("data_used", {}) or {}),
+                    "flags": list(row.get("flags", [])),
+                    "decision": bool(row.get("decision", False)),
+                }
+                for row in payload.get("agent_results", [])
+            ]
             # BLOCKCHAIN-FIX: always return non-null fingerprint references.
             verified = payload.get("extracted_data") if isinstance(payload.get("extracted_data"), dict) else {}
             identity_bucket = blackboard_snapshot.get("identity", {}) if isinstance(blackboard_snapshot.get("identity"), dict) else {}
@@ -2095,6 +2204,24 @@ class ClaimGuardV2Orchestrator:
         tracker.update("OCR Extraction", "RUNNING")
         extraction_payload = self._build_ocr_blackboard_payload(claim_request)
         if str(extraction_payload.get("status", "OK")).upper() == "ERROR":
+            review_context = self._register_human_review_context(
+                claim_id=claim_id,
+                claim_request=claim_request,
+                ts_score=50.0,
+                reason="Hybrid extraction failed",
+                verified_fields={},
+                agent_outputs=[],
+                blackboard_snapshot={
+                    "entries": {},
+                    "terminated": True,
+                    "flags": {"hybrid_extraction_failed": True},
+                    "extraction_error": {
+                        "status": "ERROR",
+                        "reason": str(extraction_payload.get("reason") or "Unknown extraction error"),
+                        "stage": str(extraction_payload.get("stage") or "rule"),
+                    },
+                },
+            )
             return _finalize_response(
                 exit_reason="low_confidence",
                 agent_outputs=[],
@@ -2123,6 +2250,7 @@ class ClaimGuardV2Orchestrator:
                 decision_trace={
                     "decision_reason": "Hybrid extraction failed",
                     "final_decision": "HUMAN_REVIEW",
+                    "document_url": str(review_context.get("document_url") or ""),
                     "extraction_error": {
                         "status": "ERROR",
                         "reason": str(extraction_payload.get("reason") or "Unknown extraction error"),
@@ -2141,6 +2269,9 @@ class ClaimGuardV2Orchestrator:
         print("=== OCR TEXT END ===")
         sanitized_extracted_text = sanitize_for_prompt(extracted_text)
         structured_data = dict(extraction_payload["structured_fields"])
+        extraction_warnings = list(extraction_payload.get("extraction_warnings", []))
+        if extraction_warnings:
+            system_flags.append("HYBRID_EXTRACTION_DEGRADED")
         doc_classification = classify_document(extracted_text, structured_data)
         raw_doc_label = str(doc_classification.get("label", "")).upper()
         if raw_doc_label in {"NON_CLAIM", "UNCERTAIN"}:
@@ -3027,6 +3158,8 @@ class ClaimGuardV2Orchestrator:
             confidence = float(parsed.get("confidence", 0.0))
             score, confidence = _normalize_score_confidence_scale(score, confidence)
             explanation = str(parsed.get("explanation", "No explanation provided"))
+            if not explanation.strip():
+                explanation = "Fallback: agent did not return structured output"
             claims = _coerce_claims(parsed, explanation)
             hallucination_flags = parsed.get("hallucination_flags", [])
             if not isinstance(hallucination_flags, list):
@@ -3114,6 +3247,18 @@ class ClaimGuardV2Orchestrator:
             if parsed_status not in allowed_statuses:
                 parsed_status = normalized["analysis_status"]
             parsed["status"] = parsed_status
+            parsed["agent_name"] = contract.name
+            parsed["score"] = round(max(0.0, min(100.0, score * 100.0)), 2)
+            parsed["confidence"] = round(max(0.0, min(100.0, confidence * 100.0)), 2)
+            parsed["explanation"] = explanation
+            parsed["signals"] = list(parsed.get("hallucination_flags", [])) if isinstance(parsed.get("hallucination_flags", []), list) else []
+            parsed["data_used"] = dict(parsed.get("data_used", {}) or {})
+            parsed["status_ui"] = (
+                "REVIEW"
+                if bool(parsed.get("insufficient_data", False))
+                else ("PASS" if score >= 0.6 else "FAIL")
+            )
+            LOGGER.info("[AGENT OUTPUT] %s -> %s", contract.name, parsed)
             if self._agent_has_critical_failure(parsed, explanation):
                 failure_flag = f"AGENT_FAILURE_{contract.name.upper()}"
                 terminal_result = terminate_pipeline(
@@ -3403,7 +3548,16 @@ class ClaimGuardV2Orchestrator:
                         system_flags.append("IDENTITY_CIN_FORMAT_MATCH")
                 else:
                     # CALIBRATION-FIX: keep soft-fail only when CIN is absent from OCR.
-                    tracker.update("IdentityAgent", "FAILED")
+                    tracker.update(
+                        "IdentityAgent",
+                        "COMPLETED",
+                        score=score,
+                        confidence=confidence,
+                        explanation=(
+                            f"{explanation} CIN not found in OCR; marked for REVIEW instead of execution failure."
+                        ),
+                        is_fraud=is_fraud,
+                    )
                     system_flags.append("IDENTITY_SOFT_FAIL_CONTINUE")
 
         # ── Step 3: GOA ────────────────────────────────────────────────────
@@ -3540,6 +3694,7 @@ class ClaimGuardV2Orchestrator:
             payload["insufficient_data"] = bool(ao.output_snapshot.get("insufficient_data", False))
             payload["hallucination_flags"] = list(ao.hallucination_flags)
             consensus_entries[ao.agent] = payload
+        assert len([name for name in consensus_entries.keys() if name != "_meta"]) >= 5, "Expected at least 5 agent results for consensus"
         consensus_entries["_meta"] = {
             "missing_fields": extraction_validation.get("missing_fields", []),
             "field_verification": blackboard.field_verification,
