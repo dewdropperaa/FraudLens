@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 **/service_accounts.json
+**/serviceAccount.json
 *credentials*.json
 google-services.json
 GoogleService-Info.plist

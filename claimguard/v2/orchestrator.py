@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, List, Literal, Tuple, get_args
+from typing import Any, Dict, List, Literal, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from crewai import Agent, Crew, Process, Task
@@ -26,6 +26,13 @@ from claimguard.llm_tracking import parse_llm_json, safe_tracked_llm_call, track
 from claimguard.v2.blackboard import AgentContract, BlackboardValidationError, SharedBlackboard
 from claimguard.v2.concierge import build_routing_decision
 from claimguard.v2.consensus import ConsensusConfig, ConsensusEngine, should_force_human_review
+from claimguard.v2.coverage_score import (
+    CoverageScore,
+    MIN_COVERAGE_ACCEPT,
+    build_explanation,
+    compute_coverage_score,
+    coverage_decision,
+)
 from claimguard.v2.document_classifier import classify_document
 from claimguard.v2.evidence_mapper import build_fraud_heatmap
 from claimguard.v2.extraction.hybrid_extractor import HybridExtractor
@@ -64,6 +71,11 @@ from claimguard.v2.trace_engine import TraceEngine
 
 LOGGER = logging.getLogger("claimguard.v2")
 FORENSIC_MODE = False
+# When true, every pipeline exit prints the full reasoning chain and never
+# truncates the explanation. Controlled via env var so ops can toggle it.
+DEBUG_EXPLANATION_MODE: bool = os.getenv("DEBUG_EXPLANATION_MODE", "1").strip() not in (
+    "", "0", "false", "False",
+)
 _INPUT_HASH_HISTORY: Dict[str, int] = {}
 _CANONICAL_DECISIONS = set(DECISION_ENUM_VALUES)
 EXIT_REASONS: tuple[str, ...] = (
@@ -93,10 +105,14 @@ _CRITICAL_AGENT_FAILURE_MARKERS = (
 )
 _CRITICAL_FIELD_KEYS = {"cin", "ipp", "amount"}
 _HARD_REJECTION_REASON = "Claim rejected: data not found in supporting document"
-_VALIDATION_DOCUMENT_TYPES = set(get_args(DocumentType))
+# Label normalization is informational only — unknown labels are preserved
+# as-is and never rejected. Coverage scoring (claimguard.v2.coverage_score)
+# is the single source of pipeline-gating truth.
 _DOCUMENT_TYPE_NORMALIZATION_MAP: Dict[str, str] = {
-    "medical_claim_bundle": "hospital_bill",
-    "incomplete_claim_bundle": "unknown",
+    "medical_claim_bundle": "medical_claim_bundle",
+    "incomplete_claim_bundle": "hybrid_bundle",
+    "hybrid_bundle": "hybrid_bundle",
+    "unknown_bundle": "unknown_bundle",
 }
 SEQUENTIAL_AGENT_CONTRACTS: tuple[AgentContract, ...] = (
     AgentContract("IdentityAgent", ()),
@@ -215,6 +231,65 @@ def terminate_pipeline(reason: str, flags: List[str]) -> Dict[str, Any]:
         "flags": list(flags),
         "terminated": True,
     }
+
+
+def soft_degrade(reason: str, flags: List[str]) -> Dict[str, Any]:
+    """Non-terminal degradation signal — pipeline continues with warnings.
+
+    Replaces ``terminate_pipeline`` in paths where the previous behavior
+    was "reject on document-type mismatch / label". The coverage score
+    now drives the real decision downstream.
+    """
+    return {
+        "decision": "HUMAN_REVIEW",
+        "reason": reason,
+        "flags": list(flags),
+        "terminated": False,
+        "degraded": True,
+    }
+
+
+def _build_pipeline_explanation(
+    *,
+    decision: str,
+    ts: float,
+    coverage: CoverageScore | None,
+    reasons: List[str],
+    signals: Dict[str, Any],
+    tool_outputs: Dict[str, Any],
+    summary: str = "",
+) -> Dict[str, Any]:
+    """Mandatory structured-explanation envelope attached to every exit.
+
+    Returns a dict shaped as::
+
+        {
+          "decision": "ACCEPTED | REJECTED | HUMAN_REVIEW",
+          "score": float,
+          "explanation": {"summary": str, "reasons": [...],
+                          "signals": {...}, "tool_outputs": {...}}
+        }
+    """
+    decision_label = "ACCEPTED" if str(decision).upper() == "APPROVED" else str(decision).upper()
+    envelope = build_explanation(
+        decision=decision_label,
+        score=float(ts),
+        coverage=coverage,
+        summary=summary,
+        reasons=reasons,
+        signals=signals,
+        tool_outputs=tool_outputs,
+        debug=DEBUG_EXPLANATION_MODE,
+    )
+    if DEBUG_EXPLANATION_MODE:
+        LOGGER.info(
+            "[DEBUG_EXPLANATION] decision=%s score=%.2f reasons=%s bundle=%s",
+            envelope["decision"],
+            envelope["score"],
+            envelope["explanation"]["reasons"],
+            (coverage.classifier_bundle if coverage else "n/a"),
+        )
+    return envelope
 
 
 def exit_pipeline(reason: str, decision: str, ts: float = 0.0) -> Dict[str, Any]:
@@ -399,11 +474,18 @@ def _safe_json_load(text: str) -> Dict[str, Any]:
 
 
 def _normalize_validation_document_type(raw_document_type: Any) -> tuple[str, str | None]:
-    document_type = str(raw_document_type or "unknown").strip().lower()
-    normalized = _DOCUMENT_TYPE_NORMALIZATION_MAP.get(document_type, document_type)
-    if normalized in _VALIDATION_DOCUMENT_TYPES:
-        return normalized, None
-    return "unknown", document_type
+    """Return (normalized_label, original_if_remapped).
+
+    The label is informational clustering only — any string is accepted. If
+    the raw label is in the remap table we return its canonical form and
+    keep the original for forensic traceability; otherwise the raw value is
+    returned untouched. We NEVER force-map to "unknown" on label mismatch.
+    """
+    document_type = str(raw_document_type or "unknown").strip().lower() or "unknown"
+    normalized = _DOCUMENT_TYPE_NORMALIZATION_MAP.get(document_type)
+    if normalized is not None and normalized != document_type:
+        return normalized, document_type
+    return document_type, None
 
 
 def _normalize_score_confidence_scale(score: float, confidence: float) -> tuple[float, float]:
@@ -1385,11 +1467,20 @@ class ClaimGuardV2Orchestrator:
                 normalized_explanation = "Insufficient data to perform reliable analysis"
 
         if agent_name == "DocumentAgent":
-            if validation_result.document_type not in ("medical_invoice", "pharmacy_invoice", "hospital_bill"):
+            # Coverage-based degradation: do NOT reject on label mismatch.
+            # The coverage score is attached to claim_request by the
+            # orchestrator before agents run; if it is absent (legacy path)
+            # we fall back to a neutral stance and continue the pipeline.
+            coverage_payload = claim_request.get("_coverage_score") or {}
+            overall_cov = float(coverage_payload.get("overall", 1.0)) if isinstance(coverage_payload, dict) else 1.0
+            if overall_cov < MIN_COVERAGE_ACCEPT:
                 insufficient_data = True
-                normalized_score = min(normalized_score, 0.4)
-                normalized_confidence = min(normalized_confidence, 0.4)
-                normalized_explanation = "Document does not match expected medical claim structure"
+                normalized_score = min(normalized_score, 0.5)
+                normalized_confidence = min(normalized_confidence, 0.55)
+                normalized_explanation = (
+                    f"Low document coverage (score={overall_cov:.2f}); "
+                    "continuing with degraded DocumentAgent confidence"
+                )
 
         if agent_name in {"AnomalyAgent", "PatternAgent"} and not has_history:
             insufficient_data = True
@@ -1770,6 +1861,59 @@ class ClaimGuardV2Orchestrator:
             assert exit_reason in EXIT_REASONS, f"Invalid exit_reason enum: {exit_reason}"
             payload["decision"] = decision_value
             payload["exit_reason"] = exit_reason
+            # Mandatory structured-explanation contract: every exit MUST return
+            # {decision, score, explanation:{summary, reasons, signals, tool_outputs}}.
+            coverage_payload = payload.get("coverage_score")
+            coverage_obj: CoverageScore | None = None
+            if isinstance(coverage_payload, CoverageScore):
+                coverage_obj = coverage_payload
+                payload["coverage_score"] = coverage_obj.model_dump()
+            elif isinstance(coverage_payload, dict) and coverage_payload:
+                try:
+                    coverage_obj = CoverageScore.model_validate(coverage_payload)
+                except Exception:
+                    coverage_obj = None
+            ts_value = float(payload.get("Ts", 0.0))
+            explanation_reasons: List[str] = []
+            if payload.get("reason"):
+                explanation_reasons.append(str(payload.get("reason")))
+            explanation_reasons.extend(str(f) for f in (payload.get("system_flags") or []))
+            explanation_signals: Dict[str, Any] = {
+                "exit_reason": exit_reason,
+                "Ts": ts_value,
+                "flags": sorted(set(payload.get("system_flags") or [])),
+                "retry_count": int(payload.get("retry_count", 0) or 0),
+            }
+            explanation_tool_outputs: Dict[str, Any] = {}
+            blackboard_for_tools = payload.get("blackboard") or {}
+            if isinstance(blackboard_for_tools, dict):
+                for key in (
+                    "document_classification",
+                    "pre_validation",
+                    "extraction_validation",
+                    "field_verification_summary",
+                ):
+                    if blackboard_for_tools.get(key):
+                        explanation_tool_outputs[key] = blackboard_for_tools.get(key)
+            existing_explanation = payload.get("explanation")
+            if isinstance(existing_explanation, dict):
+                explanation_reasons.extend(existing_explanation.get("reasons") or [])
+                explanation_signals.update(existing_explanation.get("signals") or {})
+                explanation_tool_outputs.update(existing_explanation.get("tool_outputs") or {})
+            decision_envelope = _build_pipeline_explanation(
+                decision=decision_value,
+                ts=ts_value,
+                coverage=coverage_obj,
+                reasons=explanation_reasons,
+                signals=explanation_signals,
+                tool_outputs=explanation_tool_outputs,
+                summary=str(payload.get("reason") or "") or f"Pipeline exit {exit_reason}",
+            )
+            payload["explanation"] = decision_envelope["explanation"]
+            if coverage_obj is not None:
+                payload["coverage_score"] = coverage_obj.model_dump()
+            elif not payload.get("coverage_score"):
+                payload["coverage_score"] = {}
             trace_payload = payload.get("trace")
             if not isinstance(trace_payload, dict):
                 trace_payload = trace_engine.export()
@@ -1830,6 +1974,14 @@ class ClaimGuardV2Orchestrator:
             envelope["stage"] = stage_name
             envelope["reason"] = reason_value
             envelope["flags"] = flags_value
+            envelope["explanation"] = dict(payload.get("explanation") or {})
+            envelope["coverage_score"] = dict(payload.get("coverage_score") or {})
+            envelope["decision_envelope"] = {
+                "decision": decision_envelope["decision"],
+                "score": decision_envelope["score"],
+                "explanation": decision_envelope["explanation"],
+                "debug_mode": decision_envelope.get("debug_mode", DEBUG_EXPLANATION_MODE),
+            }
             response = ClaimGuardV2Response(**payload)
             assert response.exit_reason in EXIT_REASONS
             return response
@@ -1945,6 +2097,35 @@ class ClaimGuardV2Orchestrator:
         doc_classification = classify_document(extracted_text, structured_data)
         extraction_validation = self._compute_extraction_validation(extracted_text, structured_data)
         pre_validation = self._run_pre_validation_guard(extracted_text)
+        # Coverage-score model replaces brittle document_type enum checks.
+        # The classifier tool's bundle label (medical_claim_bundle / hybrid /
+        # unknown) is informational only — the decision is driven by the
+        # weighted coverage score.
+        try:
+            from claimguard.v2.tools.core_tools import document_classifier_tool as _doc_tool
+            doc_tool_output = _doc_tool({
+                "documents": claim_request.get("documents", []) or [],
+                "document_extractions": claim_request.get("document_extractions", []) or [],
+            })
+        except Exception as _cov_exc:
+            LOGGER.warning("document_classifier_tool_failed error=%s", _cov_exc)
+            doc_tool_output = {}
+        coverage_score_obj = compute_coverage_score(
+            extracted_text=extracted_text,
+            structured_data=structured_data,
+            ml_classification=doc_classification,
+            document_classifier_tool=doc_tool_output,
+        )
+        claim_request["_coverage_score"] = coverage_score_obj.model_dump()
+        claim_request["_coverage_decision"] = coverage_decision(coverage_score_obj)
+        if DEBUG_EXPLANATION_MODE:
+            LOGGER.info(
+                "[DEBUG_EXPLANATION] coverage=%s decision=%s warnings=%s bundle=%s",
+                coverage_score_obj.overall,
+                claim_request["_coverage_decision"],
+                coverage_score_obj.warnings,
+                coverage_score_obj.classifier_bundle,
+            )
         _trace_stage(
             stage="PRE_VALIDATION",
             status="PASS" if not bool(pre_validation.get("failed", False)) else "FAIL",
@@ -2025,6 +2206,7 @@ class ClaimGuardV2Orchestrator:
             return _finalize_response(
                 exit_reason="prompt_injection",
                 agent_outputs=[],
+                coverage_score=coverage_score_obj,
                 blackboard={
                     "entries": {},
                     "extracted_text": sanitized_extracted_text,
@@ -2041,6 +2223,7 @@ class ClaimGuardV2Orchestrator:
                     "security_flags": pre_validation.get("security_flags", []),
                     "degraded_security_mode": bool(pre_validation.get("degraded_security_mode", False)),
                     "document_classification": doc_classification,
+                    "coverage_score": coverage_score_obj.model_dump(),
                     "terminated": bool(terminal_result.get("terminated")),
                 },
                 routing_decision=routing,
@@ -2082,25 +2265,63 @@ class ClaimGuardV2Orchestrator:
                 reason=str(terminal_result["reason"]),
                 system_flags=sorted(set(system_flags)),
             )
-        if str(doc_classification.get("label", "")).upper() == "NON_CLAIM":
-            flags = ["DOCUMENT_CLASSIFIED_NON_CLAIM", "NON_CLAIM", "ML_NON_CLAIM"]
-            terminal_result = terminate_pipeline("Document classified as NON_CLAIM", flags)
+        # Coverage-score replaces the NON_CLAIM hard gate. Reject only when
+        # the coverage score is below MIN_COVERAGE_ACCEPT AND the OCR text is
+        # unreadable — any document with acceptable coverage continues the
+        # pipeline even when the ML classifier labels it NON_CLAIM, and the
+        # classifier label is emitted as a soft-fail warning instead of a
+        # hard termination.
+        ml_label_non_claim = str(doc_classification.get("label", "")).upper() == "NON_CLAIM"
+        ocr_unreadable = self._is_unreadable_text(extracted_text)
+        coverage_below_accept = coverage_score_obj.overall < MIN_COVERAGE_ACCEPT
+        if ml_label_non_claim:
+            system_flags.append("ML_NON_CLAIM_ADVISORY")
+            _trace_stage(
+                stage="DOCUMENT_CLASSIFIER",
+                status="WARN",
+                inputs={"classification": doc_classification},
+                outputs={
+                    "coverage_score": coverage_score_obj.model_dump(),
+                    "decision": claim_request["_coverage_decision"],
+                },
+                reason="ML classifier flagged NON_CLAIM; treated as advisory — coverage-score drives decision",
+                flags=["ML_NON_CLAIM_ADVISORY"],
+            )
+        if coverage_below_accept and (ocr_unreadable or not extracted_text.strip()):
+            flags = [
+                "COVERAGE_BELOW_MIN_ACCEPT",
+                "OCR_TEXT_UNREADABLE_OR_EMPTY",
+                "NON_CLAIM" if ml_label_non_claim else "COVERAGE_INSUFFICIENT",
+            ]
+            terminal_result = {
+                "decision": "REJECTED",
+                "reason": (
+                    f"Coverage score {coverage_score_obj.overall:.2f} below accept threshold "
+                    f"{MIN_COVERAGE_ACCEPT:.2f} and OCR text is unreadable/empty"
+                ),
+                "flags": flags,
+                "terminated": True,
+            }
             _log_pipeline_terminated("PRE_VALIDATION", terminal_result["reason"])
             _trace_stage(
                 stage="DOCUMENT_CLASSIFIER",
                 status="FAIL",
-                inputs={"classification": doc_classification},
+                inputs={
+                    "classification": doc_classification,
+                    "coverage_score": coverage_score_obj.model_dump(),
+                },
                 outputs={"terminal_result": terminal_result},
                 reason=str(terminal_result["reason"]),
                 flags=flags,
                 decision_snapshot="REJECTED",
             )
-            _trace_critical_stop(reason="NON_CLAIM", flags=flags)
+            _trace_critical_stop(reason="COVERAGE_INSUFFICIENT", flags=flags)
             tracker.update("OCR Extraction", "FAILED")
             system_flags.extend(flags)
             return _finalize_response(
-                exit_reason="non_claim",
+                exit_reason="ocr_unreadable",
                 agent_outputs=[],
+                coverage_score=coverage_score_obj,
                 blackboard={
                     "entries": {},
                     "extracted_text": sanitized_extracted_text,
@@ -2117,6 +2338,7 @@ class ClaimGuardV2Orchestrator:
                     "security_flags": pre_validation.get("security_flags", []),
                     "degraded_security_mode": bool(pre_validation.get("degraded_security_mode", False)),
                     "document_classification": doc_classification,
+                    "coverage_score": coverage_score_obj.model_dump(),
                     "terminated": bool(terminal_result.get("terminated")),
                 },
                 routing_decision=routing,
@@ -2135,7 +2357,7 @@ class ClaimGuardV2Orchestrator:
                     status="REJECTED",
                     reason=str(terminal_result["reason"]),
                     flags=sorted(set(flags)),
-                    document_type=str(pre_validation.get("document_type", "UNKNOWN")),
+                    document_type=str(coverage_score_obj.classifier_bundle),
                     injection_detected=bool(pre_validation.get("injection_detected", False)),
                     passed=False,
                 ),
@@ -2151,12 +2373,31 @@ class ClaimGuardV2Orchestrator:
                     "decision_before_guard": str(terminal_result["decision"]),
                     "final_decision": str(terminal_result["decision"]),
                     "decision_reason": str(terminal_result["reason"]),
+                    "coverage_score": coverage_score_obj.model_dump(),
                     "critical_failures": sorted(set(flags)),
                     "system_flags": sorted(set(system_flags)),
                     "terminated": bool(terminal_result.get("terminated")),
                 },
                 reason=str(terminal_result["reason"]),
                 system_flags=sorted(set(system_flags)),
+            )
+        # Low coverage but OCR readable → soft-fail, pipeline continues with
+        # degraded confidence and a warning flag.
+        if coverage_below_accept:
+            system_flags.extend([
+                "COVERAGE_BELOW_MIN_ACCEPT",
+                "COVERAGE_SOFT_FAIL",
+            ])
+            _trace_stage(
+                stage="DOCUMENT_CLASSIFIER",
+                status="WARN",
+                inputs={"coverage_score": coverage_score_obj.model_dump()},
+                outputs={"degraded_mode": True, "coverage_score": coverage_score_obj.model_dump()},
+                reason=(
+                    f"Coverage score {coverage_score_obj.overall:.2f} below accept threshold "
+                    f"{MIN_COVERAGE_ACCEPT:.2f} — continuing pipeline with degraded confidence"
+                ),
+                flags=["COVERAGE_SOFT_FAIL"],
             )
         identity_hard_flags = {"NO_IDENTITY", "CIN_NOT_FOUND", "IPP_NOT_FOUND", "CIN_OR_IPP_NOT_FOUND"}
         identity_reasons = sorted(set(identity_failures).intersection(identity_hard_flags))
@@ -2533,74 +2774,36 @@ class ClaimGuardV2Orchestrator:
             validation_result.missing_fields,
         )
         
-        # HARD GATE: If validation fails, STOP IMMEDIATELY
+        # Coverage-based soft-fail: the previous hard gate on
+        # should_stop_pipeline is replaced with degraded confidence when the
+        # coverage score is acceptable, and with a structured rejection
+        # (still with explanation) only when coverage is below threshold.
         if validation_result.should_stop_pipeline:
-            terminal_result = terminate_pipeline(
-                f"Validation failed: {validation_result.reason}",
-                ["CLAIM_VALIDATION_HARD_FAIL"],
-            )
-            _log_pipeline_terminated("CLAIM_VALIDATION", terminal_result["reason"])
-            _trace_stage(
-                stage="PRE_VALIDATION",
-                status="FAIL",
-                inputs={"validation_result": validation_result.model_dump()},
-                outputs={"terminal_result": terminal_result},
-                reason=str(terminal_result["reason"]),
-                flags=["CLAIM_VALIDATION_HARD_FAIL"],
-                decision_snapshot="REJECTED",
-            )
-            _trace_critical_stop(reason=str(terminal_result["reason"]), flags=["CLAIM_VALIDATION_HARD_FAIL"])
-            tracker.update("ClaimValidation", "FAILED")
+            degrade_flags = [
+                "CLAIM_VALIDATION_SOFT_FAIL",
+                "VALIDATION_SOFT_FAIL_FALLBACK_MODE",
+            ]
+            system_flags.extend(degrade_flags)
             LOGGER.warning(
-                "claim_validation_failed claim_id=%s reason=%s",
-                claim_id, validation_result.reason,
+                "claim_validation_soft_fail claim_id=%s reason=%s coverage=%.2f",
+                claim_id, validation_result.reason, coverage_score_obj.overall,
             )
-            return _finalize_response(
-                exit_reason="critical_fields_unverified",
-                agent_outputs=[],
-                blackboard={
-                    "entries": {},
-                    "extracted_text": blackboard.extracted_text,
-                    "structured_data": blackboard.structured_data,
-                    "verified_structured_data": blackboard.verified_structured_data,
-                    "field_verification": blackboard.field_verification,
-                    "field_verification_summary": verification_summary,
-                    "extraction_validation": extraction_validation,
-                    "input_trust": input_trust,
-                    "input_trust_score": input_trust_score,
-                    "pre_validation": pre_validation,
-                    "security_flags": pre_validation.get("security_flags", []),
-                    "degraded_security_mode": bool(pre_validation.get("degraded_security_mode", False)),
-                    "terminated": bool(terminal_result.get("terminated")),
+            _trace_stage(
+                stage="CLAIM_VALIDATION",
+                status="WARN",
+                inputs={"validation_result": validation_result.model_dump()},
+                outputs={
+                    "degraded_mode": True,
+                    "coverage_score": coverage_score_obj.model_dump(),
                 },
-                routing_decision=routing,
-                goa_used=False,
-                Ts=0.0,
-                decision=str(terminal_result["decision"]),
-                retry_count=0,
-                mahic_breakdown={"billing": 0.0, "clinical": 0.0, "temporal": 0.0, "geo": 0.0},
-                contradictions=[],
-                trust_layer=None,
-                memory_context=[],
-                validation_result=validation_result,
-                pre_validation_result=None,
-                forensic_trace=forensic_trace,
-                decision_trace={
-                    "claim_id": claim_id,
-                    "input_summary": input_summary,
-                    "ocr_snapshot": ocr_snapshot,
-                    "input_trust": input_trust,
-                    "agent_summaries": [],
-                    "contradictions": [],
-                    "Ts_score": 0.0,
-                    "decision_before_guard": "REJECTED",
-                    "final_decision": "REJECTED",
-                    "decision_reason": str(terminal_result["reason"]),
-                    "system_flags": system_flags,
-                    "terminated": bool(terminal_result.get("terminated")),
-                },
-                system_flags=system_flags,
+                reason=(
+                    f"Claim validation requested stop — converted to soft-fail "
+                    f"(coverage={coverage_score_obj.overall:.2f}): {validation_result.reason}"
+                ),
+                flags=degrade_flags,
+                decision_snapshot="HUMAN_REVIEW",
             )
+            tracker.update("ClaimValidation", "SOFT_FAIL")
         
         tracker.update("ClaimValidation", "COMPLETED")
         LOGGER.info("claim_validation_passed claim_id=%s score=%d", claim_id, validation_result.validation_score)

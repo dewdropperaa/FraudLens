@@ -126,9 +126,9 @@ class PinataIPFSClient:
 
 class EthereumTrustClient:
     def __init__(self) -> None:
-        self._rpc_url = os.getenv("SEPOLIA_RPC_URL", "")
+        self._rpc_url = os.getenv("GANACHE_RPC_URL", "")
         self._contract_address = os.getenv("TRUST_CONTRACT_ADDRESS", "")
-        self._private_key = os.getenv("SEPOLIA_PRIVATE_KEY", "")
+        self._private_key = os.getenv("GANACHE_PRIVATE_KEY", "")
         self._validator_id = os.getenv("TRUST_VALIDATOR_ID", "claimguard-v2")
         self._abi_json = os.getenv("TRUST_CONTRACT_ABI_JSON", "")
         self._function_name = os.getenv("TRUST_CONTRACT_FUNCTION", "storeTrustRecord")
@@ -140,7 +140,7 @@ class EthereumTrustClient:
             raise RuntimeError("Blockchain trust configuration is incomplete.")
         w3 = Web3(Web3.HTTPProvider(self._rpc_url))
         if not w3.is_connected():
-            raise RuntimeError("Unable to connect to Sepolia RPC.")
+            raise RuntimeError("Unable to connect to Ganache RPC.")
         account = w3.eth.account.from_key(self._private_key)
         contract = w3.eth.contract(
             address=Web3.to_checksum_address(self._contract_address),
@@ -157,7 +157,7 @@ class EthereumTrustClient:
             {
                 "from": account.address,
                 "nonce": w3.eth.get_transaction_count(account.address),
-                "chainId": 11155111,
+                "chainId": 1337,
                 "gasPrice": w3.eth.gas_price,
             }
         )

@@ -10,7 +10,12 @@ ModelRoute = Literal["mistral", "llama3", "deepseek-r1"]
 ValidationStatus = Literal["VALID", "INVALID"]
 DecisionEnum = Literal["APPROVED", "HUMAN_REVIEW", "REJECTED"]
 DECISION_ENUM_VALUES: tuple[DecisionEnum, ...] = ("APPROVED", "HUMAN_REVIEW", "REJECTED")
-DocumentType = Literal[
+
+# DocumentType is deliberately a free-form string. The coverage-score model
+# (claimguard.v2.coverage_score) now drives pipeline decisions; the label is
+# informational clustering only, so it must never hard-gate the pipeline.
+DocumentType = str
+CANONICAL_DOCUMENT_TYPES: tuple[str, ...] = (
     "medical_invoice",
     "medical_prescription",
     "lab_report",
@@ -18,9 +23,12 @@ DocumentType = Literal[
     "insurance_attestation",
     "pharmacy_invoice",
     "hospital_bill",
+    "medical_claim_bundle",
+    "hybrid_bundle",
+    "unknown_bundle",
     "irrelevant_document",
-    "unknown"
-]
+    "unknown",
+)
 
 
 class ClaimRequestV2(BaseModel):
@@ -89,15 +97,30 @@ class AgentOutput(BaseModel):
 
 
 class ValidationResult(BaseModel):
-    """Result of claim validation performed by ClaimValidationAgent."""
+    """Result of claim validation performed by ClaimValidationAgent.
+
+    ``document_type`` is a free-form string used as informational clustering;
+    it is NEVER used as a gate. ``should_stop_pipeline`` is retained for
+    backwards compatibility but is treated as an advisory soft-fail signal
+    rather than a hard stop.
+    """
     validation_status: ValidationStatus
     validation_score: int = Field(ge=0, le=100)
-    document_type: DocumentType
+    document_type: str = "unknown"
     missing_fields: List[str] = Field(default_factory=list)
     found_fields: List[str] = Field(default_factory=list)
     reason: str
-    should_stop_pipeline: bool
+    should_stop_pipeline: bool = False
     details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class DecisionExplanationModel(BaseModel):
+    """Structured, mandatory explanation attached to every pipeline exit."""
+
+    summary: str = ""
+    reasons: List[str] = Field(default_factory=list)
+    signals: Dict[str, Any] = Field(default_factory=dict)
+    tool_outputs: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PreValidationResult(BaseModel):
@@ -144,3 +167,5 @@ class ClaimGuardV2Response(BaseModel):
     pipeline_trace: List[str] = Field(
         default_factory=lambda: ["PRE_VALIDATION", "FIELD_VERIFICATION", "AGENTS", "CONSENSUS"]
     )
+    explanation: DecisionExplanationModel = Field(default_factory=DecisionExplanationModel)
+    coverage_score: Dict[str, Any] = Field(default_factory=dict)

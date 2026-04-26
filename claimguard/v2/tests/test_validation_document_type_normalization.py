@@ -3,19 +3,19 @@ from __future__ import annotations
 from claimguard.v2.orchestrator import _normalize_validation_document_type
 
 
-def test_maps_medical_claim_bundle_to_supported_type() -> None:
+def test_medical_claim_bundle_is_preserved_as_informational_cluster() -> None:
     normalized, original = _normalize_validation_document_type("medical_claim_bundle")
-    assert normalized == "hospital_bill"
+    assert normalized == "medical_claim_bundle"
     assert original is None
 
 
-def test_maps_incomplete_bundle_to_unknown_without_crashing() -> None:
+def test_incomplete_bundle_is_remapped_to_hybrid_bundle() -> None:
     normalized, original = _normalize_validation_document_type("incomplete_claim_bundle")
-    assert normalized == "unknown"
-    assert original is None
+    assert normalized == "hybrid_bundle"
+    assert original == "incomplete_claim_bundle"
 
 
-def test_unknown_type_is_downgraded_and_preserved_for_forensics() -> None:
+def test_arbitrary_label_is_preserved_and_never_rejected() -> None:
     normalized, original = _normalize_validation_document_type("totally_new_type")
-    assert normalized == "unknown"
-    assert original == "totally_new_type"
+    assert normalized == "totally_new_type"
+    assert original is None
