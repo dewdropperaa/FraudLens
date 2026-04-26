@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Any, Dict, List, Tuple
 
 from claimguard.v2.schemas import AgentOutput
@@ -10,13 +11,53 @@ from claimguard.v2.schemas import AgentOutput
 LOGGER = logging.getLogger("claimguard.v2.consensus")
 
 AGENT_WEIGHTS: Dict[str, float] = {
-    "IdentityAgent": 0.9,
-    "DocumentAgent": 0.8,
-    "PolicyAgent": 0.75,
-    "AnomalyAgent": 0.85,
-    "PatternAgent": 0.7,
-    "GraphRiskAgent": 0.8,
+    "IdentityAgent": 0.30,  # SCORE-FIX
+    "DocumentAgent": 0.20,  # SCORE-FIX
+    "PolicyAgent": 0.20,  # SCORE-FIX
+    "AnomalyAgent": 0.15,  # SCORE-FIX
+    "PatternAgent": 0.10,  # SCORE-FIX
+    "GraphRiskAgent": 0.05,  # SCORE-FIX
 }
+
+
+def _resolve_score(result: Dict[str, Any], agent_name: str) -> float:
+    if result.get("score", None) is not None:
+        raw = float(result["score"])
+    else:
+        output = result.get("output") if isinstance(result.get("output"), dict) else {}
+        final_decision = output.get("final_decision") if isinstance(output.get("final_decision"), dict) else {}
+        nested_score = final_decision.get("score", output.get("score"))
+        if nested_score is None:
+            raise ValueError(f"{agent_name} missing score")
+        raw = float(nested_score)
+    return raw * 100.0 if raw <= 1.0 else raw
+
+
+def calculate_weighted_score(agent_results: Dict[str, Dict[str, Any]]) -> float:
+    total_weight = 0.0  # SCORE-FIX
+    weighted_sum = 0.0  # SCORE-FIX
+    used_agents: List[str] = []  # SCORE-FIX
+    for agent_name, result in (agent_results or {}).items():
+        if not isinstance(result, dict):
+            continue
+        status = str(result.get("status", "ERROR")).upper()
+        if status in {"ERROR", "TIMEOUT"}:
+            continue
+        score_0_100 = _resolve_score(result, agent_name)
+        weight = AGENT_WEIGHTS.get(agent_name, 0.10)
+        weighted_sum += score_0_100 * weight
+        total_weight += weight
+        used_agents.append(agent_name)
+    if total_weight == 0:
+        return 50.0
+    raw_score = weighted_sum / total_weight
+    LOGGER.info(
+        "[CONSENSUS] weighted_score=%s total_weight=%s agents_used=%s",  # SCORE-FIX
+        round(raw_score, 2),
+        round(total_weight, 2),
+        used_agents,
+    )
+    return round(raw_score, 2)
 
 
 @dataclass
@@ -35,11 +76,139 @@ class Contradiction:
 
 @dataclass(frozen=True)
 class ConsensusConfig:
+    # CALIBRATION-FIX: relaxed calibration to avoid false-positive human review routing.
+    approved_threshold: float = 65.0
+    human_review_min: float = 45.0
+    human_review_max: float = 64.0
+    rejected_threshold: float = 44.0
+    stability_required_delta: float = 8.0
     hallucination_confidence_floor: float = 0.7
     max_contradiction_threshold: float = 0.3
-    auto_approve_threshold: float = 90.0
+    auto_approve_threshold: float = 75.0
     degraded_memory_penalty: float = 0.15
     unavailable_memory_penalty: float = 0.25
+
+
+class FlagTier(str, Enum):
+    BLOCKING = "blocking"
+    WARNING = "warnings"
+    INFORMATIONAL = "informational"
+
+
+@dataclass(frozen=True)
+class FlagEvent:
+    flag: str
+    tier: FlagTier
+    reason: str
+    timestamp: str
+
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "flag": self.flag,
+            "tier": self.tier.value,
+            "reason": self.reason,
+            "timestamp": self.timestamp,
+        }
+
+
+class FlagRegistry:
+    # PROD-FIX: central flag registry with tiered auditability.
+    def __init__(self) -> None:
+        self._by_tier: Dict[FlagTier, List[str]] = {
+            FlagTier.BLOCKING: [],
+            FlagTier.WARNING: [],
+            FlagTier.INFORMATIONAL: [],
+        }
+        self._events: List[FlagEvent] = []
+
+    def emit(self, flag: str, tier: FlagTier, reason: str) -> None:
+        clean_flag = str(flag or "").strip().upper()
+        if not clean_flag:
+            return
+        if clean_flag not in self._by_tier[tier]:
+            self._by_tier[tier].append(clean_flag)
+        self._events.append(
+            FlagEvent(
+                flag=clean_flag,
+                tier=tier,
+                reason=str(reason or "").strip() or "No reason provided",
+                timestamp=datetime.utcnow().isoformat() + "Z",
+            )
+        )
+
+    def as_dict(self) -> Dict[str, List[str]]:
+        return {
+            "blocking": list(self._by_tier[FlagTier.BLOCKING]),
+            "warnings": list(self._by_tier[FlagTier.WARNING]),
+            "informational": list(self._by_tier[FlagTier.INFORMATIONAL]),
+        }
+
+    def audit_trail(self) -> List[Dict[str, str]]:
+        return [event.to_dict() for event in self._events]
+
+
+class ScoreCalibrator:
+    # CALIBRATION-FIX: ensure infra degradation does not masquerade as fraud.
+    def calibrate(
+        self,
+        *,
+        base_ts: float,
+        flags: Dict[str, List[str]],
+        error_agents: List[str],
+        all_agents_done: bool,
+        fraud_signals: int,
+        all_critical_fields_verified: bool,
+        doc_type_correct: bool,
+        unverified_critical_fields: int,
+        unverified_non_critical: int,
+        no_tier1_blocking_flags: bool,
+        tool_failures: int,
+        cin_found: bool,
+        ipp_found: bool,
+        amount_found: bool,
+        injection_detected: bool,
+        cin_format_match: bool,
+    ) -> float:
+        score = float(base_ts)
+        score -= 25.0 * len(flags.get("blocking", []))
+        warning_penalty = 0.0
+        if "DECISION_STABILITY_FAIL" in flags.get("warnings", []):
+            # CALIBRATION-FIX: stability warning can contribute at most -5 and never force outcome.
+            warning_penalty += 5.0
+        score -= min(warning_penalty, 5.0)
+        score -= 8.0 * max(0, int(tool_failures))
+        if all_agents_done and len(error_agents) == 0:
+            score += 6.0  # CALIBRATION-FIX
+        if fraud_signals == 0:
+            score += 5.0  # CALIBRATION-FIX
+        if cin_found and ipp_found and amount_found:
+            score += 4.0  # CALIBRATION-FIX
+        if cin_format_match:
+            score += 2.0  # CALIBRATION-FIX: Moroccan CIN pattern bonus.
+        if doc_type_correct:
+            score += 3.0  # CALIBRATION-FIX
+        if no_tier1_blocking_flags:
+            score += 4.0  # CALIBRATION-FIX
+        if not injection_detected:
+            score += 3.0  # CALIBRATION-FIX
+        if all_critical_fields_verified:
+            score += 2.0
+        if unverified_non_critical > 1:
+            score -= 1.0
+        if unverified_critical_fields > 0:
+            score -= min(5.0, float(unverified_critical_fields) * 3.0)
+        if not (cin_found and ipp_found and amount_found):
+            # CALIBRATION-FIX: penalize unverified fields only when critical identity signals are missing.
+            if not cin_found or not ipp_found:
+                score -= 3.0
+        if (
+            all_agents_done
+            and fraud_signals == 0
+            and int(tool_failures) == 0
+            and no_tier1_blocking_flags
+        ):
+            score = max(score, 68.0)  # CALIBRATION-FIX: clean signal floor.
+        return max(0.0, min(100.0, round(score, 2)))
 
 
 def should_force_human_review(
@@ -101,8 +270,7 @@ class ConsensusEngine:
             status = str(payload.get("status", "DONE")).upper()
             if status != "DONE":
                 continue
-            raw_score = float(payload.get("score", payload.get("confidence", 0.0)))
-            score_0_100 = raw_score * 100.0 if raw_score <= 1.0 else raw_score
+            score_0_100 = _resolve_score(payload, agent)
             weighted += AGENT_WEIGHTS.get(agent, 0.0) * max(0.0, min(100.0, score_0_100))
         return weighted
 
@@ -221,12 +389,15 @@ class ConsensusEngine:
         return conflicts
 
     @staticmethod
-    def _decision_for_ts(ts: float) -> str:
-        if ts > 90:
+    def _decision_for_ts(ts: float, config: ConsensusConfig) -> str:
+        # CALIBRATION-FIX: threshold windows align to revised risk policy.
+        if ts >= config.approved_threshold:
             return "APPROVED"
-        if 60 <= ts <= 90:
+        if config.human_review_min <= ts <= config.human_review_max:
             return "HUMAN_REVIEW"
-        return "REFLEXIVE_TRIGGER"
+        if ts <= config.rejected_threshold:
+            return "REJECTED"
+        return "HUMAN_REVIEW"
 
     @staticmethod
     def _extract_amount(claim_request: Dict[str, Any]) -> float:
@@ -316,18 +487,9 @@ class ConsensusEngine:
         board = dict(blackboard or {})
         memory_degraded = bool(board.get("memory_degraded"))
         memory_status = str(board.get("memory_status", "")).upper()
-        if memory_degraded and memory_status in {"DEGRADED", "DISABLED"}:
-            penalty = (
-                config.unavailable_memory_penalty
-                if memory_status == "DISABLED"
-                else config.degraded_memory_penalty
-            )
-            for agent_name in ("PatternAgent", "GraphRiskAgent"):
-                if agent_name in current_entries:
-                    current_entries[agent_name]["confidence"] = round(
-                        max(0.0, float(current_entries[agent_name].get("confidence", 0.0)) - penalty),
-                        4,
-                    )
+        if memory_degraded:
+            # CALIBRATION-FIX: degraded memory is informational only (no score/confidence penalty).
+            LOGGER.warning("memory_degraded informational mode: memory_status=%s", memory_status)
         score_evolution: List[float] = []
         retry_logs: List[Dict[str, Any]] = []
         retry_count = 0
@@ -343,18 +505,65 @@ class ConsensusEngine:
         too_many_error_agents = failure_ratio >= 0.5
 
         while True:
-            weighted_sum = self._weighted_sum(current_entries)
+            weighted_base_ts = calculate_weighted_score(current_entries)  # SCORE-FIX
             contradictions = self._detect_contradictions(current_entries)
-            ts = round(self._nexus_truth_score(weighted_sum, contradictions), 2)
+            ts = round(weighted_base_ts, 2)  # SCORE-FIX
             conflicts = self._detect_conflicts(current_entries)
             if conflicts:
                 ts = max(0.0, ts - sum(float(item.get("penalty", 0.0)) for item in conflicts))
             score_evolution.append(ts)
-            decision = self._decision_for_ts(ts)
+            decision = self._decision_for_ts(ts, config)
             contradiction_payload = [c.to_dict() for c in contradictions]
+            flag_registry = FlagRegistry()
+            _meta = entries.get("_meta", {}) if isinstance(entries.get("_meta", {}), dict) else {}
+            fraud_signals = int(_meta.get("fraud_signals", 0) or 0)
+            unverified_critical_fields = int(_meta.get("unverified_critical_fields", 0) or 0)
+            unverified_non_critical = int(_meta.get("unverified_non_critical", 0) or 0)
+            all_critical_fields_verified = bool(_meta.get("all_critical_fields_verified", False))
+            doc_type_correct = bool(_meta.get("document_type_correct", True))
+            layer2_disabled = bool(_meta.get("layer2_disabled", False))
+            layer1_triggered = bool(_meta.get("layer1_triggered", False))
+            cin_found = bool(_meta.get("cin_found", False))
+            ipp_found = bool(_meta.get("ipp_found", False))
+            amount_found = bool(_meta.get("amount_found", False))
+            injection_detected = bool(_meta.get("injection_detected", False))
+            cin_format_match = bool(_meta.get("cin_format_match", False))
+            tier1_blocking_flag_count = int(_meta.get("tier1_blocking_flag_count", 0) or 0)
+            all_agents_done = len(success_agents) > 0 and len(error_agents) == 0
+            if layer2_disabled and not layer1_triggered:
+                flag_registry.emit("DEGRADED_SECURITY_MODE", FlagTier.INFORMATIONAL, "Layer2 disabled without layer1 trigger.")
+            if conflicts:
+                flag_registry.emit("AGENT_CONFLICT", FlagTier.WARNING, "Agent contradiction conflict detected.")
+            if too_many_error_agents:
+                flag_registry.emit("TOO_MANY_ERROR_AGENTS", FlagTier.BLOCKING, "More than half of agents errored.")
+            if memory_status == "DISABLED":
+                flag_registry.emit("MEMORY_DISABLED", FlagTier.INFORMATIONAL, "Memory embedding/index unavailable.")
+            if unverified_critical_fields > 0 and (not cin_found or not ipp_found):
+                flag_registry.emit("UNVERIFIED_FIELDS_PRESENT", FlagTier.WARNING, "Critical field verification incomplete.")
+
+            ts = ScoreCalibrator().calibrate(
+                base_ts=ts,
+                flags=flag_registry.as_dict(),
+                error_agents=error_agents,
+                all_agents_done=all_agents_done,
+                fraud_signals=fraud_signals,
+                all_critical_fields_verified=all_critical_fields_verified,
+                doc_type_correct=doc_type_correct,
+                unverified_critical_fields=unverified_critical_fields,
+                unverified_non_critical=unverified_non_critical,
+                no_tier1_blocking_flags=tier1_blocking_flag_count == 0,
+                tool_failures=len(error_agents),
+                cin_found=cin_found,
+                ipp_found=ipp_found,
+                amount_found=amount_found,
+                injection_detected=injection_detected,
+                cin_format_match=cin_format_match,
+            )
+            decision = self._decision_for_ts(ts, config)
+
             if not success_agents:
                 decision = "HUMAN_REVIEW"
-            elif (65.0 <= ts <= 70.0) or conflicts or too_many_error_agents:
+            elif conflicts or too_many_error_agents:
                 decision = "HUMAN_REVIEW"
             LOGGER.info(
                 "consensus_eval retry=%s Ts=%.2f decision=%s contradictions=%s",
@@ -378,6 +587,8 @@ class ConsensusEngine:
                     "error_agents": error_agents,
                     "success_agents": success_agents,
                     "too_many_error_agents": too_many_error_agents,
+                    "flag_registry": flag_registry.as_dict(),
+                    "audit_trail": flag_registry.audit_trail(),
                 }
 
             if retry_count >= self._max_reflexive_retries:
@@ -394,6 +605,8 @@ class ConsensusEngine:
                     "error_agents": error_agents,
                     "success_agents": success_agents,
                     "too_many_error_agents": too_many_error_agents,
+                    "flag_registry": flag_registry.as_dict(),
+                    "audit_trail": flag_registry.audit_trail(),
                 }
 
             retry_count += 1

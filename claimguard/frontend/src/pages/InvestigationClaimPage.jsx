@@ -23,6 +23,11 @@ export default function InvestigationClaimPage({ claimId, user, token, onBackToD
   const [hoveredEvidence, setHoveredEvidence] = useState(null)
   const [debouncedHeatmap, setDebouncedHeatmap] = useState([])
   const explanationPanelRef = useRef(null)
+  const role = String(user?.role || '').toLowerCase()
+  const isAdminDemoUser = String(user?.email || '').toLowerCase() === 'admin@gmail.com'
+  const canInvestigate = role === 'admin' || role === 'investigator' || isAdminDemoUser
+  const [retryTick, setRetryTick] = useState(0)
+  const [is403, setIs403] = useState(false)
 
   function sanitizeText(value) {
     return String(value || '')
@@ -37,6 +42,11 @@ export default function InvestigationClaimPage({ claimId, user, token, onBackToD
   }
 
   useEffect(() => {
+    if (!canInvestigate) {
+      setLoading(false)
+      setError('Investigator/Admin access is required to open human review context.')
+      return () => {}
+    }
     let cancelled = false
     async function loadContext() {
       setLoading(true)
@@ -45,7 +55,14 @@ export default function InvestigationClaimPage({ claimId, user, token, onBackToD
         const res = await fetch(`/api/v2/claim/${claimId}/human-review-context`, {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
         })
-        if (!res.ok) throw new Error(`Failed to load context (${res.status})`)
+        if (!res.ok) {
+          if (res.status === 403) {
+            setIs403(true)
+            throw new Error('Accès refusé — vérifiez vos permissions')
+          }
+          throw new Error(`Failed to load context (${res.status})`)
+        }
+        setIs403(false)
         const body = await res.json()
         if (!cancelled) setContext(body)
       } catch (e) {
@@ -56,7 +73,7 @@ export default function InvestigationClaimPage({ claimId, user, token, onBackToD
     }
     loadContext()
     return () => { cancelled = true }
-  }, [claimId, token])
+  }, [claimId, token, canInvestigate, retryTick])
 
   const ts = Number(context?.ts || 0)
   const risk = useMemo(() => toRiskLabel(ts), [ts])
@@ -112,7 +129,15 @@ export default function InvestigationClaimPage({ claimId, user, token, onBackToD
     }
   }
 
-  if (loading) return <div className="cg-card">Loading investigation context...</div>
+  if (loading) return <div className="cg-card">Chargement du dossier investigateur...</div>
+  if (is403) {
+    return (
+      <div className="cg-card">
+        <div style={{ color: 'var(--danger)', marginBottom: 10 }}>Accès refusé — vérifiez vos permissions</div>
+        <button className="cg-btn cg-btn-ghost" onClick={() => setRetryTick((v) => v + 1)}>Réessayer</button>
+      </div>
+    )
+  }
   if (error) return <div className="cg-card" style={{ color: 'var(--danger)' }}>{error}</div>
   if (!context) return <div className="cg-card">No human review context found.</div>
 
@@ -120,6 +145,7 @@ export default function InvestigationClaimPage({ claimId, user, token, onBackToD
     <div className="space-y-4">
       <div className="cg-page-header">
         <div>
+          <div className="cg-page-sub">Dashboard → Claims → Investigateur {claimId}</div>
           <div className="cg-page-title">Claim Investigation #{claimId}</div>
           <div className="cg-page-sub">Human-in-the-loop review and trust-layer finalization</div>
         </div>

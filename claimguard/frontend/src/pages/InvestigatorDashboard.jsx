@@ -29,6 +29,18 @@ function scorePercent(score) {
   return 100
 }
 
+function getAgentBadge(agent) {
+  const status = String(agent?.status || '').toUpperCase()
+  const score = Number(agent?.score || 0)
+  if (status === 'PASS') return 'PASS'
+  if (status === 'REVIEW') return 'REVIEW'
+  if (status === 'FAIL') return 'FAIL'
+  if (status === 'ERROR' || status === 'TIMEOUT') return 'FAIL'
+  if (status === 'DONE' && score >= 60) return 'PASS'
+  if (status === 'DONE' && score >= 40) return 'REVIEW'
+  return 'FAIL'
+}
+
 function inferDecision(claim) {
   return String(claim?.decision ?? claim?.final_decision ?? claim?.status ?? 'HUMAN_REVIEW').toUpperCase()
 }
@@ -446,12 +458,12 @@ export default function InvestigatorDashboard({ claims = [], claimsLoading, fetc
                 <div className="mb-3 text-sm font-semibold">Analysis Panel</div>
                 <div className="space-y-2 text-sm">
                   <div><span className="font-semibold">Final Decision:</span> {selectedClaim.decision}</div>
-                  <div><span className="font-semibold">Ts Score:</span> {selectedClaim.ts ?? 'N/A'}</div>
+                  <div><span className="font-semibold">Score de confiance:</span> {selectedClaim.scorePct}/100</div>
                   <div><span className="font-semibold">Input Trust Score:</span> {selectedClaim.inputTrust ?? 'N/A'}</div>
                   <div className="mt-2 h-2 rounded bg-gray-100">
-                    <div className="h-2 rounded" style={{ width: `${selectedClaim.scorePct}%`, background: selectedClaim.risk === 'HIGH' ? '#dc2626' : selectedClaim.risk === 'MEDIUM' ? '#d97706' : '#16a34a' }} />
+                    <div className="h-2 rounded" style={{ width: `${selectedClaim.scorePct}%`, background: '#22c55e' }} />
                   </div>
-                  <div className="text-xs text-[var(--text-muted)]">Risk color coding: green=safe, amber=review, red=risk</div>
+                  <div className="text-xs text-[var(--text-muted)]">Seuil d'approbation: 65</div>
                 </div>
               </div>
             </div>
@@ -463,12 +475,12 @@ export default function InvestigatorDashboard({ claims = [], claimsLoading, fetc
                   <div key={`${ag.agent_name || idx}-${idx}`} className="rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] p-3">
                     <div className="flex items-center justify-between text-sm">
                       <span className="font-semibold">{ag.agent_name || `Agent ${idx + 1}`}</span>
-                      <span className="text-xs">{ag.status || (ag.passed ? 'PASS' : 'CHECK')}</span>
+                      <span className="text-xs">{getAgentBadge(ag)}</span>
                     </div>
                     <div className="mt-1 text-xs text-[var(--text-secondary)]">
-                      score: {ag.score ?? 'N/A'} | confidence: {ag.confidence ?? 'N/A'}
+                      score: {Math.round(Number(ag.score || 0))} | confidence: {ag.confidence ?? 'N/A'}
                     </div>
-                    <div className="mt-1 text-xs">{ag.explanation || ag.reasoning || 'No explanation provided.'}</div>
+                    <div className="mt-1 text-xs">{ag.explanation || ag.reasoning || 'Explanation unavailable — system error'}</div>
                     {ag.evidence_used && <div className="mt-1 text-xs text-[var(--text-secondary)]">evidence: {String(ag.evidence_used)}</div>}
                   </div>
                 ))}

@@ -20,6 +20,96 @@ class TrustLayerIPFSFailure(RuntimeError):
     pass
 
 
+def _to_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(" ", "")
+    if not text:
+        return None
+    text = text.replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _normalize_blackboard_for_trust(blackboard: Dict[str, Any]) -> Dict[str, Any]:
+    bb = blackboard if isinstance(blackboard, dict) else {}
+    identity_src = bb.get("identity", {})
+    verified = bb.get("verified_structured_data", {})
+    doc_class = bb.get("document_classification", {})
+    request = bb.get("request", {})
+    request_data = request.get("data", {}) if isinstance(request, dict) else {}
+
+    identity: Dict[str, Any] = identity_src if isinstance(identity_src, dict) else {}
+    verified_data: Dict[str, Any] = verified if isinstance(verified, dict) else {}
+    doc_classification: Dict[str, Any] = doc_class if isinstance(doc_class, dict) else {}
+    request_verified: Dict[str, Any] = request_data if isinstance(request_data, dict) else {}
+
+    cin_value = (
+        identity.get("cin")
+        or identity.get("CIN")
+        or verified_data.get("cin")
+        or verified_data.get("CIN")
+        or request_verified.get("cin")
+        or request_verified.get("CIN")
+        or ""
+    )
+    name_value = (
+        identity.get("name")
+        or verified_data.get("name")
+        or request_verified.get("name")
+        or ""
+    )
+    amount_value = (
+        bb.get("amount")
+        if bb.get("amount") is not None
+        else (
+            verified_data.get("amount")
+            if verified_data.get("amount") is not None
+            else request_verified.get("amount")
+        )
+    )
+    amount = _to_float_or_none(amount_value)
+
+    raw_doc_type = (
+        bb.get("document_type")
+        or doc_classification.get("document_type")
+        or doc_classification.get("label")
+        or ""
+    )
+    normalized_document_type = str(raw_doc_type).strip().lower().replace(" ", "_")
+    if normalized_document_type in {"medical_claim", "hospital_bill", "medical_invoice", "invoice"}:
+        normalized_document_type = "medical_claim_bundle"
+    if not normalized_document_type:
+        normalized_document_type = "medical_claim_bundle"
+
+    ocr_text = (
+        bb.get("ocr_text")
+        or bb.get("text")
+        or bb.get("extracted_text")
+        or (request.get("text") if isinstance(request, dict) else "")
+        or ""
+    )
+    return {
+        "identity": {"cin": str(cin_value or "").strip(), "name": str(name_value or "").strip()},
+        "amount": amount,
+        "document_type": normalized_document_type,
+        "ocr_text": str(ocr_text or ""),
+    }
+
+
+def is_trust_eligible(blackboard: Dict[str, Any]) -> bool:
+    normalized = _normalize_blackboard_for_trust(blackboard)
+    return bool(
+        normalized.get("identity", {}).get("cin")
+        and normalized.get("amount") is not None
+        and normalized.get("ocr_text")
+    )
+
+
 class SanitizedTrustDocument(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -82,6 +172,18 @@ class DefaultFallbackLogger:
         LOGGER.warning("trust_layer_blockchain_fallback context=%s", context)
 
 
+class HallucinationGuard:
+    # PROD-FIX: isolate true hallucination detection from degraded-mode signals.
+    def should_flag_hallucination(self, context: dict) -> bool:
+        if not isinstance(context, dict):
+            return False
+        if bool(context.get("layer2_disabled")) and not bool(context.get("layer1_triggered")):
+            return False
+        contradictory_to_ocr = bool(context.get("contradicts_ocr_text"))
+        fabricated_field = bool(context.get("field_not_present_in_document"))
+        return contradictory_to_ocr or fabricated_field
+
+
 class PinataIPFSClient:
     def __init__(
         self,
@@ -123,6 +225,48 @@ class PinataIPFSClient:
             raise TrustLayerIPFSFailure("Pinata response missing IpfsHash.")
         return str(cid)
 
+    def healthcheck(self) -> Dict[str, Any]:
+        # BLOCKCHAIN-FIX: live Pinata connectivity/auth check.
+        headers: Dict[str, str] = {}
+        if self._jwt:
+            headers["Authorization"] = f"Bearer {self._jwt}"
+        elif self._api_key and self._api_secret:
+            headers["pinata_api_key"] = self._api_key
+            headers["pinata_secret_api_key"] = self._api_secret
+        else:
+            return {
+                "status": "FAIL",
+                "configured": False,
+                "endpoint": "https://api.pinata.cloud/data/testAuthentication",
+                "message": "Missing Pinata credentials.",
+            }
+        try:
+            response = requests.get(
+                "https://api.pinata.cloud/data/testAuthentication",
+                headers=headers,
+                timeout=15,
+            )
+            ok = response.status_code == 200
+            payload: Dict[str, Any] = {"raw": response.text[:400]}
+            try:
+                payload = response.json()
+            except Exception:
+                pass
+            return {
+                "status": "OK" if ok else "FAIL",
+                "configured": True,
+                "endpoint": "https://api.pinata.cloud/data/testAuthentication",
+                "http_status": response.status_code,
+                "response": payload,
+            }
+        except Exception as exc:
+            return {
+                "status": "FAIL",
+                "configured": True,
+                "endpoint": "https://api.pinata.cloud/data/testAuthentication",
+                "message": str(exc),
+            }
+
 
 class EthereumTrustClient:
     def __init__(self) -> None:
@@ -163,7 +307,101 @@ class EthereumTrustClient:
         )
         signed = account.sign_transaction(txn)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        return str(tx_hash.hex())
+        tx_hash_hex = str(tx_hash.hex())
+        # BLOCKCHAIN-FIX: require mined confirmation to avoid "pretend" anchoring.
+        timeout_s_raw = os.getenv("TRUST_CHAIN_RECEIPT_TIMEOUT_S", "120").strip()
+        try:
+            timeout_s = max(10, int(float(timeout_s_raw)))
+        except ValueError:
+            timeout_s = 120
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout_s)
+        if int(getattr(receipt, "status", 0)) != 1:
+            raise RuntimeError(f"Blockchain transaction reverted: {tx_hash_hex}")
+        return tx_hash_hex
+
+    @staticmethod
+    def _dummy_value_for_type(sol_type: str) -> Any:
+        kind = str(sol_type or "").lower()
+        if kind.startswith("uint") or kind.startswith("int"):
+            return 1
+        if kind == "address":
+            return "0x0000000000000000000000000000000000000001"
+        if kind.startswith("bytes32"):
+            return "0x" + ("11" * 32)
+        if kind.startswith("bytes"):
+            return "0x11"
+        if kind == "bool":
+            return True
+        if kind == "string":
+            return "healthcheck"
+        if kind.endswith("[]"):
+            return []
+        return 0
+
+    def healthcheck(self) -> Dict[str, Any]:
+        # BLOCKCHAIN-FIX: live RPC/contract and dry-run call check.
+        from web3 import Web3
+
+        configured = bool(self._rpc_url and self._contract_address and self._private_key and self._abi_json)
+        if not configured:
+            return {
+                "status": "FAIL",
+                "configured": False,
+                "message": "Missing blockchain config (rpc/contract/private_key/abi).",
+            }
+        report: Dict[str, Any] = {"configured": True}
+        try:
+            w3 = Web3(Web3.HTTPProvider(self._rpc_url))
+            if not w3.is_connected():
+                return {"status": "FAIL", "configured": True, "message": "Unable to connect to Sepolia RPC."}
+            report["rpc_connected"] = True
+            report["chain_id"] = int(w3.eth.chain_id)
+            checksum_address = Web3.to_checksum_address(self._contract_address)
+            report["contract_address"] = checksum_address
+            code = w3.eth.get_code(checksum_address)
+            report["contract_deployed"] = bool(code and code != b"\x00")
+            if not report["contract_deployed"]:
+                return {**report, "status": "FAIL", "message": "No bytecode at configured contract address."}
+
+            abi = json.loads(self._abi_json)
+            contract = w3.eth.contract(address=checksum_address, abi=abi)
+            fn_name = str(self._function_name or "").strip()
+            fn_abi = next(
+                (
+                    item for item in abi
+                    if isinstance(item, dict)
+                    and item.get("type") == "function"
+                    and item.get("name") == fn_name
+                ),
+                None,
+            )
+            if fn_abi is None:
+                return {
+                    **report,
+                    "status": "FAIL",
+                    "message": f"Function '{fn_name}' not found in contract ABI.",
+                }
+            inputs = fn_abi.get("inputs", []) if isinstance(fn_abi, dict) else []
+            args = [self._dummy_value_for_type(str(inp.get("type", ""))) for inp in inputs]
+            account = w3.eth.account.from_key(self._private_key)
+            fn = getattr(contract.functions, fn_name)(*args)
+            tx = fn.build_transaction({"from": account.address})
+            _ = w3.eth.call(
+                {
+                    "to": checksum_address,
+                    "from": account.address,
+                    "data": tx.get("data", "0x"),
+                }
+            )
+            report["dry_run"] = {
+                "status": "OK",
+                "function": fn_name,
+                "args_types": [str(inp.get("type", "")) for inp in inputs],
+            }
+            return {**report, "status": "OK"}
+        except Exception as exc:
+            report["dry_run"] = {"status": "FAIL", "message": str(exc)}
+            return {**report, "status": "FAIL", "message": str(exc)}
 
     @property
     def validator_id(self) -> str:
@@ -263,8 +501,9 @@ class TrustLayerService:
         return " | ".join(items)
 
     @staticmethod
-    def _hash_cid(cid: str) -> str:
-        digest = hashlib.sha256(cid.encode("utf-8")).hexdigest()
+    def _hash_cid(cid: str | None) -> str:
+        normalized = (cid or "").strip()
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         return f"0x{digest}"
 
     @staticmethod
@@ -295,18 +534,17 @@ class TrustLayerService:
 
     def process_approved_claim(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         claim_id = str(payload.get("claim_id") or "")
-        decision = str(payload.get("decision") or "").upper()
+        raw_decision = str(payload.get("decision") or "").strip()
+        if not raw_decision:
+            return {"status": "SKIPPED"}
+        decision = raw_decision.upper()
         ts_score = float(payload.get("ts_score", 0.0))
         claim_request = payload.get("claim_request") or {}
+        blackboard = payload.get("blackboard") or {}
         agent_outputs = list(payload.get("agent_outputs") or [])
         flags = list(payload.get("flags") or [])
+        dispute_risk = bool(payload.get("dispute_risk"))
 
-        if decision != "APPROVED":
-            return {"status": "SKIPPED"}
-
-        assert decision == "APPROVED", "Approved-only side effects enforced"
-
-        decision = str(decision or "").upper()
         now = datetime.now(timezone.utc)
         timestamp_iso = now.isoformat()
         agent_summary = self._agent_summary(agent_outputs)
@@ -319,12 +557,99 @@ class TrustLayerService:
             flags=flags,
         )
 
+        if decision != "APPROVED":
+            # Tier-1 audit hash + Firebase; optional IPFS evidence bundle when disputed.
+            evidence_cid: str | None = None
+            if dispute_risk:
+                bb = _normalize_blackboard_for_trust(blackboard if isinstance(blackboard, dict) else {})
+                dispute_docs = list(self._sanitize_documents(claim_request.get("documents", [])))
+                if not dispute_docs and is_trust_eligible(bb):
+                    raw_text = bb.get("ocr_text") or ""
+                    dispute_docs.append(
+                        SanitizedTrustDocument(
+                            document_id=claim_id,
+                            document_type=str(bb.get("document_type") or "medical_claim_bundle"),
+                            content=raw_text[:5000],
+                        )
+                    )
+                if not dispute_docs:
+                    dispute_docs.append(
+                        SanitizedTrustDocument(
+                            document_id=f"{claim_id}-dispute-bundle",
+                            document_type="medical_claim_bundle",
+                            content=json.dumps(
+                                {"agent_outputs": agent_outputs, "flags": flags},
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )[:5000],
+                        )
+                    )
+                if dispute_docs:
+                    try:
+                        evidence_cid = self.ipfs_client.upload_documents(claim_id, dispute_docs)
+                    except Exception as e:
+                        LOGGER.error(f"IPFS FAILED: {e}")
+                        evidence_cid = None
+                else:
+                    LOGGER.warning("trust_layer_ipfs_skipped_empty_documents claim_id=%s", claim_id)
+                    evidence_cid = None
+            firebase_payload = FirebaseTrustRecord.model_validate(
+                {
+                    "claim_id": claim_id,
+                    "cid": "",
+                    "Ts": ts_score,
+                    "decision": decision,
+                    "agent_summary": agent_summary,
+                    "timestamp": timestamp_iso,
+                    "trust_hash": trust_hash,
+                    "dispute_risk": dispute_risk,
+                    "evidence_cid": evidence_cid,
+                }
+            )
+            firebase_id = self.firebase_client.store_record(firebase_payload)
+            return {
+                "cid": None,
+                "evidence_cid": evidence_cid,
+                "tx_hash": None,
+                "firebase_id": firebase_id,
+                "status": "stored",
+                "trust_hash": trust_hash,
+            }
+
+        assert decision == "APPROVED", "Approved-only side effects enforced"
+
         cid: str | None = None
         tx_hash: Optional[str] = None
 
-        documents = claim_request.get("documents", [])
-        trusted_docs = self._sanitize_documents(documents)
-        cid = self.ipfs_client.upload_documents(claim_id, trusted_docs)
+        bb = _normalize_blackboard_for_trust(blackboard if isinstance(blackboard, dict) else {})
+        documents = list(self._sanitize_documents(claim_request.get("documents", [])))
+        if not documents and is_trust_eligible(bb):
+            raw_text = str(bb.get("ocr_text") or "")
+            documents.append(
+                SanitizedTrustDocument(
+                    document_id=claim_id,
+                    document_type=str(bb.get("document_type") or "medical_claim_bundle"),
+                    content=raw_text[:5000],
+                )
+            )
+        LOGGER.info(f"[DEBUG] identity={bb.get('identity')}")
+        LOGGER.info(f"[DEBUG] amount={bb.get('amount')}")
+        LOGGER.info(f"[DEBUG] doc_type={bb.get('document_type')}")
+        LOGGER.info(f"[DEBUG] text_present={bool(bb.get('ocr_text'))}")
+        LOGGER.info(f"[DEBUG] trust_eligible={is_trust_eligible(bb)}")
+        LOGGER.info(f"[DEBUG] documents_count={len(documents)}")
+        LOGGER.info(
+            f"[TRUST LAYER] documents_count={len(documents)} eligible={is_trust_eligible(bb)}"
+        )
+        if documents:
+            try:
+                cid = self.ipfs_client.upload_documents(claim_id, documents)
+            except Exception as e:
+                LOGGER.error(f"IPFS FAILED: {e}")
+                cid = None
+        else:
+            LOGGER.warning("trust_layer_ipfs_skipped_empty_documents claim_id=%s", claim_id)
+            cid = None
 
         onchain_payload = OnChainTrustPayload.model_validate(
             {
@@ -390,8 +715,42 @@ class TrustLayerService:
                 "claim_request": claim_request,
                 "agent_outputs": agent_outputs,
                 "flags": list(flags or []),
+                "dispute_risk": dispute_risk,
             }
         )
         if result.get("status") == "SKIPPED":
             return None
         return TrustLayerResult.model_validate(result)
+
+    def healthcheck(self) -> Dict[str, Any]:
+        # BLOCKCHAIN-FIX: combined production readiness checks.
+        ipfs_check = (
+            self.ipfs_client.healthcheck()
+            if hasattr(self.ipfs_client, "healthcheck")
+            else {"status": "FAIL", "message": "IPFS client has no healthcheck()."}
+        )
+        chain_check = (
+            self.blockchain_client.healthcheck()
+            if hasattr(self.blockchain_client, "healthcheck")
+            else {"status": "FAIL", "message": "Blockchain client has no healthcheck()."}
+        )
+        contract_ok = bool(chain_check.get("contract_deployed", False))
+        rpc_ok = bool(chain_check.get("rpc_connected", False))
+        dry_run_ok = str((chain_check.get("dry_run", {}) or {}).get("status", "")).upper() == "OK"
+        pinata_ok = str(ipfs_check.get("status", "")).upper() == "OK"
+        overall_ok = pinata_ok and rpc_ok and contract_ok and dry_run_ok
+        return {
+            "status": "OK" if overall_ok else "FAIL",
+            "checks": {
+                "pinata": ipfs_check,
+                "sepolia_rpc": {
+                    "status": "OK" if rpc_ok else "FAIL",
+                    "chain_id": chain_check.get("chain_id"),
+                },
+                "contract": {
+                    "status": "OK" if contract_ok else "FAIL",
+                    "address": chain_check.get("contract_address"),
+                },
+                "tx_dry_run": chain_check.get("dry_run", {"status": "FAIL"}),
+            },
+        }

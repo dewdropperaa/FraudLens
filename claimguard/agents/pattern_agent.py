@@ -66,10 +66,45 @@ class PatternAgent(BaseAgent):
             },
         )
         fraud_out = tool_results["fraud_detector"].get("output") or {}
-        indicators = int(fraud_out.get("risk_indicators") or 0)
-        score = max(0.0, 100.0 - (indicators * 20.0))
+        score = 100.0  # SCORE-FIX
+        flags: List[str] = []  # SCORE-FIX
+        memory_status = str(claim_data.get("memory_status") or "").upper()
+        history = claim_data.get("history") or []
+        if memory_status == "DISABLED" or not history:
+            score = 72.0
+            reasoning = "Historique non disponible — analyse de pattern limitée"
+            payload = {
+                "agent_name": self.name,
+                "status": "REVIEW",
+                "decision": True,
+                "score": round(score, 2),
+                "confidence": 72.0,
+                "reasoning": reasoning,
+                "explanation": reasoning,
+                "signals": ["MEMORY_DISABLED"],
+                "data_used": {"fraud_detector": fraud_out},
+                "details": {"tool_results": tool_results, "memory_status": memory_status},
+            }
+            assert payload["score"] is not None
+            assert str(payload["explanation"]).strip() != ""
+            return self._build_result(status="DONE", score=score, reason=reasoning, output=payload, flags=["MEMORY_DISABLED"])  # SCORE-FIX
+        if bool(fraud_out.get("known_fraud_pattern")):
+            score -= 40
+            flags.append("KNOWN_FRAUD_PATTERN")
+        if bool(fraud_out.get("partial_pattern_match")):
+            score -= 20
+            flags.append("PARTIAL_PATTERN")
+        if bool(fraud_out.get("provider_high_risk")):
+            score -= 15
+            flags.append("PROVIDER_HIGH_RISK")
+        if bool(fraud_out.get("patient_frequency_anomaly")):
+            score -= 20
+            flags.append("PATIENT_FREQUENCY_ANOMALY")
+        if not flags:
+            score += 5
+        score = max(0.0, min(100.0, score))
         decision = score > 60
-        reasoning = "Pattern risk from fraud detector signals"
+        reasoning = "Analyse de pattern effectuee sur les signaux comportementaux"
 
         llm_fallback = self.should_use_llm_fallback(tool_results)
         if llm_fallback:
@@ -84,18 +119,23 @@ class PatternAgent(BaseAgent):
 
         payload = {
             "agent_name": self.name,
+            "status": "PASS" if score >= 70 else ("REVIEW" if score >= 40 else "FAIL"),
             "decision": decision,
             "score": round(score, 2),
-            "confidence": round(max(0.2, min(0.95, score / 100.0)), 2),
+            "confidence": round(max(20.0, min(95.0, score)), 2),
             "reasoning": reasoning,
             "explanation": reasoning,
-            "details": {"tool_results": tool_results, "risk_indicators": indicators},
+            "signals": list(flags),
+            "data_used": fraud_out,
+            "details": {"tool_results": tool_results, "risk_indicators": int(fraud_out.get("risk_indicators") or 0)},
         }
+        assert payload["score"] is not None
+        assert str(payload["explanation"]).strip() != ""
         self.enforce_tool_trace(tool_results, llm_fallback)
-        return self.build_agent_result(
-            output=payload,
+        return self._build_result(  # SCORE-FIX
+            status="DONE",
             score=float(payload["score"]),
             reason=reasoning,
-            tools_used=list(tool_results.keys()),
-            llm_fallback_used=llm_fallback,
+            output=payload,
+            flags=flags,
         )

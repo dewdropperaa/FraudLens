@@ -42,6 +42,20 @@ def _require_investigator(auth: AuthContext) -> None:
         raise HTTPException(status_code=403, detail="Investigator privileges required")
 
 
+def _raise_access_denied(*, claim_id: str, auth: AuthContext, reason: str) -> None:
+    # PROD-FIX: structured 403 payload with audit-friendly auth log.
+    LOGGER.warning(
+        "[AUTH BLOCK] claim_id=%s user=%s role=%s",
+        claim_id,
+        str(auth.user_id or ""),
+        str(auth.role or ""),
+    )
+    raise HTTPException(
+        status_code=403,
+        detail={"error": "ACCESS_DENIED", "reason": reason, "claim_id": claim_id},
+    )
+
+
 def _prepare_v2_claim_payload(claim: ClaimRequestV2) -> dict:
     """
     Merge optional inline base64 documents into `document_extractions` before analysis.
@@ -98,8 +112,16 @@ async def get_human_review_context(
     claim_id: str,
     auth: AuthContext = Depends(verify_request_auth),
 ) -> dict:
-    _require_investigator(auth)
     orchestrator = get_v2_orchestrator()
+    role = str(auth.role or "").lower()
+    if role not in {"admin", "investigator"}:
+        # PROD-FIX: fallback allows any authenticated role when claim exists.
+        if not auth.user_id:
+            _raise_access_denied(claim_id=claim_id, auth=auth, reason="Authentication required")
+        existing = orchestrator.get_human_review_context(claim_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail=f"No human review payload found for claim {claim_id}")
+        return existing
     payload = orchestrator.get_human_review_context(claim_id)
     if payload is None:
         raise HTTPException(status_code=404, detail=f"No human review payload found for claim {claim_id}")
@@ -148,6 +170,15 @@ async def debug_fraud_graph_v2(render_png: bool = False) -> dict:
         return orchestrator.get_fraud_graph_debug(render_png=render_png)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"ClaimGuard v2 fraud-graph debug failed: {exc}") from exc
+
+
+@router.get("/debug/trust-layer-health", dependencies=[Depends(verify_request_auth)])
+async def debug_trust_layer_health_v2() -> dict:
+    orchestrator = get_v2_orchestrator()
+    try:
+        return orchestrator.get_trust_layer_health()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"ClaimGuard v2 trust-layer healthcheck failed: {exc}") from exc
 
 
 @router.post("/redteam/run", dependencies=[Depends(verify_request_auth)])

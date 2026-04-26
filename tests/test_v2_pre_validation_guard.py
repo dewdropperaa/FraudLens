@@ -359,3 +359,5 @@ def test_unavailable_llm_classifier_does_not_block_pipeline(monkeypatch) -> None
     response = orchestrator.run(claim)
     assert response.decision in {"APPROVED", "HUMAN_REVIEW"}
     assert response.blackboard.get("degraded_security_mode") is True
+
+
