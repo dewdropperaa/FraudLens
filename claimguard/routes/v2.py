@@ -14,6 +14,8 @@ from claimguard.v2.redteam import StrictModeConfig, run_red_teaming
 from claimguard.v2.schemas import ClaimGuardV2Response, ClaimRequestV2
 from claimguard.v2.reliability import get_reliability_store
 from claimguard.v2.trust_layer import TrustLayerIPFSFailure
+from claimguard.models import AgentResult, ClaimResult
+from claimguard.services.storage import get_claim_store
 
 from claimguard.v2.flow_tracker import get_tracker
 
@@ -35,11 +37,6 @@ class HumanDecisionPayload(BaseModel):
     reviewer_id: str = Field(min_length=1)
     notes: str = Field(default="")
 
-
-def _require_investigator(auth: AuthContext) -> None:
-    role = str(auth.role or "").lower()
-    if role not in {"admin", "investigator"}:
-        raise HTTPException(status_code=403, detail="Investigator privileges required")
 
 
 def _raise_access_denied(*, claim_id: str, auth: AuthContext, reason: str) -> None:
@@ -114,7 +111,7 @@ async def get_human_review_context(
 ) -> dict:
     orchestrator = get_v2_orchestrator()
     role = str(auth.role or "").lower()
-    if role not in {"admin", "investigator"}:
+    if role != "admin":
         # PROD-FIX: fallback allows any authenticated role when claim exists.
         if not auth.user_id:
             _raise_access_denied(claim_id=claim_id, auth=auth, reason="Authentication required")
@@ -136,7 +133,8 @@ async def get_human_review_document(
     expires: int = Query(gt=0),
     auth: AuthContext = Depends(verify_request_auth),
 ):
-    _require_investigator(auth)
+    if str(auth.role or "").lower() != "admin":
+        raise HTTPException(status_code=403, detail="Admin privileges required")
     orchestrator = get_v2_orchestrator()
     file_path = orchestrator.resolve_human_review_document(
         claim_id=claim_id,
@@ -153,7 +151,37 @@ async def get_human_review_document(
 async def analyze_claim_v2(claim: ClaimRequestV2) -> ClaimGuardV2Response:
     orchestrator = get_v2_orchestrator()
     try:
-        return orchestrator.run(_prepare_v2_claim_payload(claim))
+        result: ClaimGuardV2Response = orchestrator.run(_prepare_v2_claim_payload(claim))
+        try:
+            agent_results = [
+                AgentResult(
+                    agent_name=str(a.get("agent_name") or a.get("agent") or ""),
+                    decision=bool(a.get("decision", False)),
+                    score=float(a.get("score", 0.0)),
+                    reasoning=str(a.get("explanation") or a.get("reasoning") or ""),
+                    details={},
+                )
+                for a in (result.agent_results or [])
+                if isinstance(a, dict) and (a.get("agent_name") or a.get("agent"))
+            ]
+            trust = result.trust_layer or {}
+            claim_record = ClaimResult(
+                claim_id=result.claim_id or "",
+                decision=result.decision,
+                score=float(result.Ts),
+                agent_results=agent_results,
+                consensus_decision=result.decision,
+                Ts=float(result.Ts),
+                retry_count=result.retry_count,
+                mahic_breakdown=result.mahic_breakdown,
+                contradictions=result.contradictions,
+                tx_hash=str(trust.get("tx_hash") or result.tx_hash or ""),
+                ipfs_hash=str(trust.get("cid") or result.ipfs_hash or ""),
+            )
+            get_claim_store().put(claim_record)
+        except Exception as store_exc:
+            LOGGER.warning("claim_store_put_failed claim_id=%s error=%s", result.claim_id, store_exc)
+        return result
     except BlackboardValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except TrustLayerIPFSFailure as exc:
@@ -232,7 +260,7 @@ async def submit_human_feedback_v2(
     auth: AuthContext = Depends(verify_request_auth),
 ) -> dict:
     role = str(auth.role or "").upper()
-    if role not in {"INVESTIGATOR", "ADMIN"}:
+    if role != "ADMIN":
         raise HTTPException(status_code=403, detail="Unauthorized feedback submission")
     if payload.reviewer_id != str(auth.user_id or ""):
         raise HTTPException(status_code=403, detail="reviewer_id does not match authenticated user")
@@ -263,9 +291,6 @@ async def submit_human_decision_v2(
     payload: HumanDecisionPayload,
     auth: AuthContext = Depends(verify_request_auth),
 ) -> dict:
-    _require_investigator(auth)
-    if payload.reviewer_id != (auth.user_id or payload.reviewer_id):
-        raise HTTPException(status_code=403, detail="reviewer_id does not match authenticated user")
     orchestrator = get_v2_orchestrator()
     try:
         return orchestrator.apply_human_decision(

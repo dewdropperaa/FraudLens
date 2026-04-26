@@ -99,6 +99,8 @@ class BaseAgent(ABC):
         normalized_output["signals"] = list(signal_values)
         normalized_output["data_used"] = data_used
         normalized_output["final_decision"] = decision_payload
+        tools_used: List[str] = list(getattr(self, "_last_tools_used", []))
+        llm_fallback_used: bool = bool(getattr(self, "_last_llm_fallback_used", False))
         result = {
             "agent": agent_name,
             "status": str(status or "ERROR").upper(),
@@ -110,6 +112,11 @@ class BaseAgent(ABC):
             "data_used": data_used,
             "output": normalized_output,
             "flags": flags or [],
+            "tools_used": tools_used,
+            "tool_policy": {
+                "tool_first": True,
+                "llm_fallback_used": llm_fallback_used,
+            },
         }
         assert result["score"] is not None
         assert result["explanation"] != ""
@@ -216,6 +223,8 @@ class BaseAgent(ABC):
     def enforce_tool_trace(self, tool_results: Dict[str, Dict[str, Any]], llm_fallback_used: bool) -> None:
         if not tool_results:
             raise RuntimeError("TOOL_TRACE_MISSING")
+        self._last_tools_used: List[str] = list(tool_results.keys())
+        self._last_llm_fallback_used: bool = llm_fallback_used
         print(f"[LLM FALLBACK USED] {llm_fallback_used}")
         if llm_fallback_used:
             BaseAgent._observability["llm_fallback"] += 1

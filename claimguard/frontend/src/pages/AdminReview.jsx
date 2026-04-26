@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Icons } from '../components'
 
 const FILTERS = ['human_review', 'all', 'approved', 'rejected']
@@ -27,12 +27,18 @@ function ScoreBar({ score }) {
 }
 
 export default function AdminReview({ claims, claimsLoading, claimsError, fetchClaims, shortHex, safeText }) {
-  const [filter, setFilter]     = useState('human_review')
-  const [pdfUrl, setPdfUrl]     = useState(null)
-  const [selected, setSelected] = useState(null)
-  const [actioning, setActioning] = useState(false)
-  const [actionError, setActionError] = useState('')
+  const [filter, setFilter]         = useState('human_review')
+  const [selected, setSelected]     = useState(null)
+  const [actioning, setActioning]   = useState(false)
+  const [actionError, setActionError]   = useState('')
   const [actionSuccess, setActionSuccess] = useState('')
+  const [reviewContext, setReviewContext] = useState(null)
+  const [contextLoading, setContextLoading] = useState(false)
+  const [pdfViewed, setPdfViewed]   = useState(false)
+  const [notes, setNotes]           = useState('')
+
+  const token = localStorage.getItem('cg_token') || ''
+  const authHeader = token ? { Authorization: `Bearer ${token}` } : {}
 
   const visible = filter === 'approved'
     ? claims.filter(c => c.decision === 'APPROVED')
@@ -42,30 +48,55 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
     ? claims.filter(c => c.decision === 'HUMAN_REVIEW')
     : claims
 
+  // Load human-review-context (PDF URL) when a HUMAN_REVIEW claim is selected
+  useEffect(() => {
+    if (!selected || selected.decision !== 'HUMAN_REVIEW') {
+      setReviewContext(null)
+      setPdfViewed(false)
+      return
+    }
+    let cancelled = false
+    setContextLoading(true)
+    setReviewContext(null)
+    setPdfViewed(false)
+    fetch(`/api/v2/claim/${selected.claim_id}/human-review-context`, { headers: authHeader })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => { if (!cancelled) setReviewContext(data) })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setContextLoading(false) })
+    return () => { cancelled = true }
+  }, [selected?.claim_id])
+
   async function submitReview(claimId, decision) {
     setActioning(true); setActionError(''); setActionSuccess('')
     try {
-      const res = await fetch(`/api/claim/${claimId}/review`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(localStorage.getItem('cg_token') ? { Authorization: `Bearer ${localStorage.getItem('cg_token')}` } : {}),
-        },
-        body: JSON.stringify({ decision }),
+      const res = await fetch('/api/v2/claim/human-decision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader },
+        body: JSON.stringify({ claim_id: claimId, decision, reviewer_id: 'admin', notes }),
       })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err?.detail || `HTTP ${res.status}`)
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(body?.detail || `HTTP ${res.status}`)
+
+      if (decision === 'APPROVED') {
+        const tx  = body.tx_hash  ? `tx: ${body.tx_hash.slice(0, 16)}…`  : ''
+        const cid = body.ipfs_cid ? `IPFS: ${body.ipfs_cid.slice(0, 16)}…` : ''
+        setActionSuccess(`Claim approuvé et ancré. ${[tx, cid].filter(Boolean).join(' · ')}`)
+      } else {
+        setActionSuccess('Claim rejeté. Aucun ancrage blockchain/IPFS effectué.')
       }
-      setActionSuccess(`Claim ${decision === 'APPROVED' ? 'approved' : 'rejected'} successfully.`)
       await fetchClaims()
       setSelected(prev => prev ? { ...prev, decision } : null)
+      setPdfViewed(false)
     } catch (e) {
       setActionError(e.message || 'Action failed.')
     } finally {
       setActioning(false)
     }
   }
+
+  const isHumanReview = selected?.decision === 'HUMAN_REVIEW'
+  const canDecide = !isHumanReview || pdfViewed
 
   return (
     <div style={{ display: 'flex', gap: '16px', height: 'calc(100vh - 100px)', minHeight: 0 }}>
@@ -110,7 +141,7 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
               {visible.map(claim => (
                 <div
                   key={claim.claim_id}
-                  onClick={() => { setSelected(claim); setActionError(''); setActionSuccess(''); setPdfUrl(null) }}
+                  onClick={() => { setSelected(claim); setActionError(''); setActionSuccess(''); setNotes('') }}
                   style={{
                     padding: '12px 16px',
                     borderBottom: '1px solid var(--border)',
@@ -145,7 +176,7 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
           </div>
         ) : (
           <>
-            {/* Header */}
+            {/* Header with decision buttons */}
             <div className="cg-card" style={{ padding: '16px 20px' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '12px' }}>
                 <div>
@@ -156,66 +187,101 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
                   <StatusBadge decision={selected.decision} />
                   <button
                     onClick={() => submitReview(selected.claim_id, 'APPROVED')}
-                    disabled={actioning || selected.decision === 'APPROVED'}
+                    disabled={actioning || selected.decision === 'APPROVED' || !canDecide}
+                    title={!canDecide ? 'Veuillez consulter le document avant de décider' : ''}
                     className="cg-btn cg-btn-sm"
-                    style={{ background: 'var(--success)', color: '#fff', border: 'none', opacity: selected.decision === 'APPROVED' ? 0.5 : 1 }}
+                    style={{ background: 'var(--success)', color: '#fff', border: 'none', opacity: (selected.decision === 'APPROVED' || !canDecide) ? 0.45 : 1 }}
                   >
-                    <Icons.CheckCircle style={{ width: 14, height: 14 }} /> Approve
+                    <Icons.CheckCircle style={{ width: 14, height: 14 }} /> Approuver
                   </button>
                   <button
                     onClick={() => submitReview(selected.claim_id, 'REJECTED')}
-                    disabled={actioning || selected.decision === 'REJECTED'}
+                    disabled={actioning || selected.decision === 'REJECTED' || !canDecide}
+                    title={!canDecide ? 'Veuillez consulter le document avant de décider' : ''}
                     className="cg-btn cg-btn-sm"
-                    style={{ background: 'var(--danger)', color: '#fff', border: 'none', opacity: selected.decision === 'REJECTED' ? 0.5 : 1 }}
+                    style={{ background: 'var(--danger)', color: '#fff', border: 'none', opacity: (selected.decision === 'REJECTED' || !canDecide) ? 0.45 : 1 }}
                   >
-                    <Icons.XCircle style={{ width: 14, height: 14 }} /> Reject
+                    <Icons.XCircle style={{ width: 14, height: 14 }} /> Rejeter
                   </button>
                 </div>
               </div>
+
+              {/* Warn if doc not yet viewed */}
+              {isHumanReview && !pdfViewed && (
+                <div className="cg-alert" style={{ marginTop: '10px', background: '#fffbeb', border: '1px solid #fde68a', color: '#92400e', borderRadius: 8, padding: '8px 12px', fontSize: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <Icons.AlertTriangle style={{ width: 14, height: 14, flexShrink: 0 }} />
+                  Consultez et confirmez le document ci-dessous avant de pouvoir approuver ou rejeter.
+                </div>
+              )}
               {actionSuccess && <div className="cg-alert success" style={{ marginTop: '10px' }}><Icons.CheckCircle />{actionSuccess}</div>}
               {actionError   && <div className="cg-alert error"   style={{ marginTop: '10px' }}><Icons.AlertTriangle />{actionError}</div>}
             </div>
 
-            {/* Documents + PDF Viewer */}
-            {(selected.ipfs_hash || selected.ipfs_hashes?.length > 0 || selected.documents?.length > 0) && (
+            {/* PDF viewer for HUMAN_REVIEW claims */}
+            {isHumanReview && (
               <div className="cg-card">
                 <div className="cg-card-header">
-                  <div className="cg-card-title"><div className="cg-card-title-icon"><Icons.FileText /></div>Documents</div>
-                  {selected.ipfs_hashes?.length > 0 || selected.ipfs_hash ? (
-                    <button
-                      className="cg-btn cg-btn-ghost cg-btn-sm"
-                      onClick={() => setPdfUrl(v => v ? null : `https://gateway.pinata.cloud/ipfs/${(selected.ipfs_hashes?.[0] || selected.ipfs_hash)}`)}
-                    >
-                      {pdfUrl ? 'Masquer' : 'Voir PDF'}
-                    </button>
-                  ) : null}
-                </div>
-                <div style={{ padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                  {(selected.ipfs_hashes?.length > 0 ? selected.ipfs_hashes : selected.ipfs_hash ? [selected.ipfs_hash] : []).map((hash, i) => (
-                    <a
-                      key={i}
-                      href={`https://gateway.pinata.cloud/ipfs/${hash}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 12px', background: 'var(--bg-elevated)', borderRadius: '6px', textDecoration: 'none', color: 'var(--accent)', fontSize: '12px', fontFamily: 'monospace' }}
-                    >
-                      <Icons.ExternalLink style={{ width: 13, height: 13, flexShrink: 0 }} />
-                      IPFS: {hash.slice(0, 12)}...{hash.slice(-8)}
-                    </a>
-                  ))}
-                  {selected.documents?.map((doc, i) => (
-                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 12px', background: 'var(--bg-elevated)', borderRadius: '6px', fontSize: '12px', color: 'var(--text-secondary)' }}>
-                      <Icons.File style={{ width: 13, height: 13, flexShrink: 0 }} />
-                      {doc}
-                    </div>
-                  ))}
-                  {pdfUrl && (
-                    <iframe
-                      src={pdfUrl}
-                      title="Document"
-                      style={{ width: '100%', height: '500px', border: '1px solid var(--border)', borderRadius: '6px', marginTop: '8px' }}
-                    />
+                  <div className="cg-card-title"><div className="cg-card-title-icon"><Icons.FileText /></div>Document justificatif</div>
+                  {pdfViewed && (
+                    <span style={{ fontSize: '11px', color: 'var(--success)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <Icons.CheckCircle style={{ width: 13, height: 13 }} /> Consulté
+                    </span>
                   )}
+                </div>
+                <div style={{ padding: '12px 16px' }}>
+                  {contextLoading && (
+                    <div style={{ color: 'var(--text-muted)', fontSize: 13 }}>Chargement du document…</div>
+                  )}
+                  {!contextLoading && !reviewContext?.document_url && (
+                    <div style={{ color: 'var(--text-muted)', fontSize: 13 }}>
+                      Aucun document temporaire disponible pour ce dossier.
+                      <button className="cg-btn cg-btn-ghost cg-btn-sm" style={{ marginLeft: 12 }} onClick={() => setPdfViewed(true)}>
+                        Continuer sans document
+                      </button>
+                    </div>
+                  )}
+                  {!contextLoading && reviewContext?.document_url && (
+                    <>
+                      <iframe
+                        src={reviewContext.document_url}
+                        title="Document justificatif"
+                        style={{ width: '100%', height: '520px', border: '1px solid var(--border)', borderRadius: '6px' }}
+                        onLoad={() => {}}
+                      />
+                      {!pdfViewed && (
+                        <button
+                          className="cg-btn cg-btn-primary"
+                          style={{ marginTop: 12, width: '100%' }}
+                          onClick={() => setPdfViewed(true)}
+                        >
+                          <Icons.CheckCircle style={{ width: 15, height: 15 }} /> J'ai consulté et vérifié ce document
+                        </button>
+                      )}
+                      {pdfViewed && (
+                        <div style={{ marginTop: 10, fontSize: 12, color: 'var(--success)', fontWeight: 600 }}>
+                          ✓ Document vérifié — vous pouvez maintenant approuver ou rejeter le dossier.
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Reviewer notes */}
+            {isHumanReview && (
+              <div className="cg-card">
+                <div className="cg-card-header">
+                  <div className="cg-card-title"><div className="cg-card-title-icon"><Icons.FileText /></div>Notes du réviseur</div>
+                </div>
+                <div style={{ padding: '12px 16px' }}>
+                  <textarea
+                    className="w-full rounded border border-[var(--border)] p-2"
+                    style={{ width: '100%', minHeight: 80, padding: '8px', borderRadius: 6, border: '1px solid var(--border)', fontSize: 13, resize: 'vertical' }}
+                    placeholder="Notes optionnelles (motif de rejet, observations…)"
+                    value={notes}
+                    onChange={e => setNotes(e.target.value)}
+                  />
                 </div>
               </div>
             )}
@@ -259,11 +325,9 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
                     <div key={i} style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
                         <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-primary)' }}>{ag.agent_name}</span>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                          <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)' }}>
-                            {typeof ag.score === 'number' ? ag.score.toFixed(1) : ag.score}
-                          </span>
-                        </div>
+                        <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)' }}>
+                          {typeof ag.score === 'number' ? ag.score.toFixed(1) : ag.score}
+                        </span>
                       </div>
                       <p style={{ margin: 0, fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>{ag.reasoning}</p>
                     </div>

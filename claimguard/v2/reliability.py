@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import os
 from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Lock
@@ -100,7 +103,20 @@ class ReliabilityStore:
             self._trace_cache[claim_id] = payload
         client = self._try_firestore_client()
         if client is not None:
-            client.collection(self._trace_collection).document(claim_id).set(payload, merge=True)
+            timeout_s = float(os.getenv("FIRESTORE_WRITE_TIMEOUT_S", "8"))
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(
+                client.collection(self._trace_collection).document(claim_id).set,
+                payload,
+                True,  # merge=True
+            )
+            try:
+                future.result(timeout=timeout_s)
+            except FuturesTimeoutError:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise RuntimeError(f"Firestore trace write timed out after {timeout_s}s")
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
         return trace_hash
 
     def get_trace(self, claim_id: str) -> Optional[Dict[str, Any]]:

@@ -60,6 +60,9 @@ export default function InvestigationClaimPage({ claimId, user, token, onBackToD
             setIs403(true)
             throw new Error('Accès refusé — vérifiez vos permissions')
           }
+          if (res.status === 404) {
+            throw new Error(`Contexte de révision non disponible pour ce dossier (${claimId}). Le dossier a peut-être été traité automatiquement.`)
+          }
           throw new Error(`Failed to load context (${res.status})`)
         }
         setIs403(false)

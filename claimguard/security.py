@@ -20,7 +20,7 @@ try:
 except ImportError:  # pragma: no cover
     jwt = None
 
-_DEV_JWT_SECRET = "claimguard-dev-jwt-secret-2024"
+_DEV_JWT_SECRET = "claimguard-dev-jwt-secret-2024!x"
 _PBKDF2_ITERATIONS = 260_000
 
 

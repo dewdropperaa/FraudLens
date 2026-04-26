@@ -6,8 +6,6 @@ import Dashboard   from './pages/Dashboard'
 import SubmitClaim  from './pages/SubmitClaim'
 import Database    from './pages/Database'
 import AdminReview from './pages/AdminReview'
-import InvestigatorDashboard from './pages/InvestigatorDashboard'
-import InvestigatorAnalytics from './pages/InvestigatorAnalytics'
 import InvestigationClaimPage from './pages/InvestigationClaimPage'
 import ProofModePage from './pages/ProofModePage'
 import Login      from './pages/Login'
@@ -130,9 +128,7 @@ export default function App() {
   const investigationMatch = initialPath.match(/^\/investigation\/([^/]+)$/)
   const proofMatch = initialPath.match(/^\/proof\/([^/]+)$/)
   const [activePage, setActivePage] = useState(
-    initialPath === '/investigator-analytics'
-      ? 'investigator-analytics'
-      : proofMatch
+    proofMatch
         ? 'proof-mode'
       : investigationMatch
         ? 'investigation-claim'
@@ -229,19 +225,9 @@ export default function App() {
       console.log('FINAL DECISION FROM BACKEND:', body?.decision)
       setLastResult(body?.data != null ? body.data : body)
       const normalizedResult = body?.data != null ? body.data : body
-      // PROD-FIX: route directly to investigator when backend requests it.
-      if (normalizedResult?.routed_to === 'INVESTIGATOR' && normalizedResult?.claim_id && canInvestigate) {
-        setInvestigationClaimId(normalizedResult.claim_id)
-        setActivePage('investigation-claim')
-        if (typeof window !== 'undefined') {
-          window.history.replaceState({ result: normalizedResult, source: 'auto_route' }, '', `/investigation/${normalizedResult.claim_id}`)
-        }
-      } else if (normalizedResult?.decision === 'HUMAN_REVIEW' && normalizedResult?.claim_id && canInvestigate) {
-        setInvestigationClaimId(normalizedResult.claim_id)
-        setActivePage('investigation-claim')
-        if (typeof window !== 'undefined') {
-          window.history.replaceState({}, '', `/investigation/${normalizedResult.claim_id}`)
-        }
+      // Route to Admin View only for HUMAN_REVIEW — REJECTED stays on submit page
+      if (normalizedResult?.claim_id && normalizedResult?.decision === 'HUMAN_REVIEW') {
+        setPageAndPath('admin')
       }
       await fetchClaims(filter); setChartTick(t => t + 1)
     } catch (err) { setSubmitError(formatApiError(err) || 'Claim submission failed.')
@@ -259,8 +245,8 @@ export default function App() {
 
   /* ── Render page ────────────────────────────────────────────── */
   const isAdminDemoUser = (user?.email || '').toLowerCase() === 'admin@gmail.com'
-  const canInvestigate = user?.role === 'investigator' || user?.role === 'admin' || isAdminDemoUser
-  const canSeeAnalytics = user?.role === 'admin'
+  const canInvestigate = user?.role === 'admin' || isAdminDemoUser
+  const canSeeAnalytics = user?.role === 'admin' || isAdminDemoUser
 
   function setPageAndPath(nextPage) {
     setActivePage(nextPage)
@@ -270,9 +256,7 @@ export default function App() {
     if (nextPage !== 'proof-mode') {
       setProofClaimId(null)
     }
-    const path = nextPage === 'investigator-analytics'
-      ? '/investigator-analytics'
-      : nextPage === 'proof-mode' && proofClaimId
+    const path = nextPage === 'proof-mode' && proofClaimId
         ? `/proof/${proofClaimId}`
         : '/'
     if (typeof window !== 'undefined' && window.location.pathname !== path) {
@@ -282,28 +266,6 @@ export default function App() {
 
   function renderPage() {
     switch (activePage) {
-      case 'investigator':
-        return canInvestigate
-          ? <InvestigatorDashboard claims={claims} claimsLoading={claimsLoading} fetchClaims={fetchClaims} user={user} />
-          : (
-            <div className="cg-card">
-              <div className="cg-card-title">Restricted Access</div>
-              <div className="cg-page-sub" style={{ marginTop: 8 }}>
-                Investigator dashboard is available only for investigator/admin roles.
-              </div>
-            </div>
-          )
-      case 'investigator-analytics':
-        return canSeeAnalytics
-          ? <InvestigatorAnalytics user={user} />
-          : (
-            <div className="cg-card">
-              <div className="cg-card-title">Restricted Access</div>
-              <div className="cg-page-sub" style={{ marginTop: 8 }}>
-                Investigator analytics are available only for admin role.
-              </div>
-            </div>
-          )
       case 'investigation-claim':
         return canInvestigate && investigationClaimId
           ? (
@@ -311,14 +273,14 @@ export default function App() {
               claimId={investigationClaimId}
               user={user}
               token={token}
-              onBackToDashboard={() => setPageAndPath('investigator')}
+              onBackToDashboard={() => setPageAndPath('admin')}
             />
           )
           : (
             <div className="cg-card">
               <div className="cg-card-title">No investigation selected</div>
               <div className="cg-page-sub" style={{ marginTop: 8 }}>
-                Submit a claim or pick one from investigator dashboard.
+                Submit a claim or pick one from the admin dashboard.
               </div>
             </div>
           )
@@ -328,7 +290,7 @@ export default function App() {
             <ProofModePage
               claimId={proofClaimId}
               token={token}
-              onBack={() => setPageAndPath('investigator')}
+              onBack={() => setPageAndPath('admin')}
             />
           )
           : (
@@ -364,7 +326,6 @@ export default function App() {
         <div className="cg-nav-links">
           {[
             { id: 'dashboard', label: 'Home',      Icon: Icons.Home     },
-            { id: 'investigator', label: 'Investigation', Icon: Icons.AlertTriangle },
             { id: 'submit',    label: 'New Claim',  Icon: Icons.FileText },
             { id: 'database',  label: 'All Claims', Icon: Icons.Database },
           ].map(({ id, label, Icon }) => (
@@ -372,11 +333,6 @@ export default function App() {
               <Icon />{label}
             </button>
           ))}
-          {canSeeAnalytics && (
-            <button className={`cg-nav-link${activePage === 'investigator-analytics' ? ' active' : ''}`} onClick={() => setPageAndPath('investigator-analytics')}>
-              <Icons.BarChart2 />Analytics
-            </button>
-          )}
         </div>
 
         <div className="cg-nav-actions">
@@ -408,11 +364,7 @@ export default function App() {
       <aside className="cg-sidebar">
         <div className="cg-sidebar-label">Overview</div>
         <SidebarItem icon={Icons.Home}       label="Dashboard"  active={activePage === 'dashboard'} onClick={() => setPageAndPath('dashboard')} />
-        <SidebarItem icon={Icons.AlertTriangle} label="Investigator" active={activePage === 'investigator'} onClick={() => setPageAndPath('investigator')} />
         <SidebarItem icon={Icons.PlusCircle} label="New Claim"  active={activePage === 'submit'}    onClick={() => setPageAndPath('submit')} />
-        {canSeeAnalytics && (
-          <SidebarItem icon={Icons.BarChart2} label="Analytics" active={activePage === 'investigator-analytics'} onClick={() => setPageAndPath('investigator-analytics')} />
-        )}
 
         <div className="cg-sidebar-label">Management</div>
         <SidebarItem icon={Icons.Database} label="Admin View" active={activePage === 'admin'} onClick={() => setPageAndPath('admin')} />

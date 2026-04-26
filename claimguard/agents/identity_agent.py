@@ -17,6 +17,7 @@ from queue import Empty, Queue
 from typing import Any, Dict, List, Optional, Tuple
 
 from claimguard.agents.base_agent import BaseAgent
+from claimguard.agents.llm_consistency import run_agent_consistency_check
 from claimguard.agents.memory_utils import process_memory_context
 from claimguard.agents.security_utils import (
     coerce_risk_output,
@@ -495,7 +496,7 @@ class IdentityAgent(BaseAgent):
             score -= 40
             flags.append("CIN_NOT_FOUND")
             reasons.append("CIN introuvable dans le texte OCR")
-        if not ipp_found_in_ocr:
+        if ipp_raw and not ipp_found_in_ocr:
             score -= 20
             flags.append("IPP_NOT_FOUND")
             reasons.append("IPP introuvable dans le texte OCR")

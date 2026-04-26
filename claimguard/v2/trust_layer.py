@@ -433,11 +433,21 @@ class FirestoreTrustClient:
 
     def store_record(self, payload: FirebaseTrustRecord) -> str:
         from firebase_admin import firestore
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
         app = self._ensure_app()
         client = firestore.client(app=app)
         ref = client.collection(self._collection).document()
-        ref.set(payload.model_dump())
+        timeout_s = float(os.getenv("FIRESTORE_WRITE_TIMEOUT_S", "8"))
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(ref.set, payload.model_dump())
+        try:
+            future.result(timeout=timeout_s)
+        except FuturesTimeoutError:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise RuntimeError(f"Firestore write timed out after {timeout_s}s (no internet?)")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         return str(ref.id)
 
 

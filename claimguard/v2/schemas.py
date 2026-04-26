@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 ComplexityLabel = Literal["simple", "complex", "high_risk"]
@@ -172,6 +172,15 @@ class ClaimGuardV2Response(BaseModel):
         default_factory=lambda: ["PRE_VALIDATION", "FIELD_VERIFICATION", "AGENTS", "CONSENSUS"]
     )
     explanation: DecisionExplanationModel = Field(default_factory=DecisionExplanationModel)
+
+    @field_validator("explanation", mode="before")
+    @classmethod
+    def _coerce_explanation(cls, v: Any) -> Any:
+        if v is None:
+            return DecisionExplanationModel()
+        if isinstance(v, dict):
+            return DecisionExplanationModel(**{k: val for k, val in v.items() if k in DecisionExplanationModel.model_fields})
+        return v
     coverage_score: Dict[str, Any] = Field(default_factory=dict)
     agent_results: List[Dict[str, Any]] = Field(default_factory=list)
     confidence: str = "LOW"

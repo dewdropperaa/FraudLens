@@ -34,6 +34,8 @@ MEMORY_DEFAULT_K: int = int(os.getenv("MEMORY_DEFAULT_K", "5"))
 _OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 _OLLAMA_EMBED_MODEL: str = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 MEMORY_STORE_PATH: str = os.getenv("MEMORY_STORE_PATH", "claimguard_memory_store")
+# Set MEMORY_ENABLED=false in .env to keep memory disabled regardless of installed tools.
+MEMORY_FORCE_DISABLED: bool = os.getenv("MEMORY_ENABLED", "true").strip().lower() in ("false", "0", "no")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -213,6 +215,10 @@ class CaseMemoryLayer:
     # ── Embedder setup ─────────────────────────────────────────────────────
 
     def _init_embedder(self) -> Any:
+        if MEMORY_FORCE_DISABLED:
+            self._using_fake_embeddings = True
+            LOGGER.info("[MEMORY] Disabled via MEMORY_ENABLED=false in env")
+            return None
         try:
             # Prefer langchain-ollama (newer, avoids deprecation warning)
             try:
