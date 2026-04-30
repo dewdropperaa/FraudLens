@@ -64,7 +64,6 @@ from claimguard.v2.schemas import (
     ValidationResult,
 )
 from claimguard.v2.trust_layer import (
-    TrustLayerIPFSFailure,
     TrustLayerService,
 )
 from claimguard.v2.trace_engine import TraceEngine
@@ -84,11 +83,8 @@ EXIT_REASONS: tuple[str, ...] = (
     "critical_fields_unverified",
     "low_confidence",
     "approved",
-    "trust_layer_degraded",
 )
-_EXIT_REASON_ALIASES: Dict[str, str] = {
-    "TRUST_LAYER_DEGRADED": "trust_layer_degraded",
-}
+_EXIT_REASON_ALIASES: Dict[str, str] = {}
 MIN_OCR_TEXT_LENGTH = 40
 GENERIC_EXPLANATION_MARKERS = (
     "no suspicious patterns detected",
@@ -324,12 +320,27 @@ def _log_pipeline_terminated(stage: str, reason: str) -> None:
 
 
 def _confidence_from_score(score: float) -> str:
-    # PROD-FIX: confidence mapping contract.
     if score >= 75.0:
         return "HIGH"
     if score >= 55.0:
         return "MEDIUM"
     return "LOW"
+
+
+def _human_readable_risk_summary(decision: str, score: float) -> str:
+    if decision == "APPROVED":
+        return "No significant fraud indicators were detected."
+    if decision == "HUMAN_REVIEW":
+        return "Some elements could not be fully verified and require human review."
+    return "The claim presents inconsistencies that prevent automatic approval."
+
+
+def _human_readable_confidence_reason(score: float, decision: str) -> str:
+    if score >= 75.0:
+        return "High confidence: all critical checks passed with strong evidence."
+    if score >= 55.0:
+        return "Medium confidence: most checks passed but some elements need verification."
+    return "Low confidence: multiple checks failed or returned insufficient data."
 
 
 def _classify_flags(system_flags: List[str]) -> Dict[str, List[str]]:
@@ -829,9 +840,23 @@ class ClaimGuardV2Orchestrator:
             memory_insights = output["details"].get("memory_insights")
         # IdentityAgent uses legitimacy scale (100=clean, 0=suspicious).
         # Pipeline and consensus also use legitimacy scale (high=clean=APPROVED).
-        # Keep score as-is; normalize confidence from the same validity value.
+        # Apply minimal quality penalties so weak OCR/invalid IDs reduce certainty.
         raw_validity = float(output.get("score", result.get("score", 0.0)))
-        confidence = round(min(1.0, max(0.3, raw_validity / 100.0)), 4)
+        evidence_cin = bool(evidence.get("cin_found"))
+        evidence_ipp = bool(evidence.get("ipp_found"))
+        identity_payload = claim_request.get("identity", {}) if isinstance(claim_request.get("identity"), dict) else {}
+        cin_candidate = str(
+            identity_payload.get("cin")
+            or identity_payload.get("CIN")
+            or claim_request.get("patient_id")
+            or ""
+        ).strip().upper()
+        cin_format_ok = bool(re.match(r"^[A-Z]{1,2}\d{5,6}$", cin_candidate))
+        if cin_candidate and not cin_format_ok:
+            raw_validity = max(0.0, raw_validity - 20.0)
+        if cin_candidate and not (evidence_cin or evidence_ipp):
+            raw_validity = max(0.0, raw_validity - 25.0)
+        confidence = round(min(1.0, max(0.2, raw_validity / 100.0)), 4)
         return {
             "score": raw_validity,
             "confidence": confidence,
@@ -1248,20 +1273,28 @@ class ClaimGuardV2Orchestrator:
                     }
                 )
             except Exception as exc:
-                # Never fail the manual finalization endpoint due to trust side-effects.
                 LOGGER.error(
-                    "human_review_trust_layer_degraded claim_id=%s reviewer=%s error=%s",
+                    "human_review_blockchain_anchoring_failed claim_id=%s reviewer=%s error=%s",
                     claim_id,
                     reviewer_id,
                     str(exc),
                 )
+                return {
+                    "status": "BLOCKCHAIN_ANCHORING_FAILED",
+                    "tx_hash": None,
+                    "ipfs_cid": None,
+                    "firebase_id": None,
+                    "trust_layer_status": "failed",
+                    "decision": "HUMAN_REVIEW",
+                    "reason": "Blockchain anchoring failed",
+                }
             self._pending_human_reviews.delete(claim_id)
             return {
                 "status": "FINALIZED",
                 "tx_hash": (trust_layer_payload or {}).get("tx_hash"),
                 "ipfs_cid": (trust_layer_payload or {}).get("cid"),
                 "firebase_id": (trust_layer_payload or {}).get("firebase_id"),
-                "trust_layer_status": "stored" if trust_layer_payload else "degraded",
+                "trust_layer_status": "stored",
                 "decision": "APPROVED",
             }
 
@@ -2270,6 +2303,38 @@ class ClaimGuardV2Orchestrator:
                 "unverified_fields": list((blackboard_snapshot.get("field_verification_summary", {}) or {}).get("unverified_fields", [])),
             }
             payload["memory_status"] = str(blackboard_snapshot.get("memory_status", "DISABLED") or "DISABLED").upper()
+            decision_reason_text = str(
+                (payload.get("decision_trace", {}) or {}).get("decision_reason")
+                or payload.get("reason")
+                or payload.get("exit_reason")
+                or ""
+            )
+            payload["decision_breakdown"] = {
+                "decision": decision_value,
+                "Ts": round(score_value, 2),
+                "reason": decision_reason_text,
+                "blocked_by": sorted(
+                    set(
+                        [
+                            flag
+                            for flag in flags_value
+                            if flag
+                            in {
+                                "CRITICAL_FIELD_MISSING",
+                                "IDENTITY_HARD_FAIL",
+                                "AGENT_CONFLICT",
+                                "SEVERE_CONTRADICTION_DETECTED",
+                                "INJECTION_DETECTED",
+                                "PROMPT_INJECTION_DETECTED",
+                                "PROMPT_INJECTION",
+                                "AMOUNT_MISMATCH_CRITICAL",
+                                "HALLUCINATION_FORCE_HUMAN_REVIEW",
+                            }
+                        ]
+                    )
+                ),
+                "signals": flags_value,
+            }
             payload["audit_trail"] = list((payload.get("decision_trace", {}) or {}).get("audit_trail", []))
             payload["processing_time_ms"] = int((time.time() - start_time) * 1000)
             payload["routed_to"] = "INVESTIGATOR" if decision_value == "HUMAN_REVIEW" else "DASHBOARD"
@@ -2307,20 +2372,41 @@ class ClaimGuardV2Orchestrator:
                     }
                 )
                 trust_payload = payload.get("trust_layer") if isinstance(payload.get("trust_layer"), dict) else {}
-                tx_hash_value = str(trust_payload.get("tx_hash") or payload.get("blockchain_tx") or payload.get("tx_hash") or local_doc_hash)
+                tx_hash_value = str(
+                    trust_payload.get("tx_hash")
+                    or payload.get("blockchain_tx")
+                    or payload.get("tx_hash")
+                    or ""
+                ).strip()
                 cid_value = str(trust_payload.get("cid") or "").strip()
-                ipfs_document_value = (
-                    cid_value if cid_value.startswith("ipfs://") else f"ipfs://{cid_value}"
-                ) if cid_value else str(payload.get("ipfs_document") or f"ipfs://claimguard/{claim_id}/{local_doc_hash[2:18]}")
+                bare_cid = cid_value.replace("ipfs://", "").strip()
+                ipfs_document_value = bare_cid if bare_cid else str(payload.get("ipfs_document") or "")
+                ipfs_url_value = ""
+                if bare_cid:
+                    ipfs_url_value = f"https://gateway.pinata.cloud/ipfs/{bare_cid}" if bare_cid else ""
                 payload["blockchain_tx"] = tx_hash_value
                 payload["ipfs_document"] = ipfs_document_value
+                payload["ipfs_url"] = ipfs_url_value
                 payload["tx_hash"] = tx_hash_value
-                payload["ipfs_hash"] = ipfs_document_value
+                payload["ipfs_hash"] = bare_cid
             else:
                 payload["blockchain_tx"] = ""
                 payload["ipfs_document"] = ""
+                payload["ipfs_url"] = ""
                 payload["tx_hash"] = ""
                 payload["ipfs_hash"] = ""
+            identity_status = "verified" if payload.get("field_verification", {}).get("cin_found") else "unverified"
+            doc_status = "valid" if decision_value == "APPROVED" else ("incomplete" if decision_value == "HUMAN_REVIEW" else "invalid")
+            policy_status = "compliant" if decision_value == "APPROVED" else "non_compliant"
+            unverified = payload.get("field_verification", {}).get("unverified_fields", [])
+            payload["decision_details"] = {
+                "identity_status": identity_status,
+                "document_status": doc_status,
+                "policy_status": policy_status,
+                "risk_summary": _human_readable_risk_summary(decision_value, score_value),
+                "missing_fields": list(unverified),
+                "confidence_reason": _human_readable_confidence_reason(score_value, decision_value),
+            }
             if DEBUG_EXPLANATION_MODE:
                 print("[DEBUG_EXPLANATION_MODE] Full decision explanation:")
                 print(json.dumps(envelope["explanation"], ensure_ascii=False, indent=2, default=str))
@@ -2687,10 +2773,10 @@ class ClaimGuardV2Orchestrator:
             terminal_result = {
                 "decision": "REJECTED",
                 "reason": (
-                    f"Document hors contexte — classifié {_rej_label} (confiance "
-                    f"{doc_classification.get('confidence', 0)}%) avec couverture "
+                    f"Out-of-context document — classified as {_rej_label} (confidence "
+                    f"{doc_classification.get('confidence', 0)}%) with coverage "
                     f"{coverage_score_obj.overall:.2f} < {MIN_COVERAGE_ACCEPT:.2f}. "
-                    f"Le document soumis n'est pas un dossier médical."
+                    f"The submitted document is not a medical claim record."
                 ),
                 "flags": flags,
                 "terminated": True,
@@ -3585,6 +3671,12 @@ class ClaimGuardV2Orchestrator:
             explanation = str(parsed.get("explanation") or "").strip()
             if not explanation:
                 explanation = str(raw_response).strip()[:400] if isinstance(raw_response, str) and raw_response.strip() else "Agent completed analysis."
+            if parsed.get("score", None) is None:
+                parsed["score"] = 0.0
+                parsed["hallucination_flags"] = list(parsed.get("hallucination_flags", [])) + ["agent_output_missing_score"]
+                explanation = f"{explanation} [contract_enforced:missing_score]"
+            if not explanation.strip():
+                explanation = "Contract-enforced fallback explanation for missing agent rationale."
             claims = _coerce_claims(parsed, explanation)
             hallucination_flags = parsed.get("hallucination_flags", [])
             if not isinstance(hallucination_flags, list):
@@ -4123,7 +4215,27 @@ class ClaimGuardV2Orchestrator:
             payload["insufficient_data"] = bool(ao.output_snapshot.get("insufficient_data", False))
             payload["hallucination_flags"] = list(ao.hallucination_flags)
             consensus_entries[ao.agent] = payload
-        assert len([name for name in consensus_entries.keys() if name != "_meta"]) >= 5, "Expected at least 5 agent results for consensus"
+        valid_consensus_entries: Dict[str, Dict[str, Any]] = {}
+        for agent_name, payload in consensus_entries.items():
+            if agent_name == "_meta":
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if not str(payload.get("status", "")).strip():
+                continue
+            if payload.get("score", None) is None:
+                continue
+            if not str(payload.get("explanation", "")).strip():
+                continue
+            valid_consensus_entries[agent_name] = payload
+        LOGGER.info(
+            "consensus_inputs received=%d valid=%d invalid=%d agents=%s",
+            len([name for name in consensus_entries.keys() if name != "_meta"]),
+            len(valid_consensus_entries),
+            len([name for name in consensus_entries.keys() if name != "_meta"]) - len(valid_consensus_entries),
+            sorted(valid_consensus_entries.keys()),
+        )
+        consensus_entries = valid_consensus_entries
         consensus_entries["_meta"] = {
             "missing_fields": extraction_validation.get("missing_fields", []),
             "field_verification": blackboard.field_verification,
@@ -4177,6 +4289,7 @@ class ClaimGuardV2Orchestrator:
             force_reason = "Layer2 disabled only; no layer1 trigger."
         # CALIBRATION-FIX: hallucination is only true when output contradicts OCR-grounded evidence.
         hallucination_agents = []
+        hallucination_confidence_floor = float(getattr(self._consensus_config, "hallucination_confidence_floor", 0.7))
         for ao in agent_outputs:
             raw_flags = [str(flag).strip().lower() for flag in (ao.hallucination_flags or [])]
             grounded_flags = [
@@ -4191,7 +4304,8 @@ class ClaimGuardV2Orchestrator:
                     )
                 )
             ]
-            if grounded_flags:
+            confidence_value = float(getattr(ao, "confidence", 0.0) or 0.0)
+            if grounded_flags and confidence_value < hallucination_confidence_floor:
                 hallucination_agents.append(ao.agent)
         contradiction_penalty_total = round(
             sum(float(item.get("H_penalty", 0.0)) for item in consensus_result["contradictions"] if isinstance(item, dict)),
@@ -4234,7 +4348,8 @@ class ClaimGuardV2Orchestrator:
             system_flags.append("HALLUCINATION_FLAGS_PRESENT")
         if has_two_insufficient:
             system_flags.append("MULTI_AGENT_INSUFFICIENT_DATA")
-        if int(verification_summary.get("unverified_critical_fields", 0)) > 0:
+        missing_critical_fields = int(len(verification_summary.get("critical_stop_reasons", []) or []))
+        if missing_critical_fields > 0:
             system_flags.append("UNVERIFIED_FIELDS_PRESENT")
         if severe_contradiction or has_two_insufficient:
             consensus_result["decision"] = "HUMAN_REVIEW"
@@ -4243,7 +4358,9 @@ class ClaimGuardV2Orchestrator:
         blackboard_state["flags"]["memory_degraded"] = memory_degraded
         if memory_degraded:
             system_flags.append("memory_degraded")
-            # CALIBRATION-FIX: do not force human review only due to memory degradation.
+            # Memory degradation is informational with a bounded score penalty.
+            consensus_result["Ts"] = round(max(0.0, float(consensus_result.get("Ts", 0.0)) - 5.0), 2)
+            system_flags.append("MEMORY_DEGRADED")
 
         # Global enforcement rule — only block on clear fraud/injection signals.
         # Removed: critical_conf_ok (Ollama gives ~0.6 confidence on valid claims)
@@ -4258,6 +4375,19 @@ class ClaimGuardV2Orchestrator:
         ):
             consensus_result["decision"] = "HUMAN_REVIEW"
             system_flags.append("GLOBAL_ENFORCEMENT_GUARD")
+        critical_review_flags = {
+            "INJECTION_DETECTED",
+            "PROMPT_INJECTION_DETECTED",
+            "PROMPT_INJECTION",
+            "CRITICAL_FIELD_MISSING",
+            "IDENTITY_HARD_FAIL",
+            "AGENT_CONFLICT",
+            "SEVERE_CONTRADICTION_DETECTED",
+            "HALLUCINATION_FORCE_HUMAN_REVIEW",
+        }
+        if consensus_result["decision"] == "APPROVED" and any(flag in critical_review_flags for flag in set(system_flags)):
+            consensus_result["decision"] = "HUMAN_REVIEW"
+            system_flags.append("CRITICAL_SIGNAL_FORCE_REVIEW")
         feedback_outcome = str(feedback_signal.get("outcome", "")).upper()
         if feedback_outcome in {"REJECTED", "FRAUD", "SUSPICIOUS"}:
             consensus_result["Ts"] = round(max(0.0, consensus_result["Ts"] - 10.0), 2)
@@ -4544,7 +4674,46 @@ class ClaimGuardV2Orchestrator:
             LOGGER.exception("replay_package_register_failed claim_id=%s error=%s", claim_id, exc)
             system_flags.append("REPLAY_PACKAGE_REGISTER_FAILED")
 
-        final_outcome = _exit_from_ts(float(consensus_result.get("Ts", 0.0)))
+        ts_value = float(consensus_result.get("Ts", 0.0))
+        auto_approve_ts_threshold = 65.0
+        identity_verified = bool(identity_verification.get("cin_found", False) or identity_verification.get("ipp_found", False))
+        critical_fraud_signals = bool(
+            set(system_flags).intersection(
+                {
+                    "INJECTION_DETECTED",
+                    "PROMPT_INJECTION_DETECTED",
+                    "PROMPT_INJECTION",
+                    "IDENTITY_HARD_FAIL",
+                    "AMOUNT_MISMATCH_CRITICAL",
+                    "FRAUD_CONFIRMED",
+                }
+            )
+        )
+        # Only strict/severe contradictions should block auto-approval.
+        # Minor/non-strict inconsistencies are allowed when Ts is high enough.
+        has_conflicting_data = bool(severe_contradiction)
+        if critical_fraud_signals:
+            consensus_decision = "REJECTED"
+            final_exit_reason = "identity_not_verified"
+        elif ts_value >= auto_approve_ts_threshold and identity_verified and missing_critical_fields == 0 and not has_conflicting_data:
+            consensus_decision = "APPROVED"
+            final_exit_reason = "approved"
+        elif 50.0 <= ts_value < auto_approve_ts_threshold or missing_critical_fields > 0 or has_conflicting_data or not identity_verified:
+            consensus_decision = "HUMAN_REVIEW"
+            final_exit_reason = "low_confidence"
+        else:
+            ts_outcome = _exit_from_ts(ts_value)
+            consensus_decision = str(consensus_result.get("decision", ts_outcome.get("decision", "HUMAN_REVIEW"))).upper()
+            final_exit_reason = (
+                "low_confidence"
+                if consensus_decision == "HUMAN_REVIEW"
+                else str(ts_outcome.get("exit_reason", "low_confidence"))
+            )
+        final_outcome = {
+            "decision": consensus_decision,
+            "exit_reason": final_exit_reason,
+            "Ts": ts_value,
+        }
         # Graceful degradation: valid covered claims should not hard reject solely due low Ts.
         clean_critical_fields = (
             bool(identity_verification.get("cin_found", False))
@@ -4626,7 +4795,6 @@ class ClaimGuardV2Orchestrator:
         # ── Step 5: Trust layer ────────────────────────────────────────────
         trust_layer_payload = None
         trust_layer_error = ""
-        decision_modifier = 0.0
         if FINAL_DECISION == "APPROVED":
             try:
                 trust_layer_payload = self._trust_layer.process_approved_claim(
@@ -4640,44 +4808,30 @@ class ClaimGuardV2Orchestrator:
                         "flags": system_flags,
                     }
                 )
-                # IPFS or chain may degrade independently; do not abort the decision path.
                 cid_value = str((trust_layer_payload or {}).get("cid") or "").strip()
                 tx_value = str((trust_layer_payload or {}).get("tx_hash") or "").strip()
                 if not cid_value or not tx_value:
-                    LOGGER.warning(
-                        "trust_layer_anchoring_incomplete claim_id=%s has_cid=%s has_tx=%s",
-                        claim_id,
-                        bool(cid_value),
-                        bool(tx_value),
-                    )
-            except TrustLayerIPFSFailure as exc:
-                trust_layer_error = str(exc)
-                LOGGER.error("trust_layer_ipfs_failed claim_id=%s error=%s", claim_id, trust_layer_error)
-                system_flags.append("TRUST_LAYER_DEGRADED")
-                decision_modifier = -5.0
+                    raise RuntimeError("Blockchain anchoring failed: missing CID or tx hash from trust layer")
+                trust_layer_payload["cid"] = cid_value.replace("ipfs://", "").strip()
+                trust_layer_payload["tx_hash"] = tx_value
             except Exception as exc:
                 trust_layer_error = str(exc)
-                LOGGER.exception("trust_layer_unexpected_error claim_id=%s error=%s", claim_id, exc)
-                system_flags.append("TRUST_LAYER_DEGRADED")
-                decision_modifier = -5.0
-        if "TRUST_LAYER_DEGRADED" in system_flags and decision_modifier:
-            adjusted_ts = max(0.0, float(consensus_result.get("Ts", 0.0)) + decision_modifier)
-            consensus_result["Ts"] = adjusted_ts
-            prev_decision = FINAL_DECISION
-            FINAL_DECISION = self._consensus_engine._decision_for_ts(adjusted_ts, self._consensus_config)
-            FINAL_EXIT_REASON = "trust_layer_degraded" if FINAL_DECISION != "APPROVED" else FINAL_EXIT_REASON
-            decision_trace["final_decision"] = FINAL_DECISION
-            decision_trace["decision_reason"] = (
-                f"Trust layer degraded signal applied as score modifier ({decision_modifier})."
-            )
-            # If trust layer downgraded APPROVED → HUMAN_REVIEW, save the review context now
-            if prev_decision == "APPROVED" and FINAL_DECISION == "HUMAN_REVIEW":
+                LOGGER.exception("blockchain_anchoring_failed claim_id=%s error=%s", claim_id, exc)
+                system_flags.append("BLOCKCHAIN_ANCHORING_FAILED")
+                FINAL_DECISION = "HUMAN_REVIEW"
+                FINAL_EXIT_REASON = "low_confidence"
+                human_review_reason = "Blockchain anchoring failed"
+                blackboard_state["terminated"] = True
+                consensus_result["decision"] = FINAL_DECISION
+            if trust_layer_error:
+                decision_trace["final_decision"] = FINAL_DECISION
+                decision_trace["decision_reason"] = "Blockchain anchoring failed"
                 try:
                     review_context = self._register_human_review_context(
                         claim_id=claim_id,
                         claim_request=claim_request,
-                        ts_score=float(adjusted_ts),
-                        reason="Trust layer degraded — manual review required",
+                        ts_score=float(consensus_result["Ts"]),
+                        reason="Blockchain anchoring failed",
                         verified_fields=verified_structured_data,
                         agent_outputs=agent_outputs,
                         blackboard_snapshot=blackboard_state,
@@ -4686,16 +4840,16 @@ class ClaimGuardV2Orchestrator:
                     heatmap = list(review_context.get("heatmap", []))
                     heatmap_fallback = list(review_context.get("heatmap_fallback", []))
                 except Exception as exc:
-                    LOGGER.warning("trust_layer_review_context_failed claim_id=%s error=%s", claim_id, exc)
+                    LOGGER.warning("blockchain_anchor_review_context_failed claim_id=%s error=%s", claim_id, exc)
         _trace_stage(
             stage="TRUST_LAYER",
-            status="PASS" if bool(trust_layer_payload) else "SKIPPED",
+            status="PASS" if bool(trust_layer_payload) else ("FAIL" if trust_layer_error else "SKIPPED"),
             inputs={"final_decision": FINAL_DECISION},
             outputs={"trust_layer": trust_layer_payload or {}},
             reason=(
                 "Trust layer anchoring completed"
                 if trust_layer_payload
-                else (f"Trust layer skipped: {trust_layer_error}" if trust_layer_error else "Trust layer skipped or unavailable")
+                else (f"Blockchain anchoring failed: {trust_layer_error}" if trust_layer_error else "Trust layer skipped or unavailable")
             ),
         )
 
@@ -4741,12 +4895,14 @@ class ClaimGuardV2Orchestrator:
             decision_trace=decision_trace,
             system_flags=sorted(set(system_flags)),
             reason=(
-                "Dossier valide. Tous les champs critiques vérifiés. Aucun signal de fraude détecté."
+                "Valid claim. All critical fields verified. No fraud signal detected."
                 if FINAL_DECISION == "APPROVED"
                 else (
-                    "Dossier orienté vers un contrôle humain pour vérification complémentaire."
+                    "Blockchain anchoring failed"
+                    if "BLOCKCHAIN_ANCHORING_FAILED" in system_flags
+                    else "Claim routed to human review for additional verification."
                     if FINAL_DECISION == "HUMAN_REVIEW"
-                    else "Dossier rejeté suite à des incohérences critiques détectées."
+                    else "Claim rejected due to detected critical inconsistencies."
                 )
             ),
             document_url=document_url,

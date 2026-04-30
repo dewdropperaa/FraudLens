@@ -58,10 +58,10 @@ export default function InvestigationClaimPage({ claimId, user, token, onBackToD
         if (!res.ok) {
           if (res.status === 403) {
             setIs403(true)
-            throw new Error('Accès refusé — vérifiez vos permissions')
+            throw new Error('Access denied — check your permissions')
           }
           if (res.status === 404) {
-            throw new Error(`Contexte de révision non disponible pour ce dossier (${claimId}). Le dossier a peut-être été traité automatiquement.`)
+            throw new Error(`Review context is unavailable for this claim (${claimId}). The claim may have been processed automatically.`)
           }
           throw new Error(`Failed to load context (${res.status})`)
         }
@@ -132,12 +132,12 @@ export default function InvestigationClaimPage({ claimId, user, token, onBackToD
     }
   }
 
-  if (loading) return <div className="cg-card">Chargement du dossier investigateur...</div>
+  if (loading) return <div className="cg-card">Loading investigator claim...</div>
   if (is403) {
     return (
       <div className="cg-card">
-        <div style={{ color: 'var(--danger)', marginBottom: 10 }}>Accès refusé — vérifiez vos permissions</div>
-        <button className="cg-btn cg-btn-ghost" onClick={() => setRetryTick((v) => v + 1)}>Réessayer</button>
+        <div style={{ color: 'var(--danger)', marginBottom: 10 }}>Access denied — check your permissions</div>
+        <button className="cg-btn cg-btn-ghost" onClick={() => setRetryTick((v) => v + 1)}>Retry</button>
       </div>
     )
   }
@@ -148,7 +148,7 @@ export default function InvestigationClaimPage({ claimId, user, token, onBackToD
     <div className="space-y-4">
       <div className="cg-page-header">
         <div>
-          <div className="cg-page-sub">Dashboard → Claims → Investigateur {claimId}</div>
+          <div className="cg-page-sub">Dashboard → Claims → Investigator {claimId}</div>
           <div className="cg-page-title">Claim Investigation #{claimId}</div>
           <div className="cg-page-sub">Human-in-the-loop review and trust-layer finalization</div>
         </div>

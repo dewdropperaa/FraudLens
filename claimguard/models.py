@@ -134,6 +134,9 @@ class AgentResult(BaseModel):
 class ClaimResult(BaseModel):
     claim_id: str
     decision: DecisionType
+    # Backward-compatible aliases for dashboard/API consumers.
+    id: str | None = None
+    status: DecisionType | None = None
     score: float
     agent_results: List[AgentResult]
     consensus_decision: str | None = None
@@ -147,6 +150,17 @@ class ClaimResult(BaseModel):
     ipfs_hashes: List[str] = Field(default_factory=list)
     claim_hash: str | None = None
     zk_proof_hash: str | None = None
+    decision_source: Literal["AI", "HUMAN"] = "AI"
+    previous_status: str | None = None
+    review_trace: List[Dict[str, Any]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _sync_dashboard_aliases(self) -> "ClaimResult":
+        if not self.id:
+            self.id = self.claim_id
+        if not self.status:
+            self.status = self.decision
+        return self
 
 
 class ClaimSubmitResponse(BaseModel):

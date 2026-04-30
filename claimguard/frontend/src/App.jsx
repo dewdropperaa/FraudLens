@@ -8,6 +8,7 @@ import Database    from './pages/Database'
 import AdminReview from './pages/AdminReview'
 import InvestigationClaimPage from './pages/InvestigationClaimPage'
 import ProofModePage from './pages/ProofModePage'
+import ClaimDetail from './pages/ClaimDetail'
 import Login      from './pages/Login'
 import { useAuth } from './context/AuthContext'
 
@@ -33,7 +34,13 @@ export function safeText(v) {
   if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v)
   try { return JSON.stringify(v) } catch { return '[unprintable]' }
 }
-export function toIpfsUrl(h) { return h ? `https://gateway.pinata.cloud/ipfs/${h}` : null }
+export function toIpfsUrl(h) {
+  if (!h) return null
+  const s = String(h).trim()
+  if (s.startsWith('https://') || s.startsWith('http://')) return s
+  const bare = s.replace(/^ipfs:\/\//, '')
+  return bare ? `https://gateway.pinata.cloud/ipfs/${bare}` : null
+}
 export function shortHex(v) {
   if (!v) return 'N/A'
   if (v.length <= 16) return v
@@ -127,8 +134,11 @@ export default function App() {
   const initialPath = typeof window !== 'undefined' ? window.location.pathname : '/'
   const investigationMatch = initialPath.match(/^\/investigation\/([^/]+)$/)
   const proofMatch = initialPath.match(/^\/proof\/([^/]+)$/)
+  const claimDetailMatch = initialPath.match(/^\/claims\/([^/]+)$/)
   const [activePage, setActivePage] = useState(
-    proofMatch
+    claimDetailMatch
+        ? 'claim-detail'
+      : proofMatch
         ? 'proof-mode'
       : investigationMatch
         ? 'investigation-claim'
@@ -136,6 +146,7 @@ export default function App() {
   )
   const [investigationClaimId, setInvestigationClaimId] = useState(investigationMatch?.[1] || null)
   const [proofClaimId, setProofClaimId] = useState(proofMatch?.[1] || null)
+  const [claimDetailId, setClaimDetailId] = useState(claimDetailMatch?.[1] || null)
 
   /* ── Stats ─────────────────────────────────────────────────── */
   const stats = useMemo(() => {
@@ -256,11 +267,24 @@ export default function App() {
     if (nextPage !== 'proof-mode') {
       setProofClaimId(null)
     }
+    if (nextPage !== 'claim-detail') {
+      setClaimDetailId(null)
+    }
     const path = nextPage === 'proof-mode' && proofClaimId
         ? `/proof/${proofClaimId}`
+        : nextPage === 'claim-detail' && claimDetailId
+        ? `/claims/${claimDetailId}`
         : '/'
     if (typeof window !== 'undefined' && window.location.pathname !== path) {
       window.history.replaceState({}, '', path)
+    }
+  }
+
+  function navigateToClaimDetail(id) {
+    setClaimDetailId(id)
+    setActivePage('claim-detail')
+    if (typeof window !== 'undefined') {
+      window.history.replaceState({}, '', `/claims/${id}`)
     }
   }
 
@@ -301,12 +325,16 @@ export default function App() {
               </div>
             </div>
           )
-      case 'dashboard': return <Dashboard  {...shared} stats={stats} dailyClaims={dailyClaims} chartLoading={chartLoading} />
+      case 'claim-detail':
+        return claimDetailId
+          ? <ClaimDetail claimId={claimDetailId} onBack={() => setPageAndPath('dashboard')} api={api} safeText={safeText} />
+          : <Dashboard {...shared} stats={stats} dailyClaims={dailyClaims} chartLoading={chartLoading} onClaimClick={navigateToClaimDetail} />
+      case 'dashboard': return <Dashboard  {...shared} stats={stats} dailyClaims={dailyClaims} chartLoading={chartLoading} onClaimClick={navigateToClaimDetail} />
       case 'submit':    return <SubmitClaim {...submitProps} />
       case 'admin':     return <AdminReview {...shared} />
       case 'database':
       case 'claims':    return <Database   {...shared} />
-      default:          return <Dashboard  {...shared} stats={stats} dailyClaims={dailyClaims} chartLoading={chartLoading} />
+      default:          return <Dashboard  {...shared} stats={stats} dailyClaims={dailyClaims} chartLoading={chartLoading} onClaimClick={navigateToClaimDetail} />
     }
   }
 
@@ -344,14 +372,14 @@ export default function App() {
               <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-primary)', lineHeight: 1.2 }}>
                 {user?.full_name ?? user?.email}
               </div>
-              <div style={{ fontSize: '11px', color: 'var(--text-muted)', lineHeight: 1.2 }}>Assureur</div>
+              <div style={{ fontSize: '11px', color: 'var(--text-muted)', lineHeight: 1.2 }}>Insurer</div>
             </div>
             <div className="cg-avatar" style={{ background: 'var(--accent)' }}>
               {(user?.full_name?.[0] ?? user?.email?.[0] ?? 'A').toUpperCase()}
             </div>
             <button
               onClick={logout}
-              title="Se déconnecter"
+              title="Sign out"
               style={{ background: 'none', border: '1px solid var(--border)', borderRadius: '6px', padding: '5px 8px', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '4px' }}
             >
               <Icons.LogOut style={{ width: 14, height: 14 }} />

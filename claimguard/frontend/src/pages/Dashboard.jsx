@@ -4,7 +4,40 @@ import {
   ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
 
-export default function Dashboard({ stats, claimsLoading, dailyClaims, chartLoading, claims, shortHex, toIpfsUrl }) {
+function getStatusMeta(claim) {
+  const status = String(claim?.status || claim?.decision || '').toUpperCase()
+  const source = String(claim?.decision_source || 'AI').toUpperCase()
+
+  if (status === 'APPROVED' && source === 'HUMAN') {
+    return { label: 'Approved (after human review)', subtitle: 'Validated by human', className: 'approved', color: 'var(--success)' }
+  }
+  if (status === 'REJECTED' && source === 'HUMAN') {
+    return { label: 'Rejected (after human review)', subtitle: 'Validated by human', className: 'rejected', color: 'var(--danger)' }
+  }
+  if (status === 'APPROVED') {
+    return { label: 'Approved (AI)', subtitle: 'Validated by AI', className: 'approved', color: 'var(--success)' }
+  }
+  if (status === 'REJECTED') {
+    return { label: 'Rejected (AI)', subtitle: 'Validated by AI', className: 'rejected', color: 'var(--danger)' }
+  }
+  if (status === 'HUMAN_REVIEW') {
+    return { label: 'Sent to human review', subtitle: 'Validated by AI', className: 'pending', color: '#f59e0b' }
+  }
+  return { label: status || 'Unknown', subtitle: 'Validated by AI', className: 'pending', color: '#f59e0b' }
+}
+
+function getDecisionTimeline(claim) {
+  const status = String(claim?.status || claim?.decision || '').toUpperCase()
+  const source = String(claim?.decision_source || 'AI').toUpperCase()
+  if (status === 'APPROVED' && source === 'HUMAN') return 'AI -> Human Review -> Approved'
+  if (status === 'REJECTED' && source === 'HUMAN') return 'AI -> Human Review -> Rejected'
+  if (status === 'HUMAN_REVIEW') return 'AI -> Human Review'
+  if (status === 'APPROVED') return 'AI -> Approved'
+  if (status === 'REJECTED') return 'AI -> Rejected'
+  return 'AI -> Decision'
+}
+
+export default function Dashboard({ stats, claimsLoading, dailyClaims, chartLoading, claims, shortHex, toIpfsUrl, onClaimClick }) {
   return (
     <>
       <div className="cg-page-header">
@@ -55,12 +88,23 @@ export default function Dashboard({ stats, claimsLoading, dailyClaims, chartLoad
             <thead><tr><th>Claim ID</th><th>Decision</th><th>Score</th><th>Tx Hash</th><th>IPFS</th></tr></thead>
             <tbody>
               {claims.slice(0, 8).map((claim) => (
-                <tr key={claim.claim_id}>
+                <tr key={claim.claim_id} onClick={() => onClaimClick?.(claim.claim_id)} style={{ cursor: onClaimClick ? 'pointer' : 'default' }}>
                   <td className="mono">{shortHex(claim.claim_id)}</td>
-                  <td className={claim.decision === 'APPROVED' ? 'approved' : 'rejected'}>{claim.decision}</td>
+                  <td>
+                    {(() => {
+                      const meta = getStatusMeta(claim)
+                      return (
+                        <div>
+                          <div style={{ color: meta.color, fontWeight: 600 }}>{meta.label}</div>
+                          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{meta.subtitle}</div>
+                          <div style={{ fontSize: 11, color: '#9ca3af' }}>{getDecisionTimeline(claim)}</div>
+                        </div>
+                      )
+                    })()}
+                  </td>
                   <td className="score">{claim.score}</td>
                   <td className="mono">{shortHex(claim.tx_hash)}</td>
-                  <td>{claim.ipfs_hash ? <a href={toIpfsUrl(claim.ipfs_hash)} target="_blank" rel="noreferrer">{shortHex(claim.ipfs_hash)}</a> : <span style={{ color: 'var(--text-muted)' }}>N/A</span>}</td>
+                  <td>{claim.ipfs_hash ? <a href={toIpfsUrl(claim.ipfs_hash)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{shortHex(claim.ipfs_hash)}</a> : <span style={{ color: 'var(--text-muted)' }}>N/A</span>}</td>
                 </tr>
               ))}
               {claims.length === 0 && <tr><td colSpan={5} style={{ padding: '28px', textAlign: 'center', color: 'var(--text-muted)' }}>No claims yet.</td></tr>}

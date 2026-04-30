@@ -193,5 +193,7 @@ class ClaimGuardV2Response(BaseModel):
     routed_to: str | None = None
     blockchain_tx: str | None = None
     ipfs_document: str | None = None
+    ipfs_url: str | None = None
     tx_hash: str | None = None
     ipfs_hash: str | None = None
+    decision_details: Dict[str, Any] = Field(default_factory=dict)

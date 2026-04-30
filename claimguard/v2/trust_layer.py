@@ -11,9 +11,24 @@ from typing import Any, Dict, List, Optional, Protocol
 import requests
 from pydantic import BaseModel, ConfigDict, Field
 
+from claimguard.config import load_environment
+
 LOGGER = logging.getLogger("claimguard.v2.trust_layer")
 
 _TRUST_DOC_TYPES = ("medical", "invoice", "prescription")
+_DEFAULT_TRUST_CONTRACT_ABI: List[Dict[str, Any]] = [
+    {
+        "inputs": [
+            {"name": "claimIdHash", "type": "bytes32"},
+            {"name": "score", "type": "uint256"},
+            {"name": "approved", "type": "bool"},
+        ],
+        "name": "validateClaim",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    }
+]
 
 
 class TrustLayerIPFSFailure(RuntimeError):
@@ -156,20 +171,13 @@ class IPFSClient(Protocol):
 
 
 class BlockchainClient(Protocol):
+    def store_claim(self, *, cid: str, metadata: Dict[str, Any]) -> str: ...
+
     def store_record(self, payload: OnChainTrustPayload) -> str: ...
 
 
 class FirebaseClient(Protocol):
     def store_record(self, payload: FirebaseTrustRecord) -> str: ...
-
-
-class FallbackLogger(Protocol):
-    def log_blockchain_failure(self, context: Dict[str, Any]) -> None: ...
-
-
-class DefaultFallbackLogger:
-    def log_blockchain_failure(self, context: Dict[str, Any]) -> None:
-        LOGGER.warning("trust_layer_blockchain_fallback context=%s", context)
 
 
 class HallucinationGuard:
@@ -192,6 +200,7 @@ class PinataIPFSClient:
         pinata_api_key: Optional[str] = None,
         pinata_api_secret: Optional[str] = None,
     ) -> None:
+        load_environment()
         self._jwt = pinata_jwt or os.getenv("PINATA_JWT")
         self._api_key = pinata_api_key or os.getenv("PINATA_API_KEY")
         self._api_secret = pinata_api_secret or os.getenv("PINATA_API_SECRET")
@@ -270,12 +279,49 @@ class PinataIPFSClient:
 
 class EthereumTrustClient:
     def __init__(self) -> None:
-        self._rpc_url = os.getenv("GANACHE_RPC_URL", "")
+        load_environment()
+        self._rpc_url = (
+            os.getenv("TRUST_RPC_URL", "")
+            or os.getenv("SEPOLIA_RPC_URL", "")
+            or os.getenv("ALCHEMY_URL", "")
+            or os.getenv("WEB3_PROVIDER_URL", "")
+            or os.getenv("GANACHE_RPC_URL", "")
+        )
         self._contract_address = os.getenv("TRUST_CONTRACT_ADDRESS", "")
-        self._private_key = os.getenv("GANACHE_PRIVATE_KEY", "")
+        if not self._contract_address:
+            self._contract_address = os.getenv("CONTRACT_ADDRESS", "")
+        self._private_key = (
+            os.getenv("TRUST_PRIVATE_KEY", "")
+            or os.getenv("SEPOLIA_PRIVATE_KEY", "")
+            or os.getenv("PRIVATE_KEY", "")
+            or os.getenv("GANACHE_PRIVATE_KEY", "")
+        )
         self._validator_id = os.getenv("TRUST_VALIDATOR_ID", "claimguard-v2")
         self._abi_json = os.getenv("TRUST_CONTRACT_ABI_JSON", "")
-        self._function_name = os.getenv("TRUST_CONTRACT_FUNCTION", "storeTrustRecord")
+        if not self._abi_json:
+            self._abi_json = json.dumps(_DEFAULT_TRUST_CONTRACT_ABI)
+        self._function_name = (
+            os.getenv("TRUST_CONTRACT_FUNCTION", "").strip()
+            or ("validateClaim" if self._abi_json == json.dumps(_DEFAULT_TRUST_CONTRACT_ABI) else "storeTrustRecord")
+        )
+
+    @staticmethod
+    def _hash_cid(cid: str | None) -> str:
+        normalized = (cid or "").strip()
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        return f"0x{digest}"
+
+    def store_claim(self, *, cid: str, metadata: Dict[str, Any]) -> str:
+        onchain_payload = OnChainTrustPayload.model_validate(
+            {
+                "cid_hash": str(metadata.get("cid_hash") or self._hash_cid(cid)),
+                "validator": str(metadata.get("validator") or self.validator_id),
+                "timestamp": int(metadata.get("timestamp") or datetime.now(timezone.utc).timestamp()),
+                "ts_score": float(metadata.get("ts_score", 0.0)),
+                "final_decision": str(metadata.get("final_decision") or metadata.get("decision") or "APPROVED"),
+            }
+        )
+        return self.store_record(onchain_payload)
 
     def store_record(self, payload: OnChainTrustPayload) -> str:
         from web3 import Web3
@@ -284,39 +330,40 @@ class EthereumTrustClient:
             raise RuntimeError("Blockchain trust configuration is incomplete.")
         w3 = Web3(Web3.HTTPProvider(self._rpc_url))
         if not w3.is_connected():
-            raise RuntimeError("Unable to connect to Ganache RPC.")
-        account = w3.eth.account.from_key(self._private_key)
+            raise RuntimeError("Unable to connect to configured blockchain RPC.")
+        private_key = self._private_key[2:] if self._private_key.lower().startswith("0x") else self._private_key
+        account = w3.eth.account.from_key(private_key)
         contract = w3.eth.contract(
             address=Web3.to_checksum_address(self._contract_address),
             abi=json.loads(self._abi_json),
         )
         fn = getattr(contract.functions, self._function_name)
-        txn = fn(
-            payload.cid_hash,
-            payload.validator,
-            payload.timestamp,
-            int(round(payload.ts_score * 100)),
-            payload.final_decision,
-        ).build_transaction(
+        if self._function_name == "validateClaim":
+            contract_call = fn(
+                payload.cid_hash,
+                int(round(payload.ts_score)),
+                payload.final_decision.upper() == "APPROVED",
+            )
+        else:
+            contract_call = fn(
+                payload.cid_hash,
+                payload.validator,
+                payload.timestamp,
+                int(round(payload.ts_score * 100)),
+                payload.final_decision,
+            )
+        txn = contract_call.build_transaction(
             {
                 "from": account.address,
                 "nonce": w3.eth.get_transaction_count(account.address),
-                "chainId": 1337,
+                "chainId": int(w3.eth.chain_id),
                 "gasPrice": w3.eth.gas_price,
             }
         )
         signed = account.sign_transaction(txn)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        tx_hash_hex = str(tx_hash.hex())
-        # BLOCKCHAIN-FIX: require mined confirmation to avoid "pretend" anchoring.
-        timeout_s_raw = os.getenv("TRUST_CHAIN_RECEIPT_TIMEOUT_S", "120").strip()
-        try:
-            timeout_s = max(10, int(float(timeout_s_raw)))
-        except ValueError:
-            timeout_s = 120
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout_s)
-        if int(getattr(receipt, "status", 0)) != 1:
-            raise RuntimeError(f"Blockchain transaction reverted: {tx_hash_hex}")
+        raw_tx_hash = str(tx_hash.hex())
+        tx_hash_hex = raw_tx_hash if raw_tx_hash.startswith("0x") else f"0x{raw_tx_hash}"
         return tx_hash_hex
 
     @staticmethod
@@ -410,6 +457,7 @@ class EthereumTrustClient:
 
 class FirestoreTrustClient:
     def __init__(self) -> None:
+        load_environment()
         self._collection = os.getenv("TRUST_FIRESTORE_COLLECTION", "claim_trust_records")
         self._credential_json = os.getenv("FIREBASE_CREDENTIALS_JSON", "").strip()
         self._credential_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "").strip()
@@ -456,7 +504,6 @@ class TrustLayerService:
     ipfs_client: IPFSClient
     blockchain_client: BlockchainClient
     firebase_client: FirebaseClient
-    fallback_logger: FallbackLogger
     validator_id: str = "claimguard-v2"
 
     @classmethod
@@ -467,7 +514,6 @@ class TrustLayerService:
             ipfs_client=PinataIPFSClient(),
             blockchain_client=chain_client,
             firebase_client=FirestoreTrustClient(),
-            fallback_logger=DefaultFallbackLogger(),
             validator_id=validator,
         )
 
@@ -513,8 +559,13 @@ class TrustLayerService:
     @staticmethod
     def _hash_cid(cid: str | None) -> str:
         normalized = (cid or "").strip()
+        normalized = normalized.replace("ipfs://", "").strip()
         digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         return f"0x{digest}"
+
+    @staticmethod
+    def _bare_cid(cid: str | None) -> str:
+        return str(cid or "").strip().replace("ipfs://", "").strip()
 
     @staticmethod
     def _stable_hash_payload(payload: Dict[str, Any]) -> str:
@@ -628,9 +679,6 @@ class TrustLayerService:
 
         assert decision == "APPROVED", "Approved-only side effects enforced"
 
-        cid: str | None = None
-        tx_hash: Optional[str] = None
-
         bb = _normalize_blackboard_for_trust(blackboard if isinstance(blackboard, dict) else {})
         documents = list(self._sanitize_documents(claim_request.get("documents", [])))
         if not documents and is_trust_eligible(bb):
@@ -651,36 +699,26 @@ class TrustLayerService:
         LOGGER.info(
             f"[TRUST LAYER] documents_count={len(documents)} eligible={is_trust_eligible(bb)}"
         )
-        if documents:
-            try:
-                cid = self.ipfs_client.upload_documents(claim_id, documents)
-            except Exception as e:
-                LOGGER.error(f"IPFS FAILED: {e}")
-                cid = None
-        else:
-            LOGGER.warning("trust_layer_ipfs_skipped_empty_documents claim_id=%s", claim_id)
-            cid = None
+        if not documents:
+            raise TrustLayerIPFSFailure(f"No trust-eligible documents available for approved claim {claim_id}")
 
-        onchain_payload = OnChainTrustPayload.model_validate(
-            {
-                "cid_hash": self._hash_cid(cid),
-                "validator": self.validator_id,
-                "timestamp": int(now.timestamp()),
-                "ts_score": ts_score,
-                "final_decision": decision,
-            }
-        )
-        try:
-            tx_hash = self.blockchain_client.store_record(onchain_payload)
-        except Exception as exc:
-            self.fallback_logger.log_blockchain_failure(
-                {
-                    "claim_id": claim_id,
-                    "cid": cid,
-                    "validator": self.validator_id,
-                    "error": str(exc),
-                }
-            )
+        cid = self._bare_cid(self.ipfs_client.upload_documents(claim_id, documents))
+        if not cid:
+            raise TrustLayerIPFSFailure(f"IPFS upload returned empty CID for approved claim {claim_id}")
+
+        claim_data = {
+            "claim_id": claim_id,
+            "cid_hash": self._hash_cid(cid),
+            "validator": self.validator_id,
+            "timestamp": int(now.timestamp()),
+            "ts_score": ts_score,
+            "final_decision": decision,
+            "trust_hash": trust_hash,
+            "flags": flags,
+        }
+        tx_hash = str(self.blockchain_client.store_claim(cid=cid, metadata=claim_data)).strip()
+        if not tx_hash:
+            raise RuntimeError(f"Blockchain anchoring returned empty tx hash for approved claim {claim_id}")
 
         firebase_payload = FirebaseTrustRecord.model_validate(
             {

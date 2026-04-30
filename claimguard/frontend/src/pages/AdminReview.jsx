@@ -1,7 +1,59 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Icons } from '../components'
 
 const FILTERS = ['human_review', 'all', 'approved', 'rejected']
+
+/* ── IPFS URL helper ────────────────────────────────────────── */
+function resolveIpfsUrl(raw) {
+  if (!raw) return null
+  const s = String(raw).trim()
+  if (s.startsWith('https://') || s.startsWith('http://')) return s
+  const bare = s.replace(/^ipfs:\/\//, '')
+  return bare ? `https://gateway.pinata.cloud/ipfs/${bare}` : null
+}
+
+/* ── Contradiction formatter ────────────────────────────────── */
+const TECH_REPLACEMENTS = [
+  [/\bIdentityAgent\b/gi, "identity verification"],
+  [/\bAnomalyAgent\b/gi, "unusual activity patterns"],
+  [/\bDocumentAgent\b/gi, "document verification"],
+  [/\bPolicyAgent\b/gi, "policy compliance"],
+  [/\bFraudAgent\b/gi, "fraud risk assessment"],
+  [/\bMedianAgent\b/gi, "claim consistency check"],
+  [/\bAgent\b/gi, "check"],
+  [/\banomaly\b/gi, "unusual activity"],
+  [/\bH_penalty\b/gi, "risk level"],
+  [/\bpenalty\b/gi, "risk factor"],
+  [/\bblackboard\b/gi, "claim data"],
+  [/\bts_score\b/gi, "confidence level"],
+  [/\bscore\b/gi, "assessment level"],
+]
+
+function cleanTechText(text) {
+  let result = String(text || '')
+  for (const [pattern, replacement] of TECH_REPLACEMENTS) {
+    result = result.replace(pattern, replacement)
+  }
+  return result
+}
+
+function formatSingleContradiction(ct) {
+  if (!ct) return null
+  if (typeof ct === 'string') return cleanTechText(ct)
+
+  const reason = cleanTechText(ct?.reason || '').trim()
+  if (reason) {
+    return `There is an inconsistency in this claim:\n${reason}\nThis may require further verification.`
+  }
+  return 'An inconsistency was detected in this claim that requires further verification.'
+}
+
+function formatContradictions(contradictions) {
+  if (!contradictions?.length) return null
+  if (contradictions.length === 1) return formatSingleContradiction(contradictions[0])
+  const items = contradictions.map((ct, i) => `${i + 1}. ${formatSingleContradiction(ct)}`)
+  return `Several inconsistencies were detected:\n${items.join('\n')}`
+}
 
 function StatusBadge({ decision }) {
   const color = decision === 'APPROVED' ? 'var(--success)' : decision === 'REJECTED' ? 'var(--danger)' : 'var(--text-muted)'
@@ -36,9 +88,73 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
   const [contextLoading, setContextLoading] = useState(false)
   const [pdfViewed, setPdfViewed]   = useState(false)
   const [notes, setNotes]           = useState('')
+  const [docBlobUrl, setDocBlobUrl] = useState(null)
+  const [docLoading, setDocLoading] = useState(false)
+  const blobUrlRef = useRef(null)
 
   const token = localStorage.getItem('cg_token') || ''
   const authHeader = token ? { Authorization: `Bearer ${token}` } : {}
+
+  const [docError, setDocError] = useState('')
+
+  // Fetch document blob when context changes so the iframe can load it
+  // (iframes cannot send Authorization headers; blob URLs bypass this)
+  useEffect(() => {
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current)
+      blobUrlRef.current = null
+    }
+    setDocBlobUrl(null)
+    setDocError('')
+
+    const rawUrl = reviewContext?.document_url
+    console.log('[AdminReview] document_url from context:', rawUrl)
+    if (!rawUrl) return
+
+    // External URLs (IPFS, etc.) work directly — no auth needed
+    if (rawUrl.startsWith('http://') || rawUrl.startsWith('https://')) {
+      setDocBlobUrl(rawUrl)
+      return
+    }
+
+    // Local API paths need the JWT — fetch as blob then create object URL
+    let cancelled = false
+    setDocLoading(true)
+    fetch(rawUrl, { headers: authHeader })
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`)
+        return r.blob()
+      })
+      .then(blob => {
+        if (cancelled) return
+        console.log('[AdminReview] Document blob loaded, size:', blob.size, 'type:', blob.type)
+        const blobType = blob.type || 'application/pdf'
+        const typedBlob = blob.type ? blob : new Blob([blob], { type: blobType })
+        const url = URL.createObjectURL(typedBlob)
+        blobUrlRef.current = url
+        setDocBlobUrl(url)
+      })
+      .catch(err => {
+        console.error('[AdminReview] Document fetch failed:', err)
+        if (!cancelled) {
+          setDocBlobUrl(null)
+          setDocError(`Unable to load document: ${err.message}`)
+        }
+      })
+      .finally(() => { if (!cancelled) setDocLoading(false) })
+
+    return () => {
+      cancelled = true
+      setDocLoading(false)
+    }
+  }, [reviewContext?.document_url])
+
+  // Revoke blob URL on unmount
+  useEffect(() => {
+    return () => {
+      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current)
+    }
+  }, [])
 
   const visible = filter === 'approved'
     ? claims.filter(c => c.decision === 'APPROVED')
@@ -52,17 +168,31 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
   useEffect(() => {
     if (!selected || selected.decision !== 'HUMAN_REVIEW') {
       setReviewContext(null)
+      setDocBlobUrl(null)
+      setDocError('')
       setPdfViewed(false)
       return
     }
     let cancelled = false
     setContextLoading(true)
     setReviewContext(null)
+    setDocError('')
     setPdfViewed(false)
+    console.log('[AdminReview] Fetching review context for claim:', selected.claim_id)
     fetch(`/api/v2/claim/${selected.claim_id}/human-review-context`, { headers: authHeader })
-      .then(r => r.ok ? r.json() : null)
-      .then(data => { if (!cancelled) setReviewContext(data) })
-      .catch(() => {})
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        return r.json()
+      })
+      .then(data => {
+        if (cancelled) return
+        console.log('[AdminReview] Review context received:', { document_url: data?.document_url, claim_id: data?.claim_id })
+        setReviewContext(data)
+      })
+      .catch(err => {
+        console.error('[AdminReview] Review context fetch failed:', err)
+        if (!cancelled) setDocError(`Review context unavailable: ${err.message}`)
+      })
       .finally(() => { if (!cancelled) setContextLoading(false) })
     return () => { cancelled = true }
   }, [selected?.claim_id])
@@ -81,9 +211,9 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
       if (decision === 'APPROVED') {
         const tx  = body.tx_hash  ? `tx: ${body.tx_hash.slice(0, 16)}…`  : ''
         const cid = body.ipfs_cid ? `IPFS: ${body.ipfs_cid.slice(0, 16)}…` : ''
-        setActionSuccess(`Claim approuvé et ancré. ${[tx, cid].filter(Boolean).join(' · ')}`)
+        setActionSuccess(`Claim approved and anchored. ${[tx, cid].filter(Boolean).join(' · ')}`)
       } else {
-        setActionSuccess('Claim rejeté. Aucun ancrage blockchain/IPFS effectué.')
+        setActionSuccess('Claim rejected. No blockchain/IPFS anchoring performed.')
       }
       await fetchClaims()
       setSelected(prev => prev ? { ...prev, decision } : null)
@@ -157,9 +287,12 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
                     <StatusBadge decision={claim.decision} />
                   </div>
                   <ScoreBar score={claim.score} />
-                  <div style={{ marginTop: '4px', fontSize: '11px', color: 'var(--text-muted)' }}>
-                    {claim.agent_results?.length ?? 0} agents · {claim.contradictions?.length ?? 0} contradictions
-                  </div>
+                  {(claim.contradictions?.length ?? 0) > 0 && (
+                    <div style={{ marginTop: '4px', fontSize: '11px', color: 'var(--danger)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <Icons.AlertTriangle style={{ width: 11, height: 11 }} />
+                      {claim.contradictions.length} inconsistenc{claim.contradictions.length === 1 ? 'y' : 'ies'} detected
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -188,20 +321,20 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
                   <button
                     onClick={() => submitReview(selected.claim_id, 'APPROVED')}
                     disabled={actioning || selected.decision === 'APPROVED' || !canDecide}
-                    title={!canDecide ? 'Veuillez consulter le document avant de décider' : ''}
+                    title={!canDecide ? 'Please review the document before deciding' : ''}
                     className="cg-btn cg-btn-sm"
                     style={{ background: 'var(--success)', color: '#fff', border: 'none', opacity: (selected.decision === 'APPROVED' || !canDecide) ? 0.45 : 1 }}
                   >
-                    <Icons.CheckCircle style={{ width: 14, height: 14 }} /> Approuver
+                    <Icons.CheckCircle style={{ width: 14, height: 14 }} /> Approve
                   </button>
                   <button
                     onClick={() => submitReview(selected.claim_id, 'REJECTED')}
                     disabled={actioning || selected.decision === 'REJECTED' || !canDecide}
-                    title={!canDecide ? 'Veuillez consulter le document avant de décider' : ''}
+                    title={!canDecide ? 'Please review the document before deciding' : ''}
                     className="cg-btn cg-btn-sm"
                     style={{ background: 'var(--danger)', color: '#fff', border: 'none', opacity: (selected.decision === 'REJECTED' || !canDecide) ? 0.45 : 1 }}
                   >
-                    <Icons.XCircle style={{ width: 14, height: 14 }} /> Rejeter
+                    <Icons.XCircle style={{ width: 14, height: 14 }} /> Reject
                   </button>
                 </div>
               </div>
@@ -210,7 +343,7 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
               {isHumanReview && !pdfViewed && (
                 <div className="cg-alert" style={{ marginTop: '10px', background: '#fffbeb', border: '1px solid #fde68a', color: '#92400e', borderRadius: 8, padding: '8px 12px', fontSize: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
                   <Icons.AlertTriangle style={{ width: 14, height: 14, flexShrink: 0 }} />
-                  Consultez et confirmez le document ci-dessous avant de pouvoir approuver ou rejeter.
+                  Review and confirm the document below before you can approve or reject.
                 </div>
               )}
               {actionSuccess && <div className="cg-alert success" style={{ marginTop: '10px' }}><Icons.CheckCircle />{actionSuccess}</div>}
@@ -221,49 +354,69 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
             {isHumanReview && (
               <div className="cg-card">
                 <div className="cg-card-header">
-                  <div className="cg-card-title"><div className="cg-card-title-icon"><Icons.FileText /></div>Document justificatif</div>
+                  <div className="cg-card-title"><div className="cg-card-title-icon"><Icons.FileText /></div>Supporting document</div>
                   {pdfViewed && (
                     <span style={{ fontSize: '11px', color: 'var(--success)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
-                      <Icons.CheckCircle style={{ width: 13, height: 13 }} /> Consulté
+                      <Icons.CheckCircle style={{ width: 13, height: 13 }} /> Reviewed
                     </span>
                   )}
                 </div>
                 <div style={{ padding: '12px 16px' }}>
-                  {contextLoading && (
-                    <div style={{ color: 'var(--text-muted)', fontSize: 13 }}>Chargement du document…</div>
-                  )}
-                  {!contextLoading && !reviewContext?.document_url && (
-                    <div style={{ color: 'var(--text-muted)', fontSize: 13 }}>
-                      Aucun document temporaire disponible pour ce dossier.
-                      <button className="cg-btn cg-btn-ghost cg-btn-sm" style={{ marginLeft: 12 }} onClick={() => setPdfViewed(true)}>
-                        Continuer sans document
-                      </button>
+                  {(contextLoading || docLoading) && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-muted)', fontSize: 13 }}>
+                      <span className="cg-spinner" style={{ width: 16, height: 16 }} />
+                      Loading document...
                     </div>
                   )}
-                  {!contextLoading && reviewContext?.document_url && (
-                    <>
-                      <iframe
-                        src={reviewContext.document_url}
-                        title="Document justificatif"
-                        style={{ width: '100%', height: '520px', border: '1px solid var(--border)', borderRadius: '6px' }}
-                        onLoad={() => {}}
-                      />
-                      {!pdfViewed && (
-                        <button
-                          className="cg-btn cg-btn-primary"
-                          style={{ marginTop: 12, width: '100%' }}
-                          onClick={() => setPdfViewed(true)}
-                        >
-                          <Icons.CheckCircle style={{ width: 15, height: 15 }} /> J'ai consulté et vérifié ce document
-                        </button>
-                      )}
-                      {pdfViewed && (
-                        <div style={{ marginTop: 10, fontSize: 12, color: 'var(--success)', fontWeight: 600 }}>
-                          ✓ Document vérifié — vous pouvez maintenant approuver ou rejeter le dossier.
+                  {!contextLoading && !docLoading && (() => {
+                    const iframeUrl = docBlobUrl || resolveIpfsUrl(selected?.ipfs_hash)
+                    if (docError && !iframeUrl) {
+                      return (
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: '24px 0', color: 'var(--danger)' }}>
+                          <Icons.AlertTriangle style={{ width: 32, height: 32, opacity: 0.6 }} />
+                          <span style={{ fontSize: 13, textAlign: 'center', maxWidth: 400 }}>{docError}</span>
+                          <button className="cg-btn cg-btn-ghost cg-btn-sm" onClick={() => setPdfViewed(true)}>
+                            Continue without document
+                          </button>
                         </div>
-                      )}
-                    </>
-                  )}
+                      )
+                    }
+                    if (!iframeUrl) {
+                      return (
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: '24px 0', color: 'var(--text-muted)' }}>
+                          <Icons.FileText style={{ width: 32, height: 32, opacity: 0.35 }} />
+                          <span style={{ fontSize: 13 }}>Document unavailable</span>
+                          <button className="cg-btn cg-btn-ghost cg-btn-sm" onClick={() => setPdfViewed(true)}>
+                            Continue without document
+                          </button>
+                        </div>
+                      )
+                    }
+                    return (
+                      <>
+                        <iframe
+                          key={iframeUrl}
+                          src={iframeUrl}
+                          title="Supporting document"
+                          style={{ width: '100%', height: '600px', border: '1px solid var(--border)', borderRadius: '8px', display: 'block' }}
+                        />
+                        {!pdfViewed && (
+                          <button
+                            className="cg-btn cg-btn-primary"
+                            style={{ marginTop: 12, width: '100%' }}
+                            onClick={() => setPdfViewed(true)}
+                          >
+                            <Icons.CheckCircle style={{ width: 15, height: 15 }} /> I have reviewed and verified this document
+                          </button>
+                        )}
+                        {pdfViewed && (
+                          <div style={{ marginTop: 10, fontSize: 12, color: 'var(--success)', fontWeight: 600 }}>
+                            Document verified — you can now approve or reject the claim.
+                          </div>
+                        )}
+                      </>
+                    )
+                  })()}
                 </div>
               </div>
             )}
@@ -272,13 +425,13 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
             {isHumanReview && (
               <div className="cg-card">
                 <div className="cg-card-header">
-                  <div className="cg-card-title"><div className="cg-card-title-icon"><Icons.FileText /></div>Notes du réviseur</div>
+                  <div className="cg-card-title"><div className="cg-card-title-icon"><Icons.FileText /></div>Reviewer notes</div>
                 </div>
                 <div style={{ padding: '12px 16px' }}>
                   <textarea
                     className="w-full rounded border border-[var(--border)] p-2"
                     style={{ width: '100%', minHeight: 80, padding: '8px', borderRadius: 6, border: '1px solid var(--border)', fontSize: 13, resize: 'vertical' }}
-                    placeholder="Notes optionnelles (motif de rejet, observations…)"
+                    placeholder="Optional notes (rejection reason, observations...)"
                     value={notes}
                     onChange={e => setNotes(e.target.value)}
                   />
@@ -313,45 +466,41 @@ export default function AdminReview({ claims, claimsLoading, claimsError, fetchC
               </div>
             </div>
 
-            {/* Agent results */}
-            {selected.agent_results?.length > 0 && (
-              <div className="cg-card">
-                <div className="cg-card-header">
-                  <div className="cg-card-title"><div className="cg-card-title-icon"><Icons.Users /></div>Agent Results</div>
-                  <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{selected.agent_results.length} agents</span>
-                </div>
-                <div style={{ padding: '0 0 8px' }}>
-                  {selected.agent_results.map((ag, i) => (
-                    <div key={i} style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                        <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-primary)' }}>{ag.agent_name}</span>
-                        <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)' }}>
-                          {typeof ag.score === 'number' ? ag.score.toFixed(1) : ag.score}
-                        </span>
+            {/* Detected inconsistencies */}
+            {selected.contradictions?.length > 0 && (() => {
+              const formatted = formatContradictions(selected.contradictions)
+              if (!formatted) return null
+              const lines = formatted.split('\n').filter(Boolean)
+              return (
+                <div className="cg-card">
+                  <div className="cg-card-header">
+                    <div className="cg-card-title">
+                      <div className="cg-card-title-icon" style={{ background: 'var(--danger-bg)', color: 'var(--danger)' }}>
+                        <Icons.AlertTriangle />
                       </div>
-                      <p style={{ margin: 0, fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>{ag.reasoning}</p>
+                      Detected inconsistencies
                     </div>
-                  ))}
+                  </div>
+                  <div style={{ padding: '14px 16px 16px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {lines.map((line, i) => {
+                      const isNumbered = /^\d+\./.test(line)
+                      const isHeader = i === 0 && lines.length > 2
+                      return (
+                        <div key={i} style={{
+                          fontSize: isHeader ? 13 : 13,
+                          fontWeight: isHeader ? 600 : 400,
+                          color: isHeader ? 'var(--text-primary)' : 'var(--text-secondary)',
+                          lineHeight: 1.6,
+                          paddingLeft: isNumbered ? 4 : 0,
+                        }}>
+                          {line}
+                        </div>
+                      )
+                    })}
+                  </div>
                 </div>
-              </div>
-            )}
-
-            {/* Contradictions */}
-            {selected.contradictions?.length > 0 && (
-              <div className="cg-card">
-                <div className="cg-card-header">
-                  <div className="cg-card-title"><div className="cg-card-title-icon" style={{ background: 'var(--danger-bg)', color: 'var(--danger)' }}><Icons.AlertTriangle /></div>Contradictions</div>
-                  <span style={{ fontSize: '11px', color: 'var(--danger)' }}>{selected.contradictions.length} found</span>
-                </div>
-                <div style={{ padding: '0 0 8px' }}>
-                  {selected.contradictions.map((ct, i) => (
-                    <div key={i} style={{ padding: '10px 16px', borderBottom: '1px solid var(--border)', fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                      {typeof ct === 'string' ? ct : JSON.stringify(ct)}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
+              )
+            })()}
           </>
         )}
       </div>

@@ -72,7 +72,7 @@ class PatternAgent(BaseAgent):
         history = claim_data.get("history") or []
         if memory_status == "DISABLED" or not history:
             score = 72.0
-            reasoning = "Historique non disponible — analyse de pattern limitée"
+            reasoning = "History unavailable — pattern analysis limited"
             payload = {
                 "agent_name": self.name,
                 "status": "REVIEW",
@@ -104,7 +104,7 @@ class PatternAgent(BaseAgent):
             score += 5
         score = max(0.0, min(100.0, score))
         decision = score > 60
-        reasoning = "Analyse de pattern effectuee sur les signaux comportementaux"
+        reasoning = "Pattern analysis completed using behavioral signals"
 
         llm_fallback = self.should_use_llm_fallback(tool_results)
         if llm_fallback:

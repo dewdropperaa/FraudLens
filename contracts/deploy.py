@@ -1,5 +1,5 @@
 """
-Deploy ClaimValidator.sol to Ganache local testnet.
+Deploy ClaimValidator.sol to the currently configured EVM network.
 
 Requirements:
     pip install web3 py-solc-x python-dotenv
@@ -16,11 +16,22 @@ from web3 import Web3
 
 load_dotenv("claimguard/.env")
 
-RPC_URL     = os.getenv("GANACHE_RPC_URL") or os.getenv("WEB3_PROVIDER_URL") or ""
-PRIVATE_KEY = os.getenv("GANACHE_PRIVATE_KEY") or os.getenv("PRIVATE_KEY") or ""
+RPC_URL = (
+    os.getenv("SEPOLIA_RPC_URL")
+    or os.getenv("ALCHEMY_URL")
+    or os.getenv("WEB3_PROVIDER_URL")
+    or os.getenv("GANACHE_RPC_URL")
+    or ""
+)
+PRIVATE_KEY = (
+    os.getenv("SEPOLIA_PRIVATE_KEY")
+    or os.getenv("PRIVATE_KEY")
+    or os.getenv("GANACHE_PRIVATE_KEY")
+    or ""
+)
 
 if not RPC_URL or not PRIVATE_KEY:
-    print("ERROR: Set GANACHE_RPC_URL and GANACHE_PRIVATE_KEY in claimguard/.env")
+    print("ERROR: Set SEPOLIA_RPC_URL/ALCHEMY_URL and SEPOLIA_PRIVATE_KEY/PRIVATE_KEY in claimguard/.env")
     sys.exit(1)
 
 # ── Compile ────────────────────────────────────────────────────────────────
@@ -49,6 +60,7 @@ if not w3.is_connected():
 account = w3.eth.account.from_key(PRIVATE_KEY)
 print(f"Deploying from: {account.address}")
 print(f"Balance:        {w3.from_wei(w3.eth.get_balance(account.address), 'ether'):.4f} ETH")
+print(f"Chain ID:       {w3.eth.chain_id}")
 
 # ── Deploy ─────────────────────────────────────────────────────────────────
 Contract = w3.eth.contract(abi=abi, bytecode=bytecode)
@@ -57,7 +69,7 @@ tx = Contract.constructor().build_transaction({
     "nonce":    w3.eth.get_transaction_count(account.address),
     "gasPrice": int(w3.eth.gas_price * 1.1),
     "gas":      1_500_000,
-    "chainId":  1337,  # Ganache
+    "chainId":  int(w3.eth.chain_id),
 
 })
 

@@ -68,7 +68,7 @@ class GraphAgent(BaseAgent):
         memory_status = str(claim_data.get("memory_status") or "").upper()
         if memory_status == "DISABLED":  # SCORE-FIX
             score = 75.0
-            reasoning = "Graphe de risque non disponible — analyse réseau ignorée"
+            reasoning = "Risk graph unavailable — network analysis skipped"
             payload = {
                 "agent_name": self.name,
                 "status": "REVIEW",
@@ -101,7 +101,7 @@ class GraphAgent(BaseAgent):
         if not flags:
             score += 5
         score = max(0.0, min(100.0, round(score, 2)))
-        reasoning = "Analyse graphe realisee selon les connexions reseau detectees"
+        reasoning = "Graph analysis completed based on detected network connections"
         llm_fallback = self.should_use_llm_fallback(tool_results)
         if llm_fallback:
             print("[LLM FALLBACK USED] True")

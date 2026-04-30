@@ -1,7 +1,9 @@
 import sys
 import base64
 from pathlib import Path
+from datetime import datetime
 
+import pytest
 from fastapi.testclient import TestClient
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +14,8 @@ from claimguard.main import create_app
 from claimguard.v2.blackboard import BlackboardValidationError, SharedBlackboard
 from claimguard.v2.concierge import build_routing_decision
 from claimguard.v2.consensus import ConsensusEngine
+from claimguard.models import ClaimResult
+from claimguard.services.storage import get_claim_store, reset_claim_store_for_tests
 from claimguard.v2.schemas import RoutingDecision
 from claimguard.v2.trust_layer import (
     FirebaseTrustRecord,
@@ -198,6 +202,10 @@ def test_trust_layer_tier1_hash_runs_for_all_decisions() -> None:
         def __init__(self) -> None:
             self.called = False
 
+        def store_claim(self, *, cid: str, metadata: dict) -> str:
+            self.called = True
+            return "0xabc"
+
         def store_record(self, payload: OnChainTrustPayload) -> str:
             self.called = True
             return "0xabc"
@@ -212,10 +220,6 @@ def test_trust_layer_tier1_hash_runs_for_all_decisions() -> None:
             self.last_payload = payload
             return "fire-1"
 
-    class FakeFallback:
-        def log_blockchain_failure(self, context):
-            raise AssertionError("fallback should not be called")
-
     ipfs = FakeIPFS()
     chain = FakeChain()
     firebase = FakeFirebase()
@@ -223,7 +227,6 @@ def test_trust_layer_tier1_hash_runs_for_all_decisions() -> None:
         ipfs_client=ipfs,
         blockchain_client=chain,
         firebase_client=firebase,
-        fallback_logger=FakeFallback(),
         validator_id="sys-1",
     )
     request = {
@@ -267,6 +270,9 @@ def test_tier1_hash_is_deterministic_for_same_inputs() -> None:
             return "QmCID123"
 
     class FakeChain:
+        def store_claim(self, *, cid: str, metadata: dict) -> str:
+            return "0xabc"
+
         def store_record(self, payload: OnChainTrustPayload) -> str:
             return "0xabc"
 
@@ -278,15 +284,10 @@ def test_tier1_hash_is_deterministic_for_same_inputs() -> None:
             self.payloads.append(payload)
             return f"fire-{len(self.payloads)}"
 
-    class FakeFallback:
-        def log_blockchain_failure(self, context):
-            return None
-
     service = TrustLayerService(
         ipfs_client=FakeIPFS(),
         blockchain_client=FakeChain(),
         firebase_client=FakeFirebase(),
-        fallback_logger=FakeFallback(),
         validator_id="sys-1",
     )
     ts = "2026-01-01T00:00:00+00:00"
@@ -309,7 +310,7 @@ def test_tier1_hash_is_deterministic_for_same_inputs() -> None:
     assert h1 == h2
 
 
-def test_trust_layer_degrades_when_ipfs_fails() -> None:
+def test_trust_layer_raises_when_ipfs_fails() -> None:
     class FailingIPFS:
         def upload_documents(self, claim_id: str, documents: list[SanitizedTrustDocument]) -> str:
             raise TrustLayerIPFSFailure("boom")
@@ -317,6 +318,10 @@ def test_trust_layer_degrades_when_ipfs_fails() -> None:
     class FakeChain:
         def __init__(self) -> None:
             self.called = False
+
+        def store_claim(self, *, cid: str, metadata: dict) -> str:
+            self.called = True
+            return "0xf00"
 
         def store_record(self, payload: OnChainTrustPayload) -> str:
             self.called = True
@@ -330,38 +335,34 @@ def test_trust_layer_degrades_when_ipfs_fails() -> None:
             self.called = True
             return "fire-degraded"
 
-    class FakeFallback:
-        def log_blockchain_failure(self, context):
-            raise AssertionError("fallback should not run after IPFS failure")
-
     chain = FakeChain()
     firebase = FakeFirebase()
     service = TrustLayerService(
         ipfs_client=FailingIPFS(),
         blockchain_client=chain,
         firebase_client=firebase,
-        fallback_logger=FakeFallback(),
     )
-    result = service.process_if_applicable(
-        claim_id="c3",
-        decision="APPROVED",
-        ts_score=99.0,
-        claim_request={"documents": [{"document_type": "invoice", "text": "A"}]},
-        agent_outputs=[],
-    )
-    assert result is not None
-    assert result.cid is None
-    assert chain.called is True
-    assert firebase.called is True
-    assert result.tx_hash == "0xf00"
+    with pytest.raises(TrustLayerIPFSFailure):
+        service.process_if_applicable(
+            claim_id="c3",
+            decision="APPROVED",
+            ts_score=99.0,
+            claim_request={"documents": [{"document_type": "invoice", "text": "A"}]},
+            agent_outputs=[],
+        )
+    assert chain.called is False
+    assert firebase.called is False
 
 
-def test_trust_layer_blockchain_fallback_keeps_firebase_write() -> None:
+def test_trust_layer_blockchain_failure_raises_without_fallback() -> None:
     class FakeIPFS:
         def upload_documents(self, claim_id: str, documents: list[SanitizedTrustDocument]) -> str:
             return "QmCID456"
 
     class FailingChain:
+        def store_claim(self, *, cid: str, metadata: dict) -> str:
+            raise RuntimeError("rpc down")
+
         def store_record(self, payload: OnChainTrustPayload) -> str:
             raise RuntimeError("rpc down")
 
@@ -373,30 +374,115 @@ def test_trust_layer_blockchain_fallback_keeps_firebase_write() -> None:
             self.writes += 1
             return "fire-2"
 
-    class FakeFallback:
-        def __init__(self) -> None:
-            self.logged = 0
-
-        def log_blockchain_failure(self, context):
-            self.logged += 1
-
     firebase = FakeFirebase()
-    fallback = FakeFallback()
     service = TrustLayerService(
         ipfs_client=FakeIPFS(),
         blockchain_client=FailingChain(),
         firebase_client=firebase,
-        fallback_logger=fallback,
     )
-    result = service.process_if_applicable(
-        claim_id="c4",
+    with pytest.raises(RuntimeError, match="rpc down"):
+        service.process_if_applicable(
+            claim_id="c4",
+            decision="APPROVED",
+            ts_score=93.0,
+            claim_request={"documents": [{"document_type": "prescription", "text": "B"}]},
+            agent_outputs=[],
+        )
+    assert firebase.writes == 0
+
+
+def test_claims_list_exposes_traceability_fields(monkeypatch) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("DOCUMENT_ENCRYPTION_KEY", "0" * 32)
+    monkeypatch.setenv("CLAIMAGUARD_API_KEYS", "test-api-key-for-ci")
+    reset_claim_store_for_tests()
+    store = get_claim_store()
+
+    claim = ClaimResult(
+        claim_id="trace-1",
         decision="APPROVED",
-        ts_score=93.0,
-        claim_request={"documents": [{"document_type": "prescription", "text": "B"}]},
-        agent_outputs=[],
+        score=88.0,
+        agent_results=[],
+        consensus_decision="APPROVED",
+        Ts=88.0,
+        timestamp=datetime.utcnow(),
+        decision_source="HUMAN",
+        previous_status="HUMAN_REVIEW",
+        review_trace=[
+            {"step": "AI_ANALYSIS", "decision": "HUMAN_REVIEW", "timestamp": "2026-01-01T00:00:00+00:00"},
+            {"step": "HUMAN_REVIEW", "decision": "APPROVED", "reviewer": "admin", "timestamp": "2026-01-01T00:02:00+00:00"},
+        ],
     )
-    assert result is not None
-    assert result.tx_hash is None
-    assert result.firebase_id == "fire-2"
-    assert firebase.writes == 1
-    assert fallback.logged == 1
+    store.put(claim)
+
+    client = TestClient(create_app())
+    response = client.get("/claims", headers={"x-api-key": "test-api-key-for-ci"})
+    assert response.status_code == 200
+    items = response.json().get("items", [])
+    row = next((r for r in items if r.get("claim_id") == "trace-1"), None)
+    assert row is not None
+    assert row["id"] == "trace-1"
+    assert row["status"] == "APPROVED"
+    assert row["decision_source"] == "HUMAN"
+    assert row["previous_status"] == "HUMAN_REVIEW"
+    assert isinstance(row["review_trace"], list)
+    assert len(row["review_trace"]) == 2
+
+
+def test_human_decision_updates_traceability_fields(monkeypatch) -> None:
+    from claimguard.v2 import orchestrator as orchestrator_module
+
+    class FakeOrchestrator:
+        def apply_human_decision(self, *, claim_id: str, decision: str, reviewer_id: str, notes: str = ""):
+            return {"status": "FINALIZED", "decision": decision}
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("DOCUMENT_ENCRYPTION_KEY", "0" * 32)
+    monkeypatch.setenv("CLAIMAGUARD_API_KEYS", "test-api-key-for-ci")
+    reset_claim_store_for_tests()
+    store = get_claim_store()
+    store.put(
+        ClaimResult(
+            claim_id="trace-2",
+            decision="HUMAN_REVIEW",
+            score=72.0,
+            agent_results=[],
+            consensus_decision="HUMAN_REVIEW",
+            Ts=72.0,
+            timestamp=datetime.utcnow(),
+            decision_source="AI",
+            review_trace=[{"step": "AI_ANALYSIS", "decision": "HUMAN_REVIEW", "timestamp": "2026-01-01T00:00:00+00:00"}],
+        )
+    )
+    monkeypatch.setattr(orchestrator_module, "_singleton", FakeOrchestrator())
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/v2/claim/human-decision",
+        headers={"x-api-key": "test-api-key-for-ci"},
+        json={"claim_id": "trace-2", "decision": "APPROVED", "reviewer_id": "admin", "notes": "ok"},
+    )
+    assert response.status_code == 200
+    updated = store.get("trace-2")
+    assert updated is not None
+    assert updated.decision == "APPROVED"
+    assert updated.status == "APPROVED"
+    assert updated.previous_status == "HUMAN_REVIEW"
+    assert updated.decision_source == "HUMAN"
+    assert len(updated.review_trace) == 2
+    assert updated.review_trace[-1]["step"] == "HUMAN_REVIEW"
+    assert updated.review_trace[-1]["decision"] == "APPROVED"
+
+
+def test_old_claims_keep_backward_compatibility() -> None:
+    legacy_claim = ClaimResult(
+        claim_id="legacy-1",
+        decision="APPROVED",
+        score=92.0,
+        agent_results=[],
+    )
+    assert legacy_claim.id == "legacy-1"
+    assert legacy_claim.status == "APPROVED"
+    assert legacy_claim.decision_source == "AI"
+    assert legacy_claim.previous_status is None
+    assert legacy_claim.review_trace == []

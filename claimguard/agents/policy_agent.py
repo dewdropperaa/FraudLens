@@ -109,7 +109,7 @@ class PolicyAgent(BaseAgent):
             flags.append("DATE_OUTSIDE_COVERAGE")
         if not policy:
             score = 70.0
-            reasoning = "Données de politique non disponibles — vérification partielle"
+            reasoning = "Policy data unavailable — partial verification only"
             decision = True
             payload = {
                 "agent_name": self.name,
@@ -128,7 +128,7 @@ class PolicyAgent(BaseAgent):
             return self._build_result(status="DONE", score=score, reason=reasoning, output=payload, flags=["POLICY_DATA_MISSING"])  # SCORE-FIX
         score = max(0.0, min(100.0, score))
         decision = score > 60
-        reasoning = "Vérification de politique effectuée selon les règles de couverture"
+        reasoning = "Policy verification completed according to coverage rules"
 
         llm_fallback = self.should_use_llm_fallback(tool_results)
         if llm_fallback:

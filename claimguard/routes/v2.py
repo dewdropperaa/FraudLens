@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
@@ -16,11 +17,16 @@ from claimguard.v2.reliability import get_reliability_store
 from claimguard.v2.trust_layer import TrustLayerIPFSFailure
 from claimguard.models import AgentResult, ClaimResult
 from claimguard.services.storage import get_claim_store
+from claimguard.services import doc_store
 
 from claimguard.v2.flow_tracker import get_tracker
 
 router = APIRouter(prefix="/v2", tags=["claimguard-v2"])
 LOGGER = logging.getLogger("claimguard.routes.v2")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class HumanFeedbackPayload(BaseModel):
@@ -112,16 +118,80 @@ async def get_human_review_context(
     orchestrator = get_v2_orchestrator()
     role = str(auth.role or "").lower()
     if role != "admin":
-        # PROD-FIX: fallback allows any authenticated role when claim exists.
         if not auth.user_id:
             _raise_access_denied(claim_id=claim_id, auth=auth, reason="Authentication required")
         existing = orchestrator.get_human_review_context(claim_id)
         if existing is None:
             raise HTTPException(status_code=404, detail=f"No human review payload found for claim {claim_id}")
+        if not existing.get("document_url"):
+            if doc_store.get_document_path(claim_id):
+                existing = dict(existing)
+                existing["document_url"] = f"/api/v2/claim/{claim_id}/local-document"
         return existing
+
     payload = orchestrator.get_human_review_context(claim_id)
+
+    # When orchestrator context is lost (server restart, missing Firestore)
+    # but the document is still on disk, synthesize a minimal context so the
+    # admin can still view and decide on the claim.
     if payload is None:
-        raise HTTPException(status_code=404, detail=f"No human review payload found for claim {claim_id}")
+        local_path = doc_store.get_document_path(claim_id)
+        if local_path:
+            LOGGER.info(
+                "human_review_context_rebuilt_from_doc_store claim_id=%s",
+                claim_id,
+            )
+            payload = {
+                "claim_id": claim_id,
+                "ts": 0.0,
+                "reason": "Review context recovered from local document store",
+                "document_url": f"/api/v2/claim/{claim_id}/local-document",
+                "extracted_data": {},
+                "agent_breakdown": [],
+                "heatmap": [],
+                "heatmap_fallback": [],
+                "heatmap_status": "missing_pdf",
+                "pipeline_version": "v2",
+                "ai_suggested_decision": "HUMAN_REVIEW",
+                "risk_breakdown": {},
+            }
+        else:
+            # Also check the claim store — the claim may have been stored
+            # but the review context was lost.
+            stored = get_claim_store().get(claim_id)
+            if stored is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No human review payload found for claim {claim_id}",
+                )
+            payload = {
+                "claim_id": claim_id,
+                "ts": float(stored.Ts or stored.score or 0.0),
+                "reason": "Review context recovered from claim store",
+                "document_url": None,
+                "extracted_data": {},
+                "agent_breakdown": [],
+                "heatmap": [],
+                "heatmap_fallback": [],
+                "heatmap_status": "missing_pdf",
+                "pipeline_version": "v2",
+                "ai_suggested_decision": "HUMAN_REVIEW",
+                "risk_breakdown": {},
+            }
+
+    # _prepare_v2_claim_payload strips documents_base64 before the orchestrator
+    # runs, so document_url is often None.  Fall back to the locally-stored
+    # file saved at submission time.
+    if not payload.get("document_url"):
+        if doc_store.get_document_path(claim_id):
+            payload = dict(payload)
+            payload["document_url"] = f"/api/v2/claim/{claim_id}/local-document"
+
+    LOGGER.debug(
+        "human_review_context claim_id=%s document_url=%s",
+        claim_id,
+        payload.get("document_url"),
+    )
     return payload
 
 
@@ -147,11 +217,53 @@ async def get_human_review_document(
     return FileResponse(path=file_path, filename=file)
 
 
+@router.get("/claim/{claim_id}/local-document")
+async def get_local_review_document(
+    claim_id: str,
+):
+    """Serve a locally-stored document for a Human Review claim (temporarily public)."""
+    file_path = doc_store.get_document_path(claim_id)
+    if not file_path:
+        raise HTTPException(status_code=404, detail="No document stored for this claim")
+    filename = doc_store.get_document_name(claim_id) or "document"
+    media_type = "application/pdf" if filename.lower().endswith(".pdf") else None
+    return FileResponse(path=file_path, filename=filename, media_type=media_type)
+
+
 @router.post("/claim/analyze", response_model=ClaimGuardV2Response, dependencies=[Depends(verify_request_auth)])
 async def analyze_claim_v2(claim: ClaimRequestV2) -> ClaimGuardV2Response:
     orchestrator = get_v2_orchestrator()
     try:
         result: ClaimGuardV2Response = orchestrator.run(_prepare_v2_claim_payload(claim))
+
+        # ── Persist document locally when claim needs human review ──────────
+        # _prepare_v2_claim_payload pops documents_base64 from the dict it
+        # passes to the orchestrator, so the orchestrator never sees the raw
+        # files.  We save them here at the route layer instead.
+        if result.decision == "HUMAN_REVIEW":
+            cid = result.claim_id or str(claim.metadata.get("claim_id") or "")
+            docs_b64 = claim.documents_base64 or []
+            LOGGER.info(
+                "human_review_doc_save claim_id=%s docs_count=%d",
+                cid, len(docs_b64),
+            )
+            saved = False
+            for doc_part in docs_b64:
+                if not isinstance(doc_part, dict):
+                    continue
+                name = str(doc_part.get("name") or "document.pdf").strip()
+                b64  = str(doc_part.get("content_base64") or "").strip()
+                if b64:
+                    path = doc_store.save_document(cid, name, b64)
+                    if path:
+                        LOGGER.info("human_review_doc_saved claim_id=%s path=%s", cid, path)
+                        saved = True
+                    else:
+                        LOGGER.warning("human_review_doc_save_failed claim_id=%s name=%s", cid, name)
+                    break  # store only the first document
+            if not saved:
+                LOGGER.warning("human_review_no_doc_saved claim_id=%s", cid)
+
         try:
             agent_results = [
                 AgentResult(
@@ -168,6 +280,8 @@ async def analyze_claim_v2(claim: ClaimRequestV2) -> ClaimGuardV2Response:
             claim_record = ClaimResult(
                 claim_id=result.claim_id or "",
                 decision=result.decision,
+                id=result.claim_id or "",
+                status=result.decision,
                 score=float(result.Ts),
                 agent_results=agent_results,
                 consensus_decision=result.decision,
@@ -177,6 +291,17 @@ async def analyze_claim_v2(claim: ClaimRequestV2) -> ClaimGuardV2Response:
                 contradictions=result.contradictions,
                 tx_hash=str(trust.get("tx_hash") or result.tx_hash or ""),
                 ipfs_hash=str(trust.get("cid") or result.ipfs_hash or ""),
+                decision_source="AI",
+                previous_status=None,
+                review_trace=(
+                    [{
+                        "step": "AI_ANALYSIS",
+                        "decision": "HUMAN_REVIEW",
+                        "timestamp": _utc_now_iso(),
+                    }]
+                    if result.decision == "HUMAN_REVIEW"
+                    else []
+                ),
             )
             get_claim_store().put(claim_record)
         except Exception as store_exc:
@@ -293,12 +418,52 @@ async def submit_human_decision_v2(
 ) -> dict:
     orchestrator = get_v2_orchestrator()
     try:
-        return orchestrator.apply_human_decision(
+        normalized_decision = str(payload.decision or "").upper()
+        result = orchestrator.apply_human_decision(
             claim_id=payload.claim_id,
-            decision=payload.decision,
+            decision=normalized_decision,
             reviewer_id=payload.reviewer_id,
             notes=payload.notes,
         )
+        try:
+            store = get_claim_store()
+            existing_claim = store.get(payload.claim_id)
+            if existing_claim is not None and normalized_decision in {"APPROVED", "REJECTED"}:
+                trace = list(existing_claim.review_trace or [])
+                trace.append(
+                    {
+                        "step": "HUMAN_REVIEW",
+                        "decision": normalized_decision,
+                        "reviewer": payload.reviewer_id or "admin",
+                        "timestamp": _utc_now_iso(),
+                    }
+                )
+                updated_claim = existing_claim.model_copy(
+                    update={
+                        "decision": normalized_decision,
+                        "status": normalized_decision,
+                        "previous_status": "HUMAN_REVIEW",
+                        "decision_source": "HUMAN",
+                        "review_trace": trace,
+                    }
+                )
+                store.put(updated_claim)
+        except Exception as store_exc:
+            LOGGER.warning(
+                "claim_store_human_decision_update_failed claim_id=%s error=%s",
+                payload.claim_id,
+                store_exc,
+            )
+        # Delete locally-stored review documents now that the claim is decided.
+        # This runs regardless of APPROVED / REJECTED to keep no files on disk.
+        try:
+            doc_store.delete_documents(payload.claim_id)
+        except Exception as del_exc:
+            LOGGER.warning(
+                "doc_store.delete_failed claim_id=%s error=%s",
+                payload.claim_id, del_exc,
+            )
+        return result
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

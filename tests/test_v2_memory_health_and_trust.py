@@ -162,6 +162,9 @@ def test_all_decisions_produce_firebase_trust_hash() -> None:
             return "QmCID"
 
     class _FakeChain:
+        def store_claim(self, *, cid: str, metadata: dict) -> str:
+            return "0xtx"
+
         def store_record(self, payload: OnChainTrustPayload) -> str:
             return "0xtx"
 
@@ -173,16 +176,11 @@ def test_all_decisions_produce_firebase_trust_hash() -> None:
             self.rows.append(payload)
             return f"f-{len(self.rows)}"
 
-    class _Fallback:
-        def log_blockchain_failure(self, context):
-            return None
-
     fb = _FakeFirebase()
     service = TrustLayerService(
         ipfs_client=_FakeIPFS(),
         blockchain_client=_FakeChain(),
         firebase_client=fb,
-        fallback_logger=_Fallback(),
     )
     for decision in ("APPROVED", "HUMAN_REVIEW", "REJECTED"):
         service.process_if_applicable(
@@ -207,6 +205,9 @@ def test_disputed_human_review_produces_ipfs_bundle() -> None:
             return "QmEvidence"
 
     class _FakeChain:
+        def store_claim(self, *, cid: str, metadata: dict) -> str:
+            return "0xtx"
+
         def store_record(self, payload: OnChainTrustPayload) -> str:
             return "0xtx"
 
@@ -214,16 +215,11 @@ def test_disputed_human_review_produces_ipfs_bundle() -> None:
         def store_record(self, payload: FirebaseTrustRecord) -> str:
             return "f-1"
 
-    class _Fallback:
-        def log_blockchain_failure(self, context):
-            return None
-
     ipfs = _FakeIPFS()
     service = TrustLayerService(
         ipfs_client=ipfs,
         blockchain_client=_FakeChain(),
         firebase_client=_FakeFirebase(),
-        fallback_logger=_Fallback(),
     )
     result = service.process_if_applicable(
         claim_id="hr-1",
@@ -246,6 +242,9 @@ def test_rejected_with_dispute_risk_produces_ipfs_bundle() -> None:
             return "QmRejEvidence"
 
     class _FakeChain:
+        def store_claim(self, *, cid: str, metadata: dict) -> str:
+            return "0xtx"
+
         def store_record(self, payload: OnChainTrustPayload) -> str:
             return "0xtx"
 
@@ -253,15 +252,10 @@ def test_rejected_with_dispute_risk_produces_ipfs_bundle() -> None:
         def store_record(self, payload: FirebaseTrustRecord) -> str:
             return "f-2"
 
-    class _Fallback:
-        def log_blockchain_failure(self, context):
-            return None
-
     service = TrustLayerService(
         ipfs_client=_FakeIPFS(),
         blockchain_client=_FakeChain(),
         firebase_client=_FakeFirebase(),
-        fallback_logger=_Fallback(),
     )
     result = service.process_if_applicable(
         claim_id="rj-1",
@@ -299,6 +293,9 @@ def test_trust_layer_fallback_document_when_claim_request_documents_not_eligible
             return "QmFallbackCID"
 
     class _FakeChain:
+        def store_claim(self, *, cid: str, metadata: dict) -> str:
+            return "0xtx"
+
         def store_record(self, payload: OnChainTrustPayload) -> str:
             return "0xtx"
 
@@ -306,16 +303,11 @@ def test_trust_layer_fallback_document_when_claim_request_documents_not_eligible
         def store_record(self, payload: FirebaseTrustRecord) -> str:
             return "f-fallback"
 
-    class _Fallback:
-        def log_blockchain_failure(self, context):
-            return None
-
     ipfs = _FakeIPFS()
     service = TrustLayerService(
         ipfs_client=ipfs,
         blockchain_client=_FakeChain(),
         firebase_client=_FakeFirebase(),
-        fallback_logger=_Fallback(),
     )
     result = service.process_approved_claim(
         {

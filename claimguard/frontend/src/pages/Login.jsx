@@ -56,10 +56,10 @@ export default function Login() {
         </div>
 
         <div style={styles.demoSection}>
-          <p style={styles.demoLabel}>Compte de démonstration</p>
+          <p style={styles.demoLabel}>Demo account</p>
           <div style={styles.demoRow}>
             <button style={styles.demoBtn} onClick={fillDemo}>
-              <span style={styles.demoBadge}>Assureur</span>
+              <span style={styles.demoBadge}>Insurer</span>
               admin@gmail.com
             </button>
           </div>
